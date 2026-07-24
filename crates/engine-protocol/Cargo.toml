@@ -1,0 +1,13 @@
+[package]
+name = "xmic-engine-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+xmic-platform-api = { path = "../platform-api" }
+
+[dev-dependencies]
+serde_json.workspace = true

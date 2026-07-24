@@ -1,0 +1,13 @@
+[package]
+name = "xmic-platform-windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rtrb.workspace = true
+serde.workspace = true
+windows.workspace = true
+windows-core.workspace = true
+xmic-engine-core = { path = "../engine-core" }
+xmic-platform-api = { path = "../platform-api" }

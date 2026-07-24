@@ -1,0 +1,9 @@
+[package]
+name = "xmic-webrtc-dsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libloading.workspace = true
+thiserror.workspace = true

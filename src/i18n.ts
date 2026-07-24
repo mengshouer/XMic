@@ -1,0 +1,692 @@
+export type Language = "zh-CN" | "en";
+
+export const LANGUAGE_STORAGE_KEY = "xmic.language";
+export const DEFAULT_LANGUAGE: Language = "zh-CN";
+
+type TranslationShape<T> = T extends (...args: infer Args) => unknown
+  ? (...args: Args) => string
+  : T extends string
+    ? string
+    : { [Key in keyof T]: TranslationShape<T[Key]> };
+
+const zhCN = {
+  common: {
+    language: "界面语言",
+    loading: "正在读取音频设备",
+    start: "启动",
+    stop: "停止",
+    cancelPending: "取消等待",
+    applySettings: "应用设置",
+    pendingSettings: "有未应用的设置更改",
+  },
+  app: {
+    eyebrow: "LOCAL AUDIO ENGINE",
+    subtitle: "本地实时回声消除、降噪与语音增强",
+    sessionUnavailable:
+      "Windows 会话当前不可用，麦克风处理已暂停；恢复会话后将按之前状态处理。",
+  },
+  navigation: {
+    workspace: "工作区",
+    monitor: "实时监控",
+    routing: "设备与运行",
+    processing: "处理链路",
+  },
+  views: {
+    monitor: {
+      eyebrow: "REAL-TIME ENGINE",
+      title: "实时声音监控",
+      subtitle: "在一处观察回声消除、语音检测与整条音频链路",
+      telemetryTitle: "信号遥测",
+      telemetrySubtitle: "最近 72 个状态采样",
+      telemetryAria: "VAD 概率与 AEC3 回声衰减时间序列",
+      vadLegend: "VAD 概率",
+      attenuationLegend: "回声衰减",
+      gateWindow: "Gate 开启区间",
+      inputPeak: "输入峰值",
+      outputPeak: "输出峰值",
+      vadProbability: "当前 VAD",
+      snapshotTitle: "引擎快照",
+      snapshotSubtitle: "当前处理状态",
+      calibration: "Delay 校准",
+      gateState: "VAD Gate",
+      echoGuard: "EchoGuard",
+      activeRoute: "活动信号路径",
+      activeRouteSubtitle: "播放参考与麦克风合流后输出至虚拟设备",
+      renderSource: "播放参考",
+      captureSource: "物理麦克风",
+      processor: "XMic DSP",
+      outputDestination: "虚拟麦克风",
+      chainTitle: "DSP 模块",
+      chainSubtitle: "选择模块进入参数工作台",
+      healthTitle: "链路健康",
+      healthSubtitle: "本次运行累计数据",
+    },
+    routing: {
+      eyebrow: "DEVICES & RUNTIME",
+      title: "设备与运行",
+      subtitle: "配置音频设备、故障保护与后台运行方式",
+      configuration: "设备配置",
+      configurationSubtitle: "输入、参考与输出端点",
+      active: "当前活动路由",
+      activeSubtitle: "引擎实际使用的端点",
+      safety: "故障保护",
+      safetySubtitle: "DSP 异常时的输出策略",
+      lifecycle: "后台生命周期",
+      lifecycleSubtitle: "登录与启动行为",
+    },
+    processing: {
+      eyebrow: "DSP WORKBENCH",
+      title: "处理链路",
+      subtitle: "按信号顺序精调回声消除、降噪、增益与语音门限",
+      pipelineAria: "DSP 处理模块",
+      editorLabel: "当前模块",
+      alwaysOn: "始终启用",
+      diagnostics: "AEC3 运行诊断",
+      diagnosticsSubtitle: "Delay、ERLE、VAD 与 EchoGuard 详细数据",
+      stopToEdit: "处理运行期间参数已锁定，停止引擎后可编辑",
+    },
+  },
+  engineModes: {
+    sleeping: "已停止",
+    starting: "正在启动",
+    converging: "AEC 收敛中",
+    active: "处理中",
+    rawFallback: "原始麦克风直通",
+    safeMode: "安全模式",
+    muted: "故障静音",
+    error: "等待重连",
+  },
+  processingLoads: {
+    full: "完整",
+    reduced: "降载",
+    protection: "保护",
+  },
+  status: {
+    title: "状态",
+    dspP99: "DSP 处理耗时 P99",
+    dspP99Title: (maximum: string, misses: string) =>
+      `最大耗时 ${maximum} µs · ${misses} 次超时`,
+    cpuLoad: "CPU 降载模式",
+    cpuLoadTitle: (exceeded: string, degradations: string, recoveries: string) =>
+      `${exceeded} 次超出预算 · ${degradations} 次降载 · ${recoveries} 次恢复`,
+    processedBlocks: "累计处理帧",
+    deviceRestarts: "链路重建次数",
+    outputQueue: "输出队列延迟",
+    outputQueueHelp:
+      "虚拟输出队列深度及为补偿独立设备时钟漂移而施加的当前 resampling 修正。",
+    audioAnomalies: "音频异常计数",
+    audioAnomaliesHelp:
+      "播放欠载 / 播放溢出 / 采集溢出 / 输出欠载 / 输出溢出 / DSP 故障",
+  },
+  routing: {
+    title: "设备与运行",
+    refresh: "刷新音频设备",
+    followDefaultRender: "跟随 Windows 默认播放设备",
+    followDefaultRenderHelp:
+      "自动使用当前 Windows 默认播放设备作为 AEC reference。切换音响或耳机时 XMic 会跟随重建音频链路；不要把 CABLE Input 设为默认播放设备。",
+    renderReference: "AEC 播放参考设备",
+    renderReferenceHelp:
+      "选择实际正在发声的音响或耳机。AEC3 用它取得远端声音，选错设备会导致回声无法消除。",
+    selectRender: "选择播放设备",
+    savedRenderUnavailable: "已保存的播放设备当前不可用",
+    captureInput: "物理麦克风输入",
+    captureInputHelp:
+      "选择需要处理的真实麦克风。跟随默认时会随 Windows 默认录音设备切换；不要选择 CABLE Output。",
+    followDefaultCapture: "跟随 Windows 默认麦克风",
+    savedCaptureUnavailable: "已保存的麦克风当前不可用",
+    captureChannel: "麦克风输入声道",
+    captureChannelHelp:
+      "Auto 会持续比较多通道 USB 麦克风或 audio interface 的输入能量，并采用稳定的有效通道。若自动选择不符合设备接线，可固定为指定 channel。",
+    savedChannel: (channel: number) => `Channel ${channel}（已保存）`,
+    processedOutput: "处理后虚拟麦克风",
+    processedOutputHelp:
+      "XMic 将处理后的声音写入此播放端。使用 VB-CABLE 时选择标准 CABLE Input，再让游戏或连麦软件读取对应的 CABLE Output。",
+    selectVirtualOutput: "选择虚拟输出设备",
+    selectCableInput: "选择 CABLE Input",
+    savedOutputUnavailable: "已保存的虚拟输出当前不可用",
+    detectedVirtualDevices: "检测到的虚拟设备",
+    otherRenderEndpoints: "其他播放端点",
+    activeRouteAria: "当前活动路由",
+    currentRoute: "当前路由",
+    render: "播放参考",
+    capture: "物理麦克风",
+    output: "虚拟麦克风",
+    dspProfile: "DSP 配置",
+    customizedProfile: "当前设备组合 · 已保存",
+    defaultProfile: "当前设备组合 · 默认参数",
+    waitingProfile: "等待设备组合",
+    failurePolicy: "DSP 故障策略",
+    failurePolicyHelp:
+      "DSP 运行失败时的输出方式。原始直通可以继续说话，但可能泄漏回声和噪声；静音不会泄漏声音，但故障期间对方听不到你。",
+    rawPassthrough: "原始直通",
+    mute: "静音",
+    background: "后台与启动",
+    backgroundHelp:
+      "关闭主窗口后 XMic 会继续驻留系统托盘。锁屏、断开 Windows 会话或睡眠时会暂停处理，并在会话恢复后按之前状态重启。",
+    launchAtLogin: "开机启动",
+    launchAtLoginHelp:
+      "登录 Windows 时在系统托盘后台启动 XMic，不主动显示主窗口。关闭后不会删除其他软件的启动项。",
+    startOnLaunch: "启动后自动开始处理",
+    startOnLaunchHelp:
+      "每次 XMic 启动后按已保存的 AEC3、RNNoise 和音频路由配置自动启动实时处理；设备暂不可用时会在后台重试。",
+    defaultRenderConflict: (name: string) =>
+      `Windows 默认播放设备“${name}”同时被选为虚拟麦克风输出。请先将音响或耳机设为 Windows 默认播放设备，然后刷新设备。`,
+    renderConflict: (name: string) =>
+      `播放参考“${name}”不能同时作为虚拟麦克风输出。请为播放参考选择实际发声的音响或耳机。`,
+  },
+  dsp: {
+    title: "DSP 链路",
+    aecSubtitle: "回声消除",
+    rnnoiseSubtitle: "噪声抑制",
+    agc2Subtitle: "自动增益控制",
+    vadSubtitle: "语音活动门限",
+    limiterSubtitle: "输出峰值限制",
+    aec: {
+      enabled: "启用 AEC3",
+      enabledHelp:
+        "使用播放设备的声音作为 reference，估计并消除麦克风收到的音响回声。关闭后不会进行 echo cancellation。",
+      preset: "AEC3 回声消除强度",
+      presetHelp:
+        "Natural 优先保留自然音质；Balanced 加强残余回声抑制；Strong 抑制最强，但更可能削弱近端人声。",
+      highPass: "AEC3 高通滤波器",
+      highPassHelp:
+        "滤除麦克风中的低频隆隆声、桌面震动和部分风噪，通常能提高 AEC 稳定性；声音可能略微变薄。",
+      diagnosticsAria: "AEC3 运行诊断",
+    },
+    diagnostics: {
+      hostDelay: "主机链路延迟",
+      hostDelayHelp:
+        "根据 capture 与最新已送入 AEC3 的 render QPC 时间戳校准，并作为 stream delay 提供给 AEC3；只表示 WASAPI 队列偏移，不包含 Bluetooth 或声学传播延迟。",
+      rawSkew: "原始时钟偏差",
+      rawSkewHelp:
+        "当前 capture timestamp 减去最新 render timestamp 的原始有符号差值。负值会被钳制为 0 ms，不会作为负 delay 传给 AEC3。",
+      hostJitter: "主机延迟抖动",
+      hostJitterHelp:
+        "Host delay 相对平滑估值的指数移动平均偏差；持续升高通常表示队列时序不稳定。",
+      calibration: "延迟校准状态",
+      calibrationHelp:
+        "等待表示尚无有效时间戳，预热中表示正在收集稳定样本，已校准表示已有可持续使用的 host delay。",
+      calibrated: "已校准",
+      warming: "预热中",
+      waiting: "等待",
+      delayResets: "延迟重置次数",
+      delayResetsHelp:
+        "本次启动中因 WASAPI discontinuity、无效时间戳或大幅时序跳变而重置 delay estimator 与 AEC echo path 的累计次数。",
+      aecDelay: "AEC3 估计延迟",
+      aecDelayHelp:
+        "AEC3 对实际回声路径的独立内部估算，包括音响、Bluetooth 和声学传播；不会反馈成 Host delay，避免重复补偿。",
+      erl: "回声回损 ERL",
+      erlHelp:
+        "Echo Return Loss，表示麦克风收到的回声相对播放 reference 的衰减。",
+      erle: "增强回损 ERLE",
+      erleHelp:
+        "Echo Return Loss Enhancement，表示 AEC3 额外消除的回声量。",
+      residualEcho: "残余回声概率",
+      residualEchoHelp:
+        "WebRTC ResidualEchoDetector 判断当前 AEC 输出仍与播放 reference 相关的概率；仅 Strong 启用。",
+      attenuation: "AEC3 回声衰减",
+      attenuationHelp:
+        "AEC 前后帧能量的平滑比值。负值越小表示该声音被 AEC 判定并衰减得越多。",
+      inputPeak: "麦克风输入峰值",
+      inputPeakHelp:
+        "本次启动以来物理麦克风输入的最高峰值；接近 0 dBFS 且 clipping 增长表示输入端已经削波。",
+      outputPeak: "处理后输出峰值",
+      outputPeakHelp: "本次启动以来 DSP 最终输出的最高峰值。",
+      inputClipping: "输入削波样本",
+      inputClippingHelp:
+        "物理麦克风输入绝对幅度达到 0.999 以上的样本累计数；持续增长通常表示输入增益过高。",
+      limiterSamples: "Limiter 限幅样本",
+      limiterSamplesHelp:
+        "最终 limiter 实际压低的样本累计数；增长表示 DSP 输出曾接近或超过 ceiling。",
+      rnnoiseVad: "RNNoise VAD 概率",
+      rnnoiseVadHelp:
+        "RNNoise 当前帧的语音概率；启用 AEC3 与 Gate 时，还需要 Speech VAD 同时确认才会打开 Gate。",
+      speechVad: "WebRTC Speech VAD",
+      speechVadHelp:
+        "AEC3 各处理强度下 WebRTC VAD mode 3 的当前判定。只有它与 RNNoise 同时判断为语音才允许开 Gate。",
+      speech: "语音",
+      noise: "噪声",
+      gateState: "VAD Gate 状态",
+      gateStateHelp:
+        "VAD Gate 当前状态。只播放电脑音频时变为开启，通常表示残余回声触发了 VAD。",
+      open: "开启",
+      closed: "关闭",
+      gateEvents: "VAD Gate 开启次数",
+      gateEventsHelp:
+        "本次启动以来 VAD Gate 从关闭切换为打开的累计次数。",
+      echoGuardState: "EchoGuard 状态",
+      echoGuardStateHelp:
+        "Strong 模式下的 residual echo 保护。生效时会阻止与播放相关且被 AEC 明显衰减的声音误开 VAD Gate。",
+      active: "生效",
+      idle: "空闲",
+      echoGuardEvents: "EchoGuard 触发次数",
+      echoGuardEventsHelp:
+        "本次启动以来 Echo guard 从空闲进入生效状态的累计次数。",
+      nearendCandidates: "近端语音候选次数",
+      nearendCandidatesHelp:
+        "Echo guard 生效期间，近端语音候选段开始的累计次数；键盘或残余回声可能产生候选，但不会立刻放行。",
+      echoGuardReleases: "EchoGuard 放行次数",
+      echoGuardReleasesHelp:
+        "近端候选同时满足 VAD、AEC 瞬时/平滑衰减和低回声概率，并连续维持 60 ms 后，Echo guard 实际释放的累计次数；纯播放测试中应为 0。",
+    },
+    rnnoise: {
+      enabled: "启用 RNNoise",
+      enabledHelp:
+        "使用 RNNoise 抑制风扇、键盘和环境底噪。强噪声下可能损失少量齿音或尾音。",
+      mix: "RNNoise 降噪混合比例",
+      mixHelp:
+        "控制降噪结果的混合比例。0% 为原始声音，100% 为完整 RNNoise 输出；降低比例可换取更自然的音质。",
+    },
+    agc2: {
+      enabled: "启用 AGC2",
+      enabledHelp:
+        "自动稳定说话音量，让远近和轻重不同的语音保持在较一致的响度，同时受最大增益和 noise limit 约束。",
+      adaptive: "AGC2 自适应数字增益",
+      adaptiveHelp:
+        "根据当前语音响度动态调整 digital gain。关闭后 AGC2 只应用 Fixed gain，不会自动追踪音量。",
+      advanced: "AGC2 高级参数",
+      fixedGain: "AGC2 固定增益",
+      fixedGainHelp:
+        "始终施加的固定数字增益。提高会让所有声音一起变大，包括底噪；通常保持 0 dB。",
+      headroom: "AGC2 输出余量",
+      headroomHelp:
+        "目标峰值距离 0 dBFS 的安全余量。数值越大越不容易削波，但最终音量也会更低。",
+      maxGain: "AGC2 最大增益",
+      maxGainHelp:
+        "Adaptive digital gain 允许施加的最大增益。过高会把安静环境中的底噪明显放大。",
+      initialGain: "AGC2 初始增益",
+      initialGainHelp:
+        "AGC2 启动时使用的初始增益，之后会逐步调整。接近期望稳态值可减少启动阶段的音量变化。",
+      gainSpeed: "AGC2 增益变化速度",
+      gainSpeedHelp:
+        "每秒允许改变的最大增益。越高响应越快，但更容易出现音量抽动；越低更自然但收敛更慢。",
+      noiseLimit: "AGC2 输出噪声上限",
+      noiseLimitHelp:
+        "限制 AGC2 放大后的估计噪声电平。数值越负限制越严格，可减少底噪抬升，但也可能限制弱语音增益。",
+    },
+    vad: {
+      enabled: "启用 VAD Gate",
+      enabledHelp:
+        "根据 RNNoise 的语音概率控制 noise gate。无人声时把信号压低到 Floor，减少残余噪声和残余回声。",
+      threshold: "VAD 语音检测阈值",
+      thresholdHelp:
+        "判定为语音所需的最低概率。提高会更积极地关闭噪声，但可能漏掉轻声或句尾；降低则更容易保持开启。",
+      confirmation: "VAD 连续确认时长",
+      confirmationHelp:
+        "VAD 必须连续超过 Threshold 的时间。增加可过滤键盘敲击等短瞬态；默认 Natural/Balanced 的 DSP 固定延迟约 120 ms，Strong 因 Echo guard 约 190 ms，pre-roll 会保留语音起音。",
+      hold: "VAD Gate 保持时长",
+      holdHelp:
+        "检测不到语音后继续保持 gate 开启的时间。增加可保留短暂停顿和句尾，但会多放出一段环境声。",
+      floor: "VAD Gate 关闭电平",
+      floorHelp:
+        "Gate 关闭时的输出电平。数值越负越安静；-90 dB 接近静音，较高数值会保留更多自然底噪。",
+      attack: "VAD Gate 开启淡入时长",
+      attackHelp:
+        "检测到语音后从 Floor 恢复到正常音量的淡入时间。越短起音越完整，过短可能产生突变。",
+      release: "VAD Gate 关闭淡出时长",
+      releaseHelp:
+        "Hold 结束后从正常音量降到 Floor 的淡出时间。越长关闭越自然，但残余噪声持续更久。",
+    },
+    limiter: {
+      ceiling: "Limiter 输出峰值上限",
+      ceilingHelp:
+        "最终输出允许达到的最高峰值。保持低于 0 dBFS 可防止削波；-1 dBFS 通常兼顾响度和安全余量。",
+      release: "Limiter 增益恢复时长",
+      releaseHelp:
+        "峰值结束后 limiter 恢复正常增益的时间。过短可能产生 pumping，过长会让后续声音暂时偏小。",
+    },
+  },
+} as const;
+
+export type Translation = TranslationShape<typeof zhCN>;
+
+const en = {
+  common: {
+    language: "Interface language",
+    loading: "Reading audio devices",
+    start: "Start",
+    stop: "Stop",
+    cancelPending: "Cancel pending",
+    applySettings: "Apply settings",
+    pendingSettings: "Settings have unapplied changes",
+  },
+  app: {
+    eyebrow: "LOCAL AUDIO ENGINE",
+    subtitle: "Local real-time echo cancellation, noise suppression, and voice enhancement",
+    sessionUnavailable:
+      "The Windows session is unavailable. Microphone processing is paused and will resume in its previous state when the session returns.",
+  },
+  navigation: {
+    workspace: "Workspace",
+    monitor: "Live monitor",
+    routing: "Devices & runtime",
+    processing: "Processing",
+  },
+  views: {
+    monitor: {
+      eyebrow: "REAL-TIME ENGINE",
+      title: "Live audio monitor",
+      subtitle: "Observe echo cancellation, voice detection, and the complete audio path",
+      telemetryTitle: "Signal telemetry",
+      telemetrySubtitle: "Latest 72 status samples",
+      telemetryAria: "Time series of VAD probability and AEC3 echo attenuation",
+      vadLegend: "VAD probability",
+      attenuationLegend: "Echo attenuation",
+      gateWindow: "Gate-open window",
+      inputPeak: "Input peak",
+      outputPeak: "Output peak",
+      vadProbability: "Current VAD",
+      snapshotTitle: "Engine snapshot",
+      snapshotSubtitle: "Current processing state",
+      calibration: "Delay calibration",
+      gateState: "VAD Gate",
+      echoGuard: "EchoGuard",
+      activeRoute: "Active signal path",
+      activeRouteSubtitle: "Playback reference and microphone converge before virtual output",
+      renderSource: "Playback reference",
+      captureSource: "Physical microphone",
+      processor: "XMic DSP",
+      outputDestination: "Virtual microphone",
+      chainTitle: "DSP modules",
+      chainSubtitle: "Select a module to open its workbench",
+      healthTitle: "Pipeline health",
+      healthSubtitle: "Totals for the current run",
+    },
+    routing: {
+      eyebrow: "DEVICES & RUNTIME",
+      title: "Devices & runtime",
+      subtitle: "Configure audio devices, failure protection, and background behavior",
+      configuration: "Device configuration",
+      configurationSubtitle: "Input, reference, and output endpoints",
+      active: "Current active route",
+      activeSubtitle: "Endpoints used by the engine",
+      safety: "Failure protection",
+      safetySubtitle: "Output policy after a DSP failure",
+      lifecycle: "Background lifecycle",
+      lifecycleSubtitle: "Login and launch behavior",
+    },
+    processing: {
+      eyebrow: "DSP WORKBENCH",
+      title: "Processing chain",
+      subtitle: "Tune echo cancellation, noise suppression, gain, and voice gating in signal order",
+      pipelineAria: "DSP processing modules",
+      editorLabel: "Selected module",
+      alwaysOn: "Always on",
+      diagnostics: "AEC3 runtime diagnostics",
+      diagnosticsSubtitle: "Detailed Delay, ERLE, VAD, and EchoGuard telemetry",
+      stopToEdit: "Parameters are locked while processing; stop the engine to edit",
+    },
+  },
+  engineModes: {
+    sleeping: "Stopped",
+    starting: "Starting",
+    converging: "AEC converging",
+    active: "Processing",
+    rawFallback: "Raw microphone passthrough",
+    safeMode: "Safe mode",
+    muted: "Muted after failure",
+    error: "Waiting to reconnect",
+  },
+  processingLoads: {
+    full: "Full",
+    reduced: "Reduced",
+    protection: "Protection",
+  },
+  status: {
+    title: "Status",
+    dspP99: "DSP processing P99",
+    dspP99Title: (maximum: string, misses: string) =>
+      `Maximum ${maximum} µs · ${misses} deadline misses`,
+    cpuLoad: "CPU load mode",
+    cpuLoadTitle: (exceeded: string, degradations: string, recoveries: string) =>
+      `${exceeded} budget exceedances · ${degradations} degradations · ${recoveries} recoveries`,
+    processedBlocks: "Processed blocks",
+    deviceRestarts: "Pipeline restarts",
+    outputQueue: "Output queue latency",
+    outputQueueHelp:
+      "Virtual output queue depth and the current resampling correction applied to compensate for drift between independent device clocks.",
+    audioAnomalies: "Audio anomaly counts",
+    audioAnomaliesHelp:
+      "Render underrun / render overflow / capture overflow / output underrun / output overflow / DSP failure",
+  },
+  routing: {
+    title: "Devices & runtime",
+    refresh: "Refresh audio devices",
+    followDefaultRender: "Follow Windows default playback device",
+    followDefaultRenderHelp:
+      "Automatically use the current Windows default playback device as the AEC reference. XMic rebuilds the audio pipeline when you switch speakers or headsets. Do not set CABLE Input as the default playback device.",
+    renderReference: "AEC playback reference",
+    renderReferenceHelp:
+      "Select the speakers or headset that are actually playing sound. AEC3 uses this device as the far-end reference; choosing the wrong device prevents echo cancellation.",
+    selectRender: "Select playback device",
+    savedRenderUnavailable: "Saved playback device is unavailable",
+    captureInput: "Physical microphone input",
+    captureInputHelp:
+      "Select the physical microphone to process. When following the default, this changes with the Windows default recording device. Do not select CABLE Output.",
+    followDefaultCapture: "Follow Windows default microphone",
+    savedCaptureUnavailable: "Saved microphone is unavailable",
+    captureChannel: "Microphone input channel",
+    captureChannelHelp:
+      "Auto continuously compares the input energy of multi-channel USB microphones or audio interfaces and uses a stable active channel. Select a fixed channel if Auto does not match the device wiring.",
+    savedChannel: (channel: number) => `Channel ${channel} (saved)`,
+    processedOutput: "Processed virtual microphone",
+    processedOutputHelp:
+      "XMic writes processed audio to this playback endpoint. With VB-CABLE, select the standard CABLE Input, then configure games or voice apps to capture the corresponding CABLE Output.",
+    selectVirtualOutput: "Select virtual output device",
+    selectCableInput: "Select CABLE Input",
+    savedOutputUnavailable: "Saved virtual output is unavailable",
+    detectedVirtualDevices: "Detected virtual devices",
+    otherRenderEndpoints: "Other playback endpoints",
+    activeRouteAria: "Current active route",
+    currentRoute: "Current route",
+    render: "Playback reference",
+    capture: "Physical microphone",
+    output: "Virtual microphone",
+    dspProfile: "DSP profile",
+    customizedProfile: "Current device pair · Saved settings",
+    defaultProfile: "Current device pair · Default settings",
+    waitingProfile: "Waiting for device pair",
+    failurePolicy: "DSP failure policy",
+    failurePolicyHelp:
+      "Select the output behavior after a DSP failure. Raw passthrough keeps your microphone available but may leak echo and noise. Mute prevents leakage, but others cannot hear you during the failure.",
+    rawPassthrough: "Raw passthrough",
+    mute: "Mute",
+    background: "Background and startup",
+    backgroundHelp:
+      "XMic remains in the system tray after the main window closes. Processing pauses while Windows is locked, disconnected, or asleep, then resumes in its previous state when the session returns.",
+    launchAtLogin: "Launch at login",
+    launchAtLoginHelp:
+      "Start XMic in the system tray when you sign in to Windows without opening the main window. Disabling this does not remove startup entries from other applications.",
+    startOnLaunch: "Start processing after launch",
+    startOnLaunchHelp:
+      "Automatically start real-time processing with the saved AEC3, RNNoise, and audio routing settings whenever XMic launches. It retries in the background while devices are unavailable.",
+    defaultRenderConflict: (name: string) =>
+      `The Windows default playback device “${name}” is also selected as the virtual microphone output. Set your speakers or headset as the Windows default playback device, then refresh devices.`,
+    renderConflict: (name: string) =>
+      `The playback reference “${name}” cannot also be the virtual microphone output. Select the speakers or headset that are actually playing sound as the playback reference.`,
+  },
+  dsp: {
+    title: "DSP Chain",
+    aecSubtitle: "Echo cancellation",
+    rnnoiseSubtitle: "Noise suppression",
+    agc2Subtitle: "Automatic gain control",
+    vadSubtitle: "Voice activity gate",
+    limiterSubtitle: "Output ceiling",
+    aec: {
+      enabled: "Enable AEC3",
+      enabledHelp:
+        "Use playback audio as a reference to estimate and remove speaker echo captured by the microphone. Disabling this turns off echo cancellation.",
+      preset: "AEC3 echo cancellation strength",
+      presetHelp:
+        "Natural prioritizes natural voice quality. Balanced adds stronger residual echo suppression. Strong provides maximum suppression but is more likely to attenuate near-end speech.",
+      highPass: "AEC3 high-pass filter",
+      highPassHelp:
+        "Filter low-frequency rumble, desk vibration, and some wind noise from the microphone. This usually improves AEC stability but may make the voice slightly thinner.",
+      diagnosticsAria: "AEC3 runtime diagnostics",
+    },
+    diagnostics: {
+      hostDelay: "Host pipeline delay",
+      hostDelayHelp:
+        "Calibrated from capture and latest AEC3 render QPC timestamps, then supplied to AEC3 as stream delay. It represents only WASAPI queue offset, excluding Bluetooth and acoustic propagation delay.",
+      rawSkew: "Raw clock skew",
+      rawSkewHelp:
+        "The signed difference between the current capture timestamp and latest render timestamp. Negative values are clamped to 0 ms and are never passed to AEC3 as a negative delay.",
+      hostJitter: "Host delay jitter",
+      hostJitterHelp:
+        "Exponential moving average of the deviation from smoothed host delay. Sustained increases usually indicate unstable queue timing.",
+      calibration: "Delay calibration",
+      calibrationHelp:
+        "Waiting means no valid timestamps are available, Warming means stable samples are being collected, and Calibrated means a sustainable host delay is available.",
+      calibrated: "Calibrated",
+      warming: "Warming",
+      waiting: "Waiting",
+      delayResets: "Delay resets",
+      delayResetsHelp:
+        "Number of times the delay estimator and AEC echo path were reset during this run due to WASAPI discontinuities, invalid timestamps, or large timing jumps.",
+      aecDelay: "AEC3 estimated delay",
+      aecDelayHelp:
+        "AEC3's independent estimate of the actual echo path, including speakers, Bluetooth, and acoustic propagation. It is not fed back into Host delay, avoiding duplicate compensation.",
+      erl: "Echo return loss (ERL)",
+      erlHelp:
+        "Echo Return Loss: attenuation of the echo captured by the microphone relative to the playback reference.",
+      erle: "ERL enhancement (ERLE)",
+      erleHelp:
+        "Echo Return Loss Enhancement: the additional echo attenuation applied by AEC3.",
+      residualEcho: "Residual echo likelihood",
+      residualEchoHelp:
+        "The WebRTC ResidualEchoDetector estimate that AEC output is still correlated with the playback reference. Enabled only in Strong mode.",
+      attenuation: "AEC3 echo attenuation",
+      attenuationHelp:
+        "Smoothed ratio of frame energy before and after AEC. More negative values mean AEC classified and attenuated more of the sound.",
+      inputPeak: "Microphone input peak",
+      inputPeakHelp:
+        "Highest physical microphone input peak during this run. Values near 0 dBFS with a rising clipping count indicate input clipping.",
+      outputPeak: "Processed output peak",
+      outputPeakHelp: "Highest final DSP output peak during this run.",
+      inputClipping: "Input clipped samples",
+      inputClippingHelp:
+        "Number of physical microphone samples with absolute amplitude at or above 0.999. Sustained growth usually means the input gain is too high.",
+      limiterSamples: "Limiter-reduced samples",
+      limiterSamplesHelp:
+        "Number of samples actually reduced by the final limiter. Growth means DSP output approached or exceeded the ceiling.",
+      rnnoiseVad: "RNNoise VAD probability",
+      rnnoiseVadHelp:
+        "Current RNNoise speech probability. When AEC3 and Gate are enabled, Speech VAD must also confirm speech before the Gate opens.",
+      speechVad: "WebRTC Speech VAD",
+      speechVadHelp:
+        "Current WebRTC VAD mode 3 decision for the selected AEC3 strength. Both it and RNNoise must classify speech before the Gate can open.",
+      speech: "Speech",
+      noise: "Noise",
+      gateState: "VAD Gate state",
+      gateStateHelp:
+        "Current VAD Gate state. If it opens while only computer audio is playing, residual echo probably triggered the VAD.",
+      open: "Open",
+      closed: "Closed",
+      gateEvents: "VAD Gate open events",
+      gateEventsHelp:
+        "Number of transitions from closed to open during this run.",
+      echoGuardState: "EchoGuard state",
+      echoGuardStateHelp:
+        "Residual echo protection used in Strong mode. Active prevents playback-correlated audio that AEC strongly attenuated from opening the VAD Gate.",
+      active: "Active",
+      idle: "Idle",
+      echoGuardEvents: "EchoGuard activation events",
+      echoGuardEventsHelp:
+        "Number of EchoGuard transitions from Idle to Active during this run.",
+      nearendCandidates: "Near-end speech candidates",
+      nearendCandidatesHelp:
+        "Number of near-end speech candidate segments started while EchoGuard was Active. Keyboard noise or residual echo may create candidates but is not released immediately.",
+      echoGuardReleases: "EchoGuard release events",
+      echoGuardReleasesHelp:
+        "Number of candidates released after simultaneously meeting VAD, instantaneous and smoothed AEC attenuation, and low echo probability requirements for 60 ms. This should remain 0 in playback-only tests.",
+    },
+    rnnoise: {
+      enabled: "Enable RNNoise",
+      enabledHelp:
+        "Use RNNoise to suppress fans, keyboard noise, and ambient background noise. Strong noise may cost a small amount of sibilance or word endings.",
+      mix: "RNNoise suppression mix",
+      mixHelp:
+        "Set the mix of noise-suppressed audio. 0% is the original signal and 100% is full RNNoise output. Lower values trade suppression for a more natural sound.",
+    },
+    agc2: {
+      enabled: "Enable AGC2",
+      enabledHelp:
+        "Automatically stabilize voice volume across different distances and speaking levels, constrained by maximum gain and the noise limit.",
+      adaptive: "AGC2 adaptive digital gain",
+      adaptiveHelp:
+        "Dynamically adjust digital gain based on current speech level. When disabled, AGC2 applies only Fixed gain and does not track volume.",
+      advanced: "Advanced AGC2 parameters",
+      fixedGain: "AGC2 fixed gain",
+      fixedGainHelp:
+        "Digital gain applied at all times. Increasing it raises every sound, including background noise. Normally leave this at 0 dB.",
+      headroom: "AGC2 output headroom",
+      headroomHelp:
+        "Safety margin between the target peak and 0 dBFS. Higher values reduce clipping risk but also lower final volume.",
+      maxGain: "AGC2 maximum gain",
+      maxGainHelp:
+        "Maximum gain allowed for Adaptive digital gain. High values can noticeably amplify background noise in quiet environments.",
+      initialGain: "AGC2 initial gain",
+      initialGainHelp:
+        "Gain used when AGC2 starts before it gradually adapts. A value near the expected steady state reduces startup volume changes.",
+      gainSpeed: "AGC2 gain change speed",
+      gainSpeedHelp:
+        "Maximum gain change per second. Higher values respond faster but can cause volume pumping; lower values sound more natural but converge slowly.",
+      noiseLimit: "AGC2 output noise limit",
+      noiseLimitHelp:
+        "Limit the estimated noise level after AGC2 amplification. More negative values impose a stricter limit, reducing raised background noise but potentially limiting quiet speech gain.",
+    },
+    vad: {
+      enabled: "Enable VAD Gate",
+      enabledHelp:
+        "Use RNNoise speech probability to control the noise gate. When there is no speech, reduce the signal to Floor to suppress residual noise and echo.",
+      threshold: "VAD speech threshold",
+      thresholdHelp:
+        "Minimum probability required to classify speech. Higher values close more aggressively but may miss quiet speech or word endings; lower values stay open more easily.",
+      confirmation: "VAD confirmation time",
+      confirmationHelp:
+        "Time VAD must remain above Threshold. Increasing it filters short transients such as keyboard strikes. Default fixed DSP delay is about 120 ms for Natural/Balanced and 190 ms for Strong due to EchoGuard; pre-roll preserves speech onset.",
+      hold: "VAD Gate hold time",
+      holdHelp:
+        "Keep the Gate open for this duration after speech is no longer detected. Higher values preserve short pauses and word endings but pass more ambient sound.",
+      floor: "VAD Gate closed level",
+      floorHelp:
+        "Output level while the Gate is closed. More negative values are quieter; -90 dB is nearly silent, while higher values preserve more natural background noise.",
+      attack: "VAD Gate attack time",
+      attackHelp:
+        "Fade from Floor to normal volume after speech is detected. Shorter times preserve speech onset; excessively short times may produce an abrupt transition.",
+      release: "VAD Gate release time",
+      releaseHelp:
+        "Fade from normal volume to Floor after Hold ends. Longer times close more naturally but retain residual noise for longer.",
+    },
+    limiter: {
+      ceiling: "Limiter output ceiling",
+      ceilingHelp:
+        "Highest permitted final output peak. Keep this below 0 dBFS to prevent clipping; -1 dBFS usually balances loudness and safety margin.",
+      release: "Limiter gain recovery time",
+      releaseHelp:
+        "Time for limiter gain to recover after a peak. Too short may cause pumping; too long temporarily reduces following audio.",
+    },
+  },
+} satisfies Translation;
+
+export const translations: Record<Language, Translation> = {
+  "zh-CN": zhCN,
+  en,
+};
+
+export function readStoredLanguage(): Language {
+  try {
+    const value = window.localStorage.getItem(LANGUAGE_STORAGE_KEY);
+    return value === "en" || value === "zh-CN" ? value : DEFAULT_LANGUAGE;
+  } catch {
+    return DEFAULT_LANGUAGE;
+  }
+}
+
+export function storeLanguage(language: Language): void {
+  try {
+    window.localStorage.setItem(LANGUAGE_STORAGE_KEY, language);
+  } catch {
+    // A denied storage write should not prevent an in-memory language change.
+  }
+}

@@ -1,0 +1,12 @@
+[package]
+name = "xmic-engine-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+xmic-engine-core = { path = "../engine-core" }
+xmic-engine-protocol = { path = "../engine-protocol" }
+xmic-rnnoise-dsp = { path = "../rnnoise-dsp" }
+xmic-webrtc-dsp = { path = "../webrtc-dsp" }

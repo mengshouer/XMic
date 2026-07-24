@@ -1,0 +1,47 @@
+[workspace]
+members = [
+  "apps/audio-spike",
+  "crates/engine-core",
+  "crates/engine-protocol",
+  "crates/engine-runtime",
+  "crates/platform-api",
+  "crates/platform-windows",
+  "crates/rnnoise-dsp",
+  "crates/webrtc-dsp",
+  "src-tauri",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+
+[workspace.dependencies]
+audioadapter-buffers = "4.0.0"
+libloading = "0.8"
+nnnoiseless = { version = "0.5.2", default-features = false }
+rubato = { version = "4.0.0", default-features = false }
+rtrb = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+windows = { version = "0.61.3", features = [
+  "Win32_Devices_FunctionDiscovery",
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_Media_Audio",
+  "Win32_Security",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_LibraryLoader",
+  "Win32_System_IO",
+  "Win32_System_Pipes",
+  "Win32_System_RemoteDesktop",
+  "Win32_System_Threading",
+  "Win32_System_Variant",
+  "Win32_UI_Shell_PropertiesSystem",
+  "Win32_UI_WindowsAndMessaging",
+] }
+windows-core = "0.61.2"

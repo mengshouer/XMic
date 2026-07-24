@@ -1,0 +1,14 @@
+[package]
+name = "xmic-audio-spike"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+xmic-engine-core = { path = "../../crates/engine-core" }
+xmic-platform-api = { path = "../../crates/platform-api" }
+xmic-platform-windows = { path = "../../crates/platform-windows" }
+xmic-rnnoise-dsp = { path = "../../crates/rnnoise-dsp" }
+xmic-webrtc-dsp = { path = "../../crates/webrtc-dsp" }
