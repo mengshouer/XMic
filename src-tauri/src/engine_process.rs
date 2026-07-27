@@ -6,7 +6,7 @@ use xmic_platform_windows::{wait_for_process_exit, LocalIpcServer, WasapiPlatfor
 
 use crate::{
     device_profiles::DeviceProfileStore,
-    engine::RealtimeEngineController,
+    engine::{EngineStartError, RealtimeEngineController},
     engine_ipc::{read_message, write_message},
     settings_store::SettingsStore,
 };
@@ -91,13 +91,16 @@ fn handle_request(
                 false,
             )
         }
-        EngineRequest::UpdateSettings { settings } => match controller.update_settings(settings) {
+        EngineRequest::UpdateSettings { settings } => match controller.update_settings(*settings) {
             Ok(()) => (EngineResponse::Ack, false),
             Err(error) => (EngineResponse::Error(error), false),
         },
         EngineRequest::Start => match controller.start() {
             Ok(()) => (EngineResponse::Ack, false),
-            Err(error) => (EngineResponse::Error(error), false),
+            Err(EngineStartError::ConfigurationRequired(issue)) => {
+                (EngineResponse::ConfigurationRequired(issue), false)
+            }
+            Err(EngineStartError::Runtime(error)) => (EngineResponse::Error(error), false),
         },
         EngineRequest::Stop => match controller.stop() {
             Ok(()) => (EngineResponse::Ack, false),

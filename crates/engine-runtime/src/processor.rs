@@ -11,6 +11,7 @@ use xmic_webrtc_dsp::{
 };
 
 const ECHO_GUARD_SMOOTHING_PRE_ROLL_FRAMES: usize = 2;
+const SPEECH_ONSET_PRE_ROLL_FRAMES: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DspFrameMetrics {
@@ -223,15 +224,22 @@ impl DspProcessor {
         } else {
             self.post_agc_output.copy_from_slice(&self.rnnoise_output);
         }
-        let consensus_vad_probability = apply_speech_vad(vad_probability, speech_vad_active);
+        let echo_guard_vad_probability =
+            echo_guard_vad_probability(vad_probability, speech_vad_active);
         let echo_guard_metrics = self.echo_guard.process_frame(
-            consensus_vad_probability,
+            echo_guard_vad_probability,
             residual_echo_likelihood,
             capture,
             &self.aec_output,
         )?;
-        let gate_metrics = self.gate.process_frame(
-            echo_guard_metrics.effective_vad_probability,
+        let gate_vad_probability = if echo_guard_metrics.active {
+            0.0
+        } else {
+            vad_probability
+        };
+        let gate_metrics = self.gate.process_frame_with_secondary_vad(
+            gate_vad_probability,
+            speech_vad_active,
             &mut self.post_agc_output,
         )?;
         let limiter_metrics = self.limiter.process_frame(&mut self.post_agc_output)?;
@@ -312,7 +320,9 @@ fn gate_pre_roll_frames(
     } else {
         0
     };
-    confirmation_pre_roll.saturating_add(echo_guard_pre_roll)
+    confirmation_pre_roll
+        .saturating_add(SPEECH_ONSET_PRE_ROLL_FRAMES)
+        .saturating_add(echo_guard_pre_roll)
 }
 
 fn validate_capture_lengths(capture: &[f32], output: &[f32]) -> Result<(), DspProcessorError> {
@@ -327,7 +337,7 @@ fn validate_capture_lengths(capture: &[f32], output: &[f32]) -> Result<(), DspPr
     }
 }
 
-fn apply_speech_vad(vad_probability: f32, speech_vad_active: Option<bool>) -> f32 {
+fn echo_guard_vad_probability(vad_probability: f32, speech_vad_active: Option<bool>) -> f32 {
     if speech_vad_active == Some(false) {
         0.0
     } else {
@@ -411,10 +421,10 @@ mod tests {
     }
 
     #[test]
-    fn secondary_vad_vetoes_rnnoise_false_positive() {
-        assert_eq!(apply_speech_vad(0.99, Some(false)), 0.0);
-        assert_eq!(apply_speech_vad(0.99, Some(true)), 0.99);
-        assert_eq!(apply_speech_vad(0.99, None), 0.99);
+    fn secondary_vad_vetoes_echo_guard_false_positive() {
+        assert_eq!(echo_guard_vad_probability(0.99, Some(false)), 0.0);
+        assert_eq!(echo_guard_vad_probability(0.99, Some(true)), 0.99);
+        assert_eq!(echo_guard_vad_probability(0.99, None), 0.99);
     }
 
     #[test]
@@ -490,8 +500,8 @@ mod tests {
         let mut strong = natural.clone();
         strong.aec.preset = AecPreset::Strong;
 
-        assert_eq!(processing_latency_frames(&natural).unwrap(), 12);
-        assert_eq!(processing_latency_frames(&strong).unwrap(), 19);
+        assert_eq!(processing_latency_frames(&natural).unwrap(), 8);
+        assert_eq!(processing_latency_frames(&strong).unwrap(), 15);
     }
 
     #[test]
@@ -502,9 +512,17 @@ mod tests {
         let mut strong = natural.clone();
         strong.aec.preset = AecPreset::Strong;
 
-        assert_eq!(processing_latency_frames(&natural).unwrap(), 12);
-        assert_eq!(processing_latency_frames(&balanced).unwrap(), 12);
-        assert_eq!(processing_latency_frames(&strong).unwrap(), 19);
+        assert_eq!(processing_latency_frames(&natural).unwrap(), 8);
+        assert_eq!(processing_latency_frames(&balanced).unwrap(), 8);
+        assert_eq!(processing_latency_frames(&strong).unwrap(), 15);
+    }
+
+    #[test]
+    fn gate_latency_keeps_audio_before_the_first_speech_candidate() {
+        let echo_guard = EchoGuardConfig::default();
+
+        assert_eq!(gate_pre_roll_frames(true, 12, echo_guard), 15);
+        assert_eq!(gate_pre_roll_frames(false, 12, echo_guard), 0);
     }
 
     #[test]

@@ -9,12 +9,17 @@ use std::{
 
 use std::os::windows::process::CommandExt;
 use xmic_engine_protocol::{
-    AecPreset, EngineMode, EngineRequest, EngineResponse, EngineSettings, EngineStatus,
-    PROTOCOL_VERSION,
+    AecPreset, ConfigurationIssue, EngineMode, EngineRequest, EngineResponse, EngineSettings,
+    EngineStatus, PROTOCOL_VERSION,
 };
-use xmic_platform_api::EndpointDescriptor;
+use xmic_platform_api::{AudioPlatform, EndpointDescriptor};
+use xmic_platform_windows::WasapiPlatform;
 
-use crate::{engine::DspFeature, engine_ipc::send_request};
+use crate::{
+    engine::{DspFeature, EngineStartError},
+    engine_ipc::send_request,
+    route_validation::{configuration_issue, reconcile_virtual_device_settings},
+};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const IPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -75,6 +80,11 @@ impl SupervisorState {
         self.engine_restart_not_before = None;
         self.supervisor_warning = None;
     }
+
+    fn block_for_configuration(&mut self, issue: ConfigurationIssue) {
+        self.cancel_engine_start();
+        self.cached_status.configuration_issue = Some(issue);
+    }
 }
 
 impl CrashTracker {
@@ -123,6 +133,36 @@ impl EngineController {
         match self.get_status_locked(&mut state) {
             Ok(mut status) => {
                 status.endpoints = endpoints;
+                if !status.running {
+                    let mut settings = status.settings.clone();
+                    if reconcile_virtual_device_settings(&mut settings, &status.endpoints) {
+                        match self.request_locked(
+                            &mut state,
+                            &EngineRequest::UpdateSettings {
+                                settings: Box::new(settings.clone()),
+                            },
+                        ) {
+                            Ok(response) => {
+                                if let Err(error) = expect_ack(response) {
+                                    state.supervisor_warning = Some(format!(
+                                        "save virtual audio device selection: {error}"
+                                    ));
+                                } else {
+                                    status.settings = settings;
+                                }
+                            }
+                            Err(error) => {
+                                state.supervisor_warning =
+                                    Some(format!("save virtual audio device selection: {error}"));
+                            }
+                        }
+                    }
+                }
+                status.configuration_issue =
+                    configuration_issue(&status.settings, &status.endpoints);
+                if let Some(issue) = status.configuration_issue.clone() {
+                    state.block_for_configuration(issue);
+                }
                 apply_supervisor_warning(&mut status, state.supervisor_warning.as_deref());
                 state.cached_status = status.clone();
                 status
@@ -130,6 +170,8 @@ impl EngineController {
             Err(error) => {
                 let mut status = state.cached_status.clone();
                 status.endpoints = endpoints;
+                status.configuration_issue =
+                    configuration_issue(&status.settings, &status.endpoints);
                 status.running = false;
                 status.mode = if state.safe_mode {
                     EngineMode::SafeMode
@@ -150,7 +192,7 @@ impl EngineController {
         expect_ack(self.request_locked(
             &mut state,
             &EngineRequest::UpdateSettings {
-                settings: settings.clone(),
+                settings: Box::new(settings.clone()),
             },
         )?)?;
         state.cached_status.settings = settings;
@@ -194,10 +236,44 @@ impl EngineController {
         lock_unpoisoned(&self.state).requested_running
     }
 
-    pub fn start(&self) -> Result<(), String> {
+    pub fn configuration_issue(&self) -> Option<ConfigurationIssue> {
+        lock_unpoisoned(&self.state)
+            .cached_status
+            .configuration_issue
+            .clone()
+    }
+
+    pub fn start(&self) -> Result<(), EngineStartError> {
         let mut state = lock_unpoisoned(&self.state);
+        let status = self
+            .get_status_locked(&mut state)
+            .map_err(EngineStartError::Runtime)?;
+        state.cached_status = status;
+        let endpoints = WasapiPlatform::new()
+            .active_endpoints()
+            .map_err(|error| EngineStartError::Runtime(error.to_string()))?;
+        let mut settings = state.cached_status.settings.clone();
+        if reconcile_virtual_device_settings(&mut settings, &endpoints) {
+            expect_ack(
+                self.request_locked(
+                    &mut state,
+                    &EngineRequest::UpdateSettings {
+                        settings: Box::new(settings.clone()),
+                    },
+                )
+                .map_err(EngineStartError::Runtime)?,
+            )
+            .map_err(EngineStartError::Runtime)?;
+            state.cached_status.settings = settings;
+        }
+        if let Some(issue) = configuration_issue(&state.cached_status.settings, &endpoints) {
+            state.block_for_configuration(issue.clone());
+            return Err(EngineStartError::ConfigurationRequired(issue));
+        }
+        state.cached_status.configuration_issue = None;
         state.request_engine_start();
-        self.ensure_process_locked(&mut state)?;
+        self.ensure_process_locked(&mut state)
+            .map_err(EngineStartError::Runtime)?;
         match send_request(&self.pipe_name, &EngineRequest::Start, IPC_CONNECT_TIMEOUT) {
             Ok(EngineResponse::Ack) => {
                 state.mark_engine_started();
@@ -205,15 +281,22 @@ impl EngineController {
             }
             Ok(EngineResponse::Error(error)) => {
                 state.defer_engine_restart(&error);
-                Err(error)
+                Err(EngineStartError::Runtime(error))
+            }
+            Ok(EngineResponse::ConfigurationRequired(issue)) => {
+                state.block_for_configuration(issue.clone());
+                Err(EngineStartError::ConfigurationRequired(issue))
             }
             Ok(response) => {
                 state.cancel_engine_start();
-                Err(format!("unexpected helper acknowledgement: {response:?}"))
+                Err(EngineStartError::Runtime(format!(
+                    "unexpected helper acknowledgement: {response:?}"
+                )))
             }
             Err(error) => {
-                self.reap_child_locked(&mut state)?;
-                Err(error)
+                self.reap_child_locked(&mut state)
+                    .map_err(EngineStartError::Runtime)?;
+                Err(EngineStartError::Runtime(error))
             }
         }
     }
@@ -357,6 +440,9 @@ impl EngineController {
         match send_request(&self.pipe_name, request, IPC_CONNECT_TIMEOUT) {
             Ok(response) => match response {
                 EngineResponse::Error(error) => Err(error),
+                EngineResponse::ConfigurationRequired(_) => {
+                    Err("audio engine requires configuration".to_owned())
+                }
                 response => Ok(response),
             },
             Err(error) => {
@@ -378,6 +464,8 @@ impl EngineController {
         };
         if status.running {
             state.mark_engine_started();
+        } else if let Some(issue) = status.configuration_issue.clone() {
+            state.block_for_configuration(issue);
         } else if !state.requested_running && !state.safe_mode {
             state.supervisor_warning = None;
         }
@@ -404,6 +492,9 @@ impl EngineController {
                 }
                 Ok(EngineResponse::Error(error)) => {
                     state.defer_engine_restart(&error);
+                }
+                Ok(EngineResponse::ConfigurationRequired(issue)) => {
+                    state.block_for_configuration(issue);
                 }
                 Ok(response) => {
                     return Err(format!("unexpected helper restart response: {response:?}"));
@@ -469,6 +560,9 @@ fn expect_ack(response: EngineResponse) -> Result<(), String> {
     match response {
         EngineResponse::Ack => Ok(()),
         EngineResponse::Error(error) => Err(error),
+        EngineResponse::ConfigurationRequired(_) => {
+            Err("audio engine requires configuration".to_owned())
+        }
         response => Err(format!("unexpected helper acknowledgement: {response:?}")),
     }
 }
@@ -540,6 +634,23 @@ mod tests {
         assert!(!state.requested_running);
         assert!(state.engine_restart_not_before.is_none());
         assert!(state.supervisor_warning.is_none());
+    }
+
+    #[test]
+    fn configuration_blocker_cancels_pending_restart() {
+        let mut state = supervisor_state();
+        state.request_engine_start();
+        state.defer_engine_restart("route unavailable");
+
+        let issue = ConfigurationIssue::PhysicalCaptureRequired {
+            virtual_capture_endpoint_id: Some("cable-output".to_owned()),
+        };
+        state.block_for_configuration(issue.clone());
+
+        assert!(!state.requested_running);
+        assert!(state.engine_restart_not_before.is_none());
+        assert!(state.supervisor_warning.is_none());
+        assert_eq!(state.cached_status.configuration_issue, Some(issue));
     }
 
     #[test]

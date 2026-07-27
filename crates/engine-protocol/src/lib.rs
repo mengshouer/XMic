@@ -3,8 +3,15 @@
 use serde::{Deserialize, Serialize};
 use xmic_platform_api::EndpointDescriptor;
 
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 13;
 pub const MAX_CAPTURE_CHANNEL_INDEX: usize = 31;
+pub const MAX_TRUSTED_VIRTUAL_AUDIO_PAIRS: usize = 32;
+
+/// VAD gate values that earlier builds shipped as defaults. `DspSettings::migrate_legacy_defaults`
+/// rewrites exactly these two values so stored settings pick up the lower-latency defaults, while
+/// anything the user tuned by hand is left alone.
+pub const LEGACY_VAD_CONFIRMATION_MS: u32 = 120;
+pub const LEGACY_VAD_FLOOR_DB: f32 = -90.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -115,6 +122,23 @@ impl Default for Agc2Settings {
     }
 }
 
+impl Agc2Settings {
+    /// AGC2 without adaptive digital and without fixed gain only runs its internal limiter, so the
+    /// switch reads as enabled while the level stays untouched.
+    pub fn is_pass_through(&self) -> bool {
+        !self.adaptive_digital_enabled && self.fixed_gain_db <= 0.0
+    }
+
+    /// Restores the adaptive default so enabling AGC2 actually changes the level.
+    pub fn repair_pass_through(&mut self) -> bool {
+        let repaired = self.is_pass_through();
+        if repaired {
+            self.adaptive_digital_enabled = true;
+        }
+        repaired
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct VadGateSettings {
@@ -135,15 +159,17 @@ impl Default for VadGateSettings {
             threshold: 0.70,
             confirmation_ms: default_vad_confirmation_ms(),
             hold_ms: 300,
-            floor_db: -90.0,
+            floor_db: -20.0,
             attack_ms: 10.0,
             release_ms: 150.0,
         }
     }
 }
 
+/// Every 10 ms of confirmation costs 10 ms of gate look-ahead, so this value dominates the added
+/// microphone latency and decides how short an utterance can be before the gate drops it entirely.
 const fn default_vad_confirmation_ms() -> u32 {
-    120
+    40
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -172,6 +198,45 @@ pub struct DspSettings {
     pub limiter: LimiterSettings,
 }
 
+impl DspSettings {
+    /// Rewrites values that still hold a superseded default and repairs the AGC2 pass-through
+    /// combination. Callers run this once per stored file and persist the result; values the user
+    /// tuned away from the old defaults are preserved.
+    pub fn migrate_legacy_defaults(&mut self) -> bool {
+        let defaults = VadGateSettings::default();
+        let mut changed = false;
+        if self.vad_gate.confirmation_ms == LEGACY_VAD_CONFIRMATION_MS {
+            self.vad_gate.confirmation_ms = defaults.confirmation_ms;
+            changed = true;
+        }
+        if holds_value(self.vad_gate.floor_db, LEGACY_VAD_FLOOR_DB) {
+            self.vad_gate.floor_db = defaults.floor_db;
+            changed = true;
+        }
+        changed | self.agc2.repair_pass_through()
+    }
+}
+
+fn holds_value(value: f32, expected: f32) -> bool {
+    (value - expected).abs() <= f32::EPSILON
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum VirtualDeviceMode {
+    VbCable,
+    Custom,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrustedVirtualAudioPair {
+    pub render_endpoint_id: String,
+    pub capture_endpoint_id: String,
+    pub render_name: String,
+    pub capture_name: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct EngineSettings {
@@ -180,6 +245,9 @@ pub struct EngineSettings {
     pub capture_endpoint_id: Option<String>,
     pub capture_channel: Option<usize>,
     pub output_endpoint_id: Option<String>,
+    pub virtual_device_mode: Option<VirtualDeviceMode>,
+    pub virtual_capture_endpoint_id: Option<String>,
+    pub trusted_virtual_audio_pairs: Vec<TrustedVirtualAudioPair>,
     pub failure_policy: DspFailurePolicy,
     pub dsp: DspSettings,
 }
@@ -192,6 +260,9 @@ impl Default for EngineSettings {
             capture_endpoint_id: None,
             capture_channel: None,
             output_endpoint_id: None,
+            virtual_device_mode: None,
+            virtual_capture_endpoint_id: None,
+            trusted_virtual_audio_pairs: Vec::new(),
             failure_policy: DspFailurePolicy::Mute,
             dsp: DspSettings::default(),
         }
@@ -203,6 +274,14 @@ impl EngineSettings {
         validate_optional_endpoint(&self.render_endpoint_id)?;
         validate_optional_endpoint(&self.capture_endpoint_id)?;
         validate_optional_endpoint(&self.output_endpoint_id)?;
+        validate_optional_endpoint(&self.virtual_capture_endpoint_id)?;
+        if self.trusted_virtual_audio_pairs.len() > MAX_TRUSTED_VIRTUAL_AUDIO_PAIRS {
+            return Err(SettingsError::TooManyTrustedVirtualAudioPairs);
+        }
+        for pair in &self.trusted_virtual_audio_pairs {
+            validate_endpoint(&pair.render_endpoint_id)?;
+            validate_endpoint(&pair.capture_endpoint_id)?;
+        }
         if self
             .capture_channel
             .is_some_and(|channel| channel > MAX_CAPTURE_CHANNEL_INDEX)
@@ -215,6 +294,9 @@ impl EngineSettings {
         validate_range("RNNoise mix", self.dsp.rnnoise.mix, 0.0, 1.0)?;
         if self.dsp.vad_gate.enabled && !self.dsp.rnnoise.enabled {
             return Err(SettingsError::VadRequiresRnnoise);
+        }
+        if self.dsp.agc2.enabled && self.dsp.agc2.is_pass_through() {
+            return Err(SettingsError::Agc2WouldPassThrough);
         }
         validate_range("AGC2 fixed gain", self.dsp.agc2.fixed_gain_db, 0.0, 30.0)?;
         validate_range("AGC2 headroom", self.dsp.agc2.headroom_db, 0.0, 30.0)?;
@@ -269,6 +351,14 @@ fn validate_optional_endpoint(endpoint_id: &Option<String>) -> Result<(), Settin
     }
 }
 
+fn validate_endpoint(endpoint_id: &str) -> Result<(), SettingsError> {
+    if endpoint_id.trim().is_empty() {
+        Err(SettingsError::EmptyEndpointId)
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_range(
     name: &'static str,
     value: f32,
@@ -290,6 +380,10 @@ pub enum SettingsError {
     FixedRenderEndpointRequired,
     #[error("VAD gate requires RNNoise")]
     VadRequiresRnnoise,
+    #[error("AGC2 needs adaptive digital gain or a fixed gain above 0 dB to change the level")]
+    Agc2WouldPassThrough,
+    #[error("too many trusted virtual audio device pairs")]
+    TooManyTrustedVirtualAudioPairs,
     #[error("{0} is outside its supported range")]
     OutOfRange(&'static str),
 }
@@ -308,6 +402,37 @@ pub struct ActiveDeviceProfile {
     pub render_endpoint_id: String,
     pub capture_endpoint_id: String,
     pub customized: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum VirtualDeviceIssueReason {
+    VbCableUnavailable,
+    CustomPairIncomplete,
+    CustomPairUnconfirmed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum VirtualRouteConflictKind {
+    DefaultRender,
+    FixedRender,
+    PhysicalCapture,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum ConfigurationIssue {
+    PhysicalCaptureRequired {
+        virtual_capture_endpoint_id: Option<String>,
+    },
+    VirtualDeviceRequired {
+        reason: VirtualDeviceIssueReason,
+    },
+    VirtualRouteConflict {
+        kind: VirtualRouteConflictKind,
+        endpoint_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -330,6 +455,16 @@ pub struct EngineMetrics {
     pub processing_overload_events: u64,
     pub processing_recovery_events: u64,
     pub processing_load_mode: ProcessingLoadMode,
+    /// Measured microphone-to-worker latency: the age of a capture packet when the WASAPI worker
+    /// receives it plus any backlog waiting for the DSP thread.
+    pub capture_latency_ms: f32,
+    /// Deterministic DSP look-ahead: gate pre-roll plus RNNoise.
+    pub dsp_latency_ms: f32,
+    /// Measured write-to-endpoint latency: software queue, endpoint buffer fill, and the latency the
+    /// output driver reports. The virtual cable's internal buffering is not observable from here.
+    pub output_latency_ms: f32,
+    /// Sum of the three segments above — the latency XMic adds before the voice app sees the audio.
+    pub pipeline_latency_ms: f32,
     pub host_delay_ms: Option<i32>,
     pub host_delay_raw_skew_ms: Option<f32>,
     pub host_delay_jitter_ms: Option<f32>,
@@ -365,6 +500,7 @@ pub struct EngineStatus {
     pub settings: EngineSettings,
     pub active_route: Option<ActiveRoute>,
     pub active_device_profile: Option<ActiveDeviceProfile>,
+    pub configuration_issue: Option<ConfigurationIssue>,
     pub metrics: EngineMetrics,
     pub warning: Option<String>,
 }
@@ -380,6 +516,7 @@ impl EngineStatus {
             settings: EngineSettings::default(),
             active_route: None,
             active_device_profile: None,
+            configuration_issue: None,
             metrics: EngineMetrics::default(),
             warning: None,
         }
@@ -391,7 +528,7 @@ impl EngineStatus {
 pub enum EngineRequest {
     Hello { protocol_version: u16 },
     GetStatus { include_endpoints: bool },
-    UpdateSettings { settings: EngineSettings },
+    UpdateSettings { settings: Box<EngineSettings> },
     Start,
     Stop,
     Shutdown,
@@ -403,6 +540,7 @@ pub enum EngineResponse {
     Hello { protocol_version: u16 },
     Status(Box<EngineStatus>),
     Ack,
+    ConfigurationRequired(ConfigurationIssue),
     Error(String),
 }
 
@@ -419,10 +557,11 @@ mod tests {
         assert_eq!(settings.dsp.rnnoise.mix, 1.0);
         assert_eq!(settings.dsp.agc2.max_gain_db, 6.0);
         assert!(!settings.dsp.agc2.enabled);
+        assert!(settings.dsp.agc2.adaptive_digital_enabled);
         assert!(settings.dsp.vad_gate.enabled);
         assert_eq!(settings.dsp.vad_gate.threshold, 0.70);
-        assert_eq!(settings.dsp.vad_gate.confirmation_ms, 120);
-        assert_eq!(settings.dsp.vad_gate.floor_db, -90.0);
+        assert_eq!(settings.dsp.vad_gate.confirmation_ms, 40);
+        assert_eq!(settings.dsp.vad_gate.floor_db, -20.0);
         assert_eq!(settings.dsp.limiter.ceiling_dbfs, -1.0);
         assert_eq!(settings.failure_policy, DspFailurePolicy::Mute);
         assert_eq!(settings.capture_channel, None);
@@ -438,7 +577,78 @@ mod tests {
 
         let settings: EngineSettings = serde_json::from_value(value).unwrap();
 
-        assert_eq!(settings.dsp.vad_gate.confirmation_ms, 120);
+        assert_eq!(settings.dsp.vad_gate.confirmation_ms, 40);
+    }
+
+    #[test]
+    fn migration_replaces_only_the_superseded_gate_defaults() {
+        let mut dsp = DspSettings::default();
+        dsp.vad_gate.confirmation_ms = LEGACY_VAD_CONFIRMATION_MS;
+        dsp.vad_gate.floor_db = LEGACY_VAD_FLOOR_DB;
+        dsp.vad_gate.hold_ms = 500;
+
+        assert!(dsp.migrate_legacy_defaults());
+
+        assert_eq!(dsp.vad_gate.confirmation_ms, 40);
+        assert_eq!(dsp.vad_gate.floor_db, -20.0);
+        assert_eq!(dsp.vad_gate.hold_ms, 500);
+    }
+
+    #[test]
+    fn migration_keeps_hand_tuned_gate_values() {
+        let mut dsp = DspSettings::default();
+        dsp.vad_gate.confirmation_ms = 200;
+        dsp.vad_gate.floor_db = -45.0;
+
+        assert!(!dsp.migrate_legacy_defaults());
+
+        assert_eq!(dsp.vad_gate.confirmation_ms, 200);
+        assert_eq!(dsp.vad_gate.floor_db, -45.0);
+    }
+
+    #[test]
+    fn migration_arms_a_pass_through_agc2() {
+        let mut dsp = DspSettings::default();
+        dsp.agc2.adaptive_digital_enabled = false;
+        dsp.agc2.fixed_gain_db = 0.0;
+
+        assert!(dsp.migrate_legacy_defaults());
+
+        assert!(dsp.agc2.adaptive_digital_enabled);
+    }
+
+    #[test]
+    fn migration_keeps_a_fixed_gain_only_agc2() {
+        let mut dsp = DspSettings::default();
+        dsp.agc2.adaptive_digital_enabled = false;
+        dsp.agc2.fixed_gain_db = 6.0;
+
+        assert!(!dsp.migrate_legacy_defaults());
+
+        assert!(!dsp.agc2.adaptive_digital_enabled);
+    }
+
+    #[test]
+    fn rejects_an_enabled_agc2_that_would_pass_through() {
+        let mut settings = EngineSettings::default();
+        settings.dsp.agc2.enabled = true;
+        settings.dsp.agc2.adaptive_digital_enabled = false;
+
+        assert_eq!(
+            settings.validate(),
+            Err(SettingsError::Agc2WouldPassThrough)
+        );
+
+        settings.dsp.agc2.fixed_gain_db = 3.0;
+        settings.validate().unwrap();
+    }
+
+    #[test]
+    fn a_disabled_pass_through_agc2_stays_loadable() {
+        let mut settings = EngineSettings::default();
+        settings.dsp.agc2.adaptive_digital_enabled = false;
+
+        settings.validate().unwrap();
     }
 
     #[test]

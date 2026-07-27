@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use xmic_engine_protocol::{ActiveDeviceProfile, DspSettings};
 use xmic_platform_api::EndpointDescriptor;
 
-const PROFILE_SCHEMA_VERSION: u16 = 1;
+const PROFILE_SCHEMA_VERSION: u16 = 2;
 
 #[derive(Debug, Clone)]
 pub struct ResolvedDeviceProfile {
@@ -50,7 +50,11 @@ pub struct DeviceProfileStore {
 
 impl DeviceProfileStore {
     pub fn new(path: PathBuf) -> Self {
-        let profiles = load_profiles(&path).unwrap_or_default();
+        let (profiles, migrated) =
+            load_profiles(&path).unwrap_or_else(|| (StoredDeviceProfiles::default(), false));
+        if migrated {
+            let _ = save_profiles(&path, &profiles);
+        }
         Self {
             path,
             profiles: Mutex::new(profiles),
@@ -157,10 +161,23 @@ fn resolved_profile(profile: &StoredDeviceProfile) -> ResolvedDeviceProfile {
     }
 }
 
-fn load_profiles(path: &Path) -> Option<StoredDeviceProfiles> {
+/// Returns the stored profiles plus whether they were rewritten and need persisting. An unknown
+/// future version is discarded rather than guessed at; version 1 is migrated in place so a profile
+/// that still holds superseded DSP defaults picks up the current ones.
+fn load_profiles(path: &Path) -> Option<(StoredDeviceProfiles, bool)> {
     let contents = fs::read_to_string(path).ok()?;
-    let profiles = serde_json::from_str::<StoredDeviceProfiles>(&contents).ok()?;
-    (profiles.schema_version == PROFILE_SCHEMA_VERSION).then_some(profiles)
+    let mut profiles = serde_json::from_str::<StoredDeviceProfiles>(&contents).ok()?;
+    match profiles.schema_version {
+        PROFILE_SCHEMA_VERSION => Some((profiles, false)),
+        1 => {
+            for profile in &mut profiles.profiles {
+                profile.dsp.migrate_legacy_defaults();
+            }
+            profiles.schema_version = PROFILE_SCHEMA_VERSION;
+            Some((profiles, true))
+        }
+        _ => None,
+    }
 }
 
 fn save_profiles(path: &Path, profiles: &StoredDeviceProfiles) -> Result<(), String> {
@@ -199,6 +216,51 @@ mod tests {
             flow: DataFlow::Render,
             default_roles: vec![DeviceRole::Multimedia],
         }
+    }
+
+    #[test]
+    fn schema_version_one_migrates_superseded_dsp_defaults() {
+        let directory = std::env::temp_dir().join(format!(
+            "xmic-device-profile-{}-migrate",
+            std::process::id()
+        ));
+        let path = directory.join("device-profiles.json");
+        fs::create_dir_all(&directory).unwrap();
+        let mut legacy_dsp = DspSettings::default();
+        legacy_dsp.vad_gate.confirmation_ms = xmic_engine_protocol::LEGACY_VAD_CONFIRMATION_MS;
+        legacy_dsp.vad_gate.floor_db = xmic_engine_protocol::LEGACY_VAD_FLOOR_DB;
+        legacy_dsp.vad_gate.hold_ms = 500;
+        let stored = StoredDeviceProfiles {
+            schema_version: 1,
+            profiles: vec![StoredDeviceProfile {
+                render_endpoint_id: "render".to_owned(),
+                render_group_id: Some("render-group".to_owned()),
+                capture_endpoint_id: "capture".to_owned(),
+                capture_group_id: Some("capture-group".to_owned()),
+                customized: true,
+                dsp: legacy_dsp,
+            }],
+        };
+        fs::write(&path, serde_json::to_string_pretty(&stored).unwrap()).unwrap();
+
+        let store = DeviceProfileStore::new(path.clone());
+        let profile = store
+            .resolve(
+                &endpoint("render", Some("render-group")),
+                &endpoint("capture", Some("capture-group")),
+                &DspSettings::default(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            profile.dsp.vad_gate.confirmation_ms,
+            DspSettings::default().vad_gate.confirmation_ms
+        );
+        assert_eq!(profile.dsp.vad_gate.floor_db, -20.0);
+        assert_eq!(profile.dsp.vad_gate.hold_ms, 500);
+        let persisted = fs::read_to_string(&path).unwrap();
+        assert!(persisted.contains("\"schemaVersion\": 2"));
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]

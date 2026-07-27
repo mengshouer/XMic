@@ -16,6 +16,7 @@ const zhCN = {
     start: "启动",
     stop: "停止",
     cancelPending: "取消等待",
+    retryStart: "重试启动",
     applySettings: "应用设置",
     pendingSettings: "有未应用的设置更改",
   },
@@ -47,6 +48,7 @@ const zhCN = {
       vadProbability: "当前 VAD",
       snapshotTitle: "引擎快照",
       snapshotSubtitle: "当前处理状态",
+      pipelineLatency: "额外延迟",
       calibration: "Delay 校准",
       gateState: "VAD Gate",
       echoGuard: "EchoGuard",
@@ -57,7 +59,22 @@ const zhCN = {
       processor: "XMic DSP",
       outputDestination: "虚拟麦克风",
       chainTitle: "DSP 模块",
-      chainSubtitle: "选择模块进入参数工作台",
+      chainSubtitle: "直接开关模块，点击名称进入参数工作台",
+      quickControlsAria: "DSP 模块快速控制",
+      moduleEnabled: "已启用",
+      moduleDisabled: "已停用",
+      applying: "正在应用",
+      bypassed: "临时旁路",
+      alwaysEnabled: "始终启用",
+      aecQuickDescription: "消除扬声器回声；关闭后可能向通话泄漏回声",
+      rnnoiseQuickDescription: "抑制持续环境噪声，并为 VAD 提供语音概率",
+      agc2QuickDescription: "稳定说话音量；CPU 过载时可能临时旁路",
+      vadQuickDescription: "阻断非语音；关闭后底噪和残余回声会直接输出",
+      limiterQuickDescription: "约束输出峰值，始终参与最终输出保护",
+      rnnoiseRequiredByVad: "VAD Gate 已启用，请先关闭 VAD Gate",
+      vadRequiresRnnoise: "VAD Gate 依赖 RNNoise，请先启用 RNNoise",
+      openModule: (module: string) => `打开 ${module} 参数设置`,
+      toggleModule: (module: string) => `切换 ${module}`,
       healthTitle: "链路健康",
       healthSubtitle: "本次运行累计数据",
     },
@@ -133,6 +150,15 @@ const zhCN = {
     captureInputHelp:
       "选择需要处理的真实麦克风。跟随默认时会随 Windows 默认录音设备切换；不要选择 CABLE Output。",
     followDefaultCapture: "跟随 Windows 默认麦克风",
+    selectPhysicalCapture: "选择物理麦克风",
+    physicalCaptureRequired: "需要选择物理麦克风",
+    physicalCaptureRequiredHelp: (name: string) =>
+      name === "-"
+        ? "当前虚拟设备配置要求明确选择物理麦克风。请选择实际使用的 3.5 mm 或 USB 麦克风。"
+        : `“${name}”是虚拟回传设备或与虚拟路由冲突，不能作为 XMic 的物理输入。请选择实际使用的 3.5 mm 或 USB 麦克风。`,
+    windowsDefaultCapture: "Windows 默认麦克风",
+    xmicPhysicalCapture: "XMic 物理输入",
+    notSelected: "未选择",
     savedCaptureUnavailable: "已保存的麦克风当前不可用",
     captureChannel: "麦克风输入声道",
     captureChannelHelp:
@@ -141,6 +167,43 @@ const zhCN = {
     processedOutput: "处理后虚拟麦克风",
     processedOutputHelp:
       "XMic 将处理后的声音写入此播放端。使用 VB-CABLE 时选择标准 CABLE Input，再让游戏或连麦软件读取对应的 CABLE Output。",
+    virtualDeviceMode: "虚拟麦克风类型",
+    virtualDeviceModeHelp:
+      "标准 VB-CABLE 可自动识别设备对；其他虚拟音频设备需要分别选择写入端和读取端并确认。",
+    vbCableMode: "VB-CABLE（推荐）",
+    customVirtualMode: "自定义虚拟设备",
+    vbCableMissing: "未检测到标准 VB-CABLE",
+    vbCableMissingHelp:
+      "你可以从官方页面安装 VB-CABLE，也可以继续配置其他具有 render 写入端和 capture 读取端的虚拟音频设备。",
+    customDeviceActive: "正在使用已确认的自定义虚拟设备",
+    customDeviceActiveHelp:
+      "未检测到标准 VB-CABLE，但当前自定义设备对已确认。设备在线时 XMic 可以正常使用。",
+    customDeviceWaiting: "正在等待自定义虚拟设备恢复",
+    customDeviceWaitingHelp:
+      "已确认的 endpoint pair 当前不完整。XMic 会保留配置并等待原设备恢复；endpoint ID 变化时需要重新选择和确认。",
+    vbCableInstallStepDownload: "从 VB-Audio 官方页面下载并解压 VB-CABLE。",
+    vbCableInstallStepAdmin: "运行 x64 Setup，并使用管理员权限完成驱动安装。",
+    vbCableInstallStepRefresh: "按安装程序要求重启 Windows，然后返回 XMic 刷新设备。",
+    openVbCableDownload: "打开官方下载页",
+    copyDeviceDiagnostics: "复制设备诊断",
+    diagnosticsCopied: "已复制诊断",
+    vbCableDetected: "已检测到完整 VB-CABLE 设备对",
+    customVirtualRender: "虚拟设备写入端",
+    customVirtualRenderHelp:
+      "选择接收 XMic 处理结果的 render/playback endpoint。不要选择实际发声的音响或耳机。",
+    selectCustomVirtualRender: "选择虚拟 render endpoint",
+    customVirtualCapture: "虚拟设备读取端",
+    customVirtualCaptureHelp:
+      "选择游戏或语音软件应使用的 capture/microphone endpoint。XMic 不会从此端采集物理人声。",
+    selectCustomVirtualCapture: "选择对应的 capture endpoint",
+    savedVirtualCaptureUnavailable: "已保存的虚拟读取端当前不可用",
+    confirmCustomPair: "我确认这是虚拟音频设备对，不会通过音响或耳机播放声音",
+    confirmCustomPairHelp:
+      "确认会按当前 endpoint 设备对保存。驱动重装或 endpoint ID 变化后需要重新确认。",
+    customPairIncomplete: "请完整选择虚拟设备的写入端和读取端。",
+    customPairUnconfirmed: "请确认所选设备是虚拟音频设备对。",
+    manageTrustedDevices: "管理已确认设备",
+    revokeTrustedDevice: "撤销设备确认",
     selectVirtualOutput: "选择虚拟输出设备",
     selectCableInput: "选择 CABLE Input",
     savedOutputUnavailable: "已保存的虚拟输出当前不可用",
@@ -163,16 +226,24 @@ const zhCN = {
     background: "后台与启动",
     backgroundHelp:
       "关闭主窗口后 XMic 会继续驻留系统托盘。锁屏、断开 Windows 会话或睡眠时会暂停处理，并在会话恢复后按之前状态重启。",
+    startInTray: "启动时隐藏到托盘",
+    startInTrayHelp:
+      "XMic 启动时不显示主窗口，仅保留系统托盘图标。关闭后，手动启动或开机启动都会显示主窗口。",
     launchAtLogin: "开机启动",
     launchAtLoginHelp:
-      "登录 Windows 时在系统托盘后台启动 XMic，不主动显示主窗口。关闭后不会删除其他软件的启动项。",
+      "登录 Windows 时启动 XMic；是否显示主窗口由“启动时隐藏到托盘”控制。关闭后不会删除其他软件的启动项。",
     startOnLaunch: "启动后自动开始处理",
     startOnLaunchHelp:
       "每次 XMic 启动后按已保存的 AEC3、RNNoise 和音频路由配置自动启动实时处理；设备暂不可用时会在后台重试。",
+    startOnLaunchBlockedHelp:
+      "请先完成物理麦克风和虚拟麦克风配置。已有的自动启动设置仍可关闭，但配置完成前不能新开启。",
+    configurationRequired: "需要完成音频设备配置",
     defaultRenderConflict: (name: string) =>
       `Windows 默认播放设备“${name}”同时被选为虚拟麦克风输出。请先将音响或耳机设为 Windows 默认播放设备，然后刷新设备。`,
     renderConflict: (name: string) =>
       `播放参考“${name}”不能同时作为虚拟麦克风输出。请为播放参考选择实际发声的音响或耳机。`,
+    physicalCaptureConflict: (name: string) =>
+      `物理麦克风“${name}”与虚拟设备冲突。请选择实际使用的 3.5 mm 或 USB 麦克风。`,
   },
   dsp: {
     title: "DSP 链路",
@@ -194,6 +265,18 @@ const zhCN = {
       diagnosticsAria: "AEC3 运行诊断",
     },
     diagnostics: {
+      pipelineLatency: "额外延迟",
+      pipelineLatencyHelp:
+        "XMic 给麦克风增加的延迟，等于下面采集 / DSP / 输出三段之和。不含 VB-CABLE 驱动内部缓冲与通话软件自身的抖动缓冲——这两段在本机拿不到。",
+      captureLatency: "采集侧延迟",
+      captureLatencyHelp:
+        "实测值：WASAPI 采集包被 worker 取到时已经过了多久（含驱动与端点缓冲），加上排在 DSP 线程前面的积压。取自数据包自带的 QPC 时间戳。",
+      dspLatency: "DSP 延迟",
+      dspLatencyHelp:
+        "确定性值：VAD Gate 的 look-ahead 加 RNNoise 的一帧。完全由 confirmationMs 与各模块开关决定。",
+      outputLatency: "输出侧延迟",
+      outputLatencyHelp:
+        "实测值：软件输出队列 + 唤醒时端点缓冲里未播的帧 + 输出驱动上报的 stream latency。",
       hostDelay: "主机链路延迟",
       hostDelayHelp:
         "根据 capture 与最新已送入 AEC3 的 render QPC 时间戳校准，并作为 stream delay 提供给 AEC3；只表示 WASAPI 队列偏移，不包含 Bluetooth 或声学传播延迟。",
@@ -283,7 +366,7 @@ const zhCN = {
         "自动稳定说话音量，让远近和轻重不同的语音保持在较一致的响度，同时受最大增益和 noise limit 约束。",
       adaptive: "AGC2 自适应数字增益",
       adaptiveHelp:
-        "根据当前语音响度动态调整 digital gain。关闭后 AGC2 只应用 Fixed gain，不会自动追踪音量。",
+        "根据当前语音响度动态调整 digital gain。关闭后 AGC2 只应用 Fixed gain，不会自动追踪音量；因此 Fixed gain 仍为 0 dB 时不允许关闭它，否则 AGC2 开着却等于直通。",
       advanced: "AGC2 高级参数",
       fixedGain: "AGC2 固定增益",
       fixedGainHelp:
@@ -308,18 +391,21 @@ const zhCN = {
       enabled: "启用 VAD Gate",
       enabledHelp:
         "根据 RNNoise 的语音概率控制 noise gate。无人声时把信号压低到 Floor，减少残余噪声和残余回声。",
+      latencyEstimate: "预计 DSP 延迟",
+      latencyEstimateHelp:
+        "按当前草稿参数算出的 Gate look-ahead + RNNoise。采集侧与输出侧是实测值，运行后在 Monitor 页的额外延迟里看总数。",
       threshold: "VAD 语音检测阈值",
       thresholdHelp:
         "判定为语音所需的最低概率。提高会更积极地关闭噪声，但可能漏掉轻声或句尾；降低则更容易保持开启。",
       confirmation: "VAD 连续确认时长",
       confirmationHelp:
-        "VAD 必须连续超过 Threshold 的时间。增加可过滤键盘敲击等短瞬态；默认 Natural/Balanced 的 DSP 固定延迟约 120 ms，Strong 因 Echo guard 约 190 ms，pre-roll 会保留语音起音。",
+        "VAD 必须连续超过 Threshold 的时间。增加可过滤键盘敲击等短瞬态，但会按 1:1 增加额外延迟，并让短于这个时长的喊话被整句压到 Floor；改动会实时反映在上方的预计额外延迟里。",
       hold: "VAD Gate 保持时长",
       holdHelp:
         "检测不到语音后继续保持 gate 开启的时间。增加可保留短暂停顿和句尾，但会多放出一段环境声。",
       floor: "VAD Gate 关闭电平",
       floorHelp:
-        "Gate 关闭时的输出电平。数值越负越安静；-90 dB 接近静音，较高数值会保留更多自然底噪。",
+        "Gate 关闭时的输出电平。数值越负越安静；-90 dB 接近静音，未通过确认的短句会彻底消失，默认 -20 dB 会把它压低但仍能听出有人在说话。",
       attack: "VAD Gate 开启淡入时长",
       attackHelp:
         "检测到语音后从 Floor 恢复到正常音量的淡入时间。越短起音越完整，过短可能产生突变。",
@@ -347,6 +433,7 @@ const en = {
     start: "Start",
     stop: "Stop",
     cancelPending: "Cancel pending",
+    retryStart: "Retry start",
     applySettings: "Apply settings",
     pendingSettings: "Settings have unapplied changes",
   },
@@ -378,6 +465,7 @@ const en = {
       vadProbability: "Current VAD",
       snapshotTitle: "Engine snapshot",
       snapshotSubtitle: "Current processing state",
+      pipelineLatency: "Added latency",
       calibration: "Delay calibration",
       gateState: "VAD Gate",
       echoGuard: "EchoGuard",
@@ -388,7 +476,22 @@ const en = {
       processor: "XMic DSP",
       outputDestination: "Virtual microphone",
       chainTitle: "DSP modules",
-      chainSubtitle: "Select a module to open its workbench",
+      chainSubtitle: "Toggle modules directly or select a name to open its workbench",
+      quickControlsAria: "DSP module quick controls",
+      moduleEnabled: "Enabled",
+      moduleDisabled: "Disabled",
+      applying: "Applying",
+      bypassed: "Bypassed",
+      alwaysEnabled: "Always on",
+      aecQuickDescription: "Removes speaker echo; disabling it may leak echo into calls",
+      rnnoiseQuickDescription: "Suppresses steady noise and supplies speech probability to VAD",
+      agc2QuickDescription: "Stabilizes voice level; may be bypassed during CPU overload",
+      vadQuickDescription: "Blocks non-speech; disabling it passes noise and residual echo",
+      limiterQuickDescription: "Constrains output peaks and always protects the final output",
+      rnnoiseRequiredByVad: "VAD Gate is enabled; disable VAD Gate first",
+      vadRequiresRnnoise: "VAD Gate requires RNNoise; enable RNNoise first",
+      openModule: (module: string) => `Open ${module} settings`,
+      toggleModule: (module: string) => `Toggle ${module}`,
       healthTitle: "Pipeline health",
       healthSubtitle: "Totals for the current run",
     },
@@ -464,6 +567,15 @@ const en = {
     captureInputHelp:
       "Select the physical microphone to process. When following the default, this changes with the Windows default recording device. Do not select CABLE Output.",
     followDefaultCapture: "Follow Windows default microphone",
+    selectPhysicalCapture: "Select a physical microphone",
+    physicalCaptureRequired: "Select a physical microphone",
+    physicalCaptureRequiredHelp: (name: string) =>
+      name === "-"
+        ? "The current virtual-device setup requires an explicit physical microphone. Select the 3.5 mm or USB microphone you use."
+        : `“${name}” is a virtual return endpoint or conflicts with the virtual route, so it cannot be used as the physical XMic input. Select the 3.5 mm or USB microphone you use.`,
+    windowsDefaultCapture: "Windows default microphone",
+    xmicPhysicalCapture: "XMic physical input",
+    notSelected: "Not selected",
     savedCaptureUnavailable: "Saved microphone is unavailable",
     captureChannel: "Microphone input channel",
     captureChannelHelp:
@@ -472,6 +584,48 @@ const en = {
     processedOutput: "Processed virtual microphone",
     processedOutputHelp:
       "XMic writes processed audio to this playback endpoint. With VB-CABLE, select the standard CABLE Input, then configure games or voice apps to capture the corresponding CABLE Output.",
+    virtualDeviceMode: "Virtual microphone type",
+    virtualDeviceModeHelp:
+      "XMic detects a standard VB-CABLE pair automatically. Other virtual audio devices require separate write and read endpoints plus confirmation.",
+    vbCableMode: "VB-CABLE (recommended)",
+    customVirtualMode: "Custom virtual device",
+    vbCableMissing: "Standard VB-CABLE was not detected",
+    vbCableMissingHelp:
+      "Install VB-CABLE from its official page, or configure another virtual audio device that exposes both a render write endpoint and a capture read endpoint.",
+    customDeviceActive: "Using a confirmed custom virtual device",
+    customDeviceActiveHelp:
+      "Standard VB-CABLE is unavailable, but the current custom device pair is confirmed. XMic can run while those endpoints are online.",
+    customDeviceWaiting: "Waiting for the custom virtual device",
+    customDeviceWaitingHelp:
+      "The confirmed endpoint pair is currently incomplete. XMic keeps the configuration and waits for the original devices. Changed endpoint IDs must be selected and confirmed again.",
+    vbCableInstallStepDownload:
+      "Download and extract VB-CABLE from the official VB-Audio page.",
+    vbCableInstallStepAdmin:
+      "Run the x64 Setup with administrator privileges to install the driver.",
+    vbCableInstallStepRefresh:
+      "Restart Windows if requested by the installer, then return to XMic and refresh devices.",
+    openVbCableDownload: "Open official download page",
+    copyDeviceDiagnostics: "Copy device diagnostics",
+    diagnosticsCopied: "Diagnostics copied",
+    vbCableDetected: "Complete VB-CABLE device pair detected",
+    customVirtualRender: "Virtual device write endpoint",
+    customVirtualRenderHelp:
+      "Select the render/playback endpoint that receives XMic output. Do not select speakers, headphones, or another physical playback device.",
+    selectCustomVirtualRender: "Select a virtual render endpoint",
+    customVirtualCapture: "Virtual device read endpoint",
+    customVirtualCaptureHelp:
+      "Select the capture/microphone endpoint that games and voice apps should use. XMic does not capture your physical voice from this endpoint.",
+    selectCustomVirtualCapture: "Select the corresponding capture endpoint",
+    savedVirtualCaptureUnavailable:
+      "Saved virtual read endpoint is currently unavailable",
+    confirmCustomPair:
+      "I confirm this is a virtual audio pair and will not play through speakers or headphones",
+    confirmCustomPairHelp:
+      "Confirmation is saved for the current endpoint pair. Reinstalling the driver or changing endpoint IDs requires confirmation again.",
+    customPairIncomplete: "Select both write and read endpoints for the virtual device.",
+    customPairUnconfirmed: "Confirm that the selected endpoints form a virtual audio device pair.",
+    manageTrustedDevices: "Manage confirmed devices",
+    revokeTrustedDevice: "Revoke device confirmation",
     selectVirtualOutput: "Select virtual output device",
     selectCableInput: "Select CABLE Input",
     savedOutputUnavailable: "Saved virtual output is unavailable",
@@ -494,16 +648,24 @@ const en = {
     background: "Background and startup",
     backgroundHelp:
       "XMic remains in the system tray after the main window closes. Processing pauses while Windows is locked, disconnected, or asleep, then resumes in its previous state when the session returns.",
+    startInTray: "Start in system tray",
+    startInTrayHelp:
+      "Launch XMic without showing the main window, leaving only its system tray icon. When disabled, manual and login launches show the main window.",
     launchAtLogin: "Launch at login",
     launchAtLoginHelp:
-      "Start XMic in the system tray when you sign in to Windows without opening the main window. Disabling this does not remove startup entries from other applications.",
+      "Start XMic when you sign in to Windows. Main-window visibility follows Start in system tray. Disabling this does not remove startup entries from other applications.",
     startOnLaunch: "Start processing after launch",
     startOnLaunchHelp:
       "Automatically start real-time processing with the saved AEC3, RNNoise, and audio routing settings whenever XMic launches. It retries in the background while devices are unavailable.",
+    startOnLaunchBlockedHelp:
+      "Finish configuring the physical and virtual microphones first. An existing automatic-start setting can still be disabled, but it cannot be enabled until configuration is complete.",
+    configurationRequired: "Audio device setup required",
     defaultRenderConflict: (name: string) =>
       `The Windows default playback device “${name}” is also selected as the virtual microphone output. Set your speakers or headset as the Windows default playback device, then refresh devices.`,
     renderConflict: (name: string) =>
       `The playback reference “${name}” cannot also be the virtual microphone output. Select the speakers or headset that are actually playing sound as the playback reference.`,
+    physicalCaptureConflict: (name: string) =>
+      `The physical microphone “${name}” conflicts with the virtual device. Select the 3.5 mm or USB microphone you use.`,
   },
   dsp: {
     title: "DSP Chain",
@@ -525,6 +687,18 @@ const en = {
       diagnosticsAria: "AEC3 runtime diagnostics",
     },
     diagnostics: {
+      pipelineLatency: "Added latency",
+      pipelineLatencyHelp:
+        "Latency XMic adds to the microphone: the sum of the capture, DSP, and output segments below. Excludes VB-CABLE's internal buffering and the voice app's own jitter buffer, neither of which is observable from this process.",
+      captureLatency: "Capture latency",
+      captureLatencyHelp:
+        "Measured: how stale a WASAPI capture packet already is when the worker receives it (driver and endpoint buffering included), plus any backlog queued ahead of the DSP thread. Taken from the QPC timestamp each packet carries.",
+      dspLatency: "DSP latency",
+      dspLatencyHelp:
+        "Deterministic: VAD Gate look-ahead plus one RNNoise frame. Decided entirely by confirmationMs and which stages are enabled.",
+      outputLatency: "Output latency",
+      outputLatencyHelp:
+        "Measured: software output queue + frames still unplayed in the endpoint buffer at wake-up + the stream latency the output driver reports.",
       hostDelay: "Host pipeline delay",
       hostDelayHelp:
         "Calibrated from capture and latest AEC3 render QPC timestamps, then supplied to AEC3 as stream delay. It represents only WASAPI queue offset, excluding Bluetooth and acoustic propagation delay.",
@@ -614,7 +788,7 @@ const en = {
         "Automatically stabilize voice volume across different distances and speaking levels, constrained by maximum gain and the noise limit.",
       adaptive: "AGC2 adaptive digital gain",
       adaptiveHelp:
-        "Dynamically adjust digital gain based on current speech level. When disabled, AGC2 applies only Fixed gain and does not track volume.",
+        "Dynamically adjust digital gain based on current speech level. When disabled, AGC2 applies only Fixed gain and does not track volume, so it cannot be turned off while Fixed gain is still 0 dB — that combination would leave AGC2 enabled but transparent.",
       advanced: "Advanced AGC2 parameters",
       fixedGain: "AGC2 fixed gain",
       fixedGainHelp:
@@ -639,18 +813,21 @@ const en = {
       enabled: "Enable VAD Gate",
       enabledHelp:
         "Use RNNoise speech probability to control the noise gate. When there is no speech, reduce the signal to Floor to suppress residual noise and echo.",
+      latencyEstimate: "Estimated DSP latency",
+      latencyEstimateHelp:
+        "Gate look-ahead plus RNNoise, computed from the current draft. The capture and output segments are measured instead — see Added latency on the Monitor page for the total once the engine runs.",
       threshold: "VAD speech threshold",
       thresholdHelp:
         "Minimum probability required to classify speech. Higher values close more aggressively but may miss quiet speech or word endings; lower values stay open more easily.",
       confirmation: "VAD confirmation time",
       confirmationHelp:
-        "Time VAD must remain above Threshold. Increasing it filters short transients such as keyboard strikes. Default fixed DSP delay is about 120 ms for Natural/Balanced and 190 ms for Strong due to EchoGuard; pre-roll preserves speech onset.",
+        "Time VAD must remain above Threshold. Increasing it filters short transients such as keyboard strikes, but it adds the same amount of latency and drops any call-out shorter than this window down to Floor. The estimate above updates as you change it.",
       hold: "VAD Gate hold time",
       holdHelp:
         "Keep the Gate open for this duration after speech is no longer detected. Higher values preserve short pauses and word endings but pass more ambient sound.",
       floor: "VAD Gate closed level",
       floorHelp:
-        "Output level while the Gate is closed. More negative values are quieter; -90 dB is nearly silent, while higher values preserve more natural background noise.",
+        "Output level while the Gate is closed. More negative values are quieter; -90 dB is nearly silent, so an unconfirmed short utterance disappears completely, while the -20 dB default keeps it audible but attenuated.",
       attack: "VAD Gate attack time",
       attackHelp:
         "Fade from Floor to normal volume after speech is detected. Shorter times preserve speech onset; excessively short times may produce an abrupt transition.",

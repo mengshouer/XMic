@@ -1,6 +1,7 @@
 import { ChevronDown, CircleHelp } from "lucide-react";
 import {
   type CSSProperties,
+  type Ref,
   type ReactNode,
   useEffect,
   useId,
@@ -84,6 +85,9 @@ export function SelectControl({
   help,
   value,
   disabled,
+  invalid,
+  ariaDescribedBy,
+  selectRef,
   children,
   onChange,
 }: {
@@ -91,6 +95,9 @@ export function SelectControl({
   help: string;
   value: string;
   disabled?: boolean;
+  invalid?: boolean;
+  ariaDescribedBy?: string;
+  selectRef?: Ref<HTMLSelectElement>;
   children: ReactNode;
   onChange: (value: string) => void;
 }) {
@@ -101,9 +108,12 @@ export function SelectControl({
       <ControlLabel label={label} help={help} htmlFor={inputId} />
       <span className="select-input-wrap">
         <select
+          ref={selectRef}
           id={inputId}
           value={value}
           disabled={disabled}
+          aria-invalid={invalid || undefined}
+          aria-describedby={ariaDescribedBy}
           onChange={(event) => onChange(event.target.value)}
         >
           {children}

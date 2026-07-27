@@ -10,22 +10,26 @@ use std::{
 
 use xmic_engine_core::{
     DelayCalibrationState as CoreDelayCalibrationState, HostDelayEstimator, HostDelayObservation,
-    RenderFrame, DSP_SAMPLES_PER_FRAME, MAX_RENDER_CHANNELS,
+    RenderFrame, DSP_FRAME_DURATION_MS, DSP_SAMPLES_PER_FRAME, MAX_RENDER_CHANNELS,
 };
 use xmic_engine_protocol::{
-    ActiveDeviceProfile, ActiveRoute, DelayCalibrationState as ProtocolDelayCalibrationState,
-    DspFailurePolicy, DspSettings, EngineMetrics, EngineMode, EngineSettings, EngineStatus,
-    ProcessingLoadMode, PROTOCOL_VERSION,
+    ActiveDeviceProfile, ActiveRoute, ConfigurationIssue,
+    DelayCalibrationState as ProtocolDelayCalibrationState, DspFailurePolicy, DspSettings,
+    EngineMetrics, EngineMode, EngineSettings, EngineStatus, ProcessingLoadMode, PROTOCOL_VERSION,
 };
 use xmic_engine_runtime::{processing_latency_frames, AlignedRawPath, DspProcessor};
-use xmic_platform_api::{EndpointDescriptor, PlatformError};
+use xmic_platform_api::{AudioPlatform, EndpointDescriptor, PlatformError};
 use xmic_platform_windows::{
     register_realtime_audio_thread, start_device_change_monitor, start_duplex_source,
     start_output_sink, DeviceChangeMonitor, DuplexSourceRequest, DuplexSourceStream,
-    OutputSinkRequest, OutputSinkStream,
+    OutputCountersSnapshot, OutputSinkRequest, OutputSinkStream, WasapiPlatform,
 };
 
-use crate::{device_profiles::DeviceProfileStore, settings_store::SettingsStore};
+use crate::{
+    device_profiles::DeviceProfileStore,
+    route_validation::{configuration_issue, reconcile_virtual_device_settings},
+    settings_store::SettingsStore,
+};
 
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -42,6 +46,7 @@ const OVERLOAD_DEADLINES_PER_WINDOW: u32 = 2;
 const OVERLOAD_TIMING_FAULTS_PER_WINDOW: u32 = 2;
 const OVERLOAD_WINDOWS_TO_ESCALATE: u32 = 2;
 const STABLE_WINDOWS_TO_RECOVER: u32 = 5;
+const QPC_UNITS_PER_MILLISECOND: f32 = 10_000.0;
 
 pub struct RealtimeEngineController {
     control: Mutex<ControlState>,
@@ -52,25 +57,61 @@ pub struct RealtimeEngineController {
     safe_mode: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) enum DspFeature {
     Aec,
+    Rnnoise,
     Agc2,
     VadGate,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum EngineStartError {
+    ConfigurationRequired(ConfigurationIssue),
+    Runtime(String),
+}
+
+impl std::fmt::Display for EngineStartError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConfigurationRequired(_) => {
+                formatter.write_str("audio device configuration is required")
+            }
+            Self::Runtime(message) => formatter.write_str(message),
+        }
+    }
+}
+
 impl DspFeature {
-    pub(crate) fn toggle(self, settings: &mut EngineSettings) -> bool {
-        let enabled = !match self {
+    pub(crate) fn enabled(self, settings: &EngineSettings) -> bool {
+        match self {
             Self::Aec => settings.dsp.aec.enabled,
+            Self::Rnnoise => settings.dsp.rnnoise.enabled,
             Self::Agc2 => settings.dsp.agc2.enabled,
             Self::VadGate => settings.dsp.vad_gate.enabled,
-        };
+        }
+    }
+
+    pub(crate) fn set_enabled(self, settings: &mut EngineSettings, enabled: bool) {
         match self {
             Self::Aec => settings.dsp.aec.enabled = enabled,
-            Self::Agc2 => settings.dsp.agc2.enabled = enabled,
+            Self::Rnnoise => settings.dsp.rnnoise.enabled = enabled,
+            Self::Agc2 => {
+                settings.dsp.agc2.enabled = enabled;
+                if enabled {
+                    // A stored pass-through combination would make this switch a no-op and is
+                    // rejected by validation, so arm the adaptive default alongside it.
+                    settings.dsp.agc2.repair_pass_through();
+                }
+            }
             Self::VadGate => settings.dsp.vad_gate.enabled = enabled,
         }
+    }
+
+    pub(crate) fn toggle(self, settings: &mut EngineSettings) -> bool {
+        let enabled = !self.enabled(settings);
+        self.set_enabled(settings, enabled);
         enabled
     }
 }
@@ -92,6 +133,7 @@ struct RuntimeSnapshot {
     active_route: Option<ActiveRoute>,
     metrics: EngineMetrics,
     warning: Option<String>,
+    configuration_issue: Option<ConfigurationIssue>,
     device_profile: Option<ActiveDeviceProfile>,
     effective_dsp: Option<DspSettings>,
 }
@@ -104,6 +146,7 @@ impl Default for RuntimeSnapshot {
             active_route: None,
             metrics: EngineMetrics::default(),
             warning: None,
+            configuration_issue: None,
             device_profile: None,
             effective_dsp: None,
         }
@@ -160,6 +203,7 @@ impl RealtimeEngineController {
             settings,
             active_route: runtime.active_route,
             active_device_profile,
+            configuration_issue: runtime.configuration_issue,
             metrics: runtime.metrics,
             warning: runtime.warning,
         }
@@ -179,21 +223,38 @@ impl RealtimeEngineController {
         drop(runtime);
         self.settings_store.save(&settings)?;
         control.settings = settings;
+        lock_unpoisoned(&self.runtime).configuration_issue = None;
         Ok(())
     }
 
-    pub fn start(&self) -> Result<(), String> {
+    pub fn start(&self) -> Result<(), EngineStartError> {
         let mut control = lock_unpoisoned(&self.control);
         reap_finished_worker(&mut control);
         if control.worker.is_some() {
-            return Err("audio engine is already running".to_owned());
+            return Err(EngineStartError::Runtime(
+                "audio engine is already running".to_owned(),
+            ));
+        }
+        let endpoints = WasapiPlatform::new()
+            .active_endpoints()
+            .map_err(|error| EngineStartError::Runtime(error.to_string()))?;
+        if reconcile_virtual_device_settings(&mut control.settings, &endpoints) {
+            self.settings_store
+                .save(&control.settings)
+                .map_err(EngineStartError::Runtime)?;
         }
         control
             .settings
             .validate()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| EngineStartError::Runtime(error.to_string()))?;
+        if let Some(issue) = configuration_issue(&control.settings, &endpoints) {
+            set_configuration_issue(&self.runtime, issue.clone());
+            return Err(EngineStartError::ConfigurationRequired(issue));
+        }
         if control.settings.output_endpoint_id.is_none() {
-            return Err("select a virtual microphone output endpoint first".to_owned());
+            return Err(EngineStartError::Runtime(
+                "select a virtual microphone output endpoint first".to_owned(),
+            ));
         }
 
         replace_runtime(
@@ -228,7 +289,7 @@ impl RealtimeEngineController {
             .map_err(|error| {
                 let message = format!("start audio engine worker: {error}");
                 set_worker_error(&self.runtime, &message);
-                message
+                EngineStartError::Runtime(message)
             })?;
         control.worker = Some(EngineWorker { stop, handle });
 
@@ -248,11 +309,15 @@ impl RealtimeEngineController {
                     EngineMetrics::default(),
                     Some("WASAPI did not complete startup within 15 seconds".to_owned()),
                 );
-                Err("audio engine startup timed out".to_owned())
+                Err(EngineStartError::Runtime(
+                    "audio engine startup timed out".to_owned(),
+                ))
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 request_stop_without_join(control.worker.take());
-                Err("audio engine worker stopped during startup".to_owned())
+                Err(EngineStartError::Runtime(
+                    "audio engine worker stopped during startup".to_owned(),
+                ))
             }
         }
     }
@@ -336,14 +401,14 @@ fn run_worker(
     safe_mode: bool,
     stop: Arc<AtomicBool>,
     runtime: Arc<Mutex<RuntimeSnapshot>>,
-    ready: mpsc::SyncSender<Result<(), String>>,
+    ready: mpsc::SyncSender<Result<(), EngineStartError>>,
 ) {
     let _realtime_thread = match register_realtime_audio_thread() {
         Ok(registration) => registration,
         Err(error) => {
             let message = format!("register DSP thread with MMCSS: {error}");
             set_worker_error(&runtime, &message);
-            let _ = ready.send(Err(message));
+            let _ = ready.send(Err(EngineStartError::Runtime(message)));
             return;
         }
     };
@@ -352,7 +417,7 @@ fn run_worker(
         Err(error) => {
             let message = format!("start device change monitor: {error}");
             set_worker_error(&runtime, &message);
-            let _ = ready.send(Err(message));
+            let _ = ready.send(Err(EngineStartError::Runtime(message)));
             return;
         }
     };
@@ -360,6 +425,29 @@ fn run_worker(
     let mut metrics = EngineMetrics::default();
 
     while !stop.load(Ordering::Acquire) {
+        match WasapiPlatform::new().active_endpoints() {
+            Ok(endpoints) => {
+                if let Some(issue) = configuration_issue(&settings, &endpoints) {
+                    set_configuration_issue(&runtime, issue.clone());
+                    if first_session {
+                        let _ = ready.send(Err(EngineStartError::ConfigurationRequired(issue)));
+                    }
+                    break;
+                }
+            }
+            Err(error) => {
+                let message = format!("read active audio endpoints: {error}");
+                set_worker_error(&runtime, &message);
+                if first_session {
+                    let _ = ready.send(Err(EngineStartError::Runtime(message)));
+                    break;
+                }
+                if wait_for_stop(&stop, RESTART_BACKOFF) {
+                    break;
+                }
+                continue;
+            }
+        }
         replace_runtime(
             &runtime,
             EngineMode::Starting,
@@ -388,7 +476,7 @@ fn run_worker(
                 let message = format!("启动实时音频会话失败：{error}");
                 set_worker_error(&runtime, &message);
                 if first_session {
-                    let _ = ready.send(Err(message));
+                    let _ = ready.send(Err(EngineStartError::Runtime(message)));
                     return;
                 }
                 if wait_for_stop(&stop, RESTART_BACKOFF) {
@@ -466,6 +554,7 @@ struct RealtimeSession {
     output: OutputSinkStream,
     processor: Option<DspProcessor>,
     raw_path: AlignedRawPath,
+    processing_latency_frames: usize,
     route: ActiveRoute,
     device_profile: ActiveDeviceProfile,
     effective_settings: EngineSettings,
@@ -543,6 +632,7 @@ impl RealtimeSession {
             output,
             processor,
             raw_path: AlignedRawPath::new(raw_delay_frames),
+            processing_latency_frames: raw_delay_frames,
             route,
             device_profile: resolved_profile.status,
             effective_settings,
@@ -597,6 +687,9 @@ impl RealtimeSession {
         let mut nearend_candidate_was_active = false;
         let mut host_delay_estimator = HostDelayEstimator::default();
         let mut last_data_discontinuities = self.source.counters().data_discontinuities;
+        let mut window_input_peak_dbfs = None;
+        let mut window_output_peak_dbfs = None;
+        let mut window_capture_backlog_blocks = 0usize;
         let mut overload = ProcessingOverloadController::new(settings.dsp.agc2.enabled);
         metrics.processing_load_mode = ProcessingLoadMode::Full;
         let mut recovery_mute_until = None;
@@ -616,6 +709,8 @@ impl RealtimeSession {
                 return SessionExit::Failed("a WASAPI worker stopped unexpectedly".to_owned());
             }
 
+            window_capture_backlog_blocks =
+                window_capture_backlog_blocks.max(self.source.capture_queue_blocks());
             let Some(capture) = self.source.pop_capture() else {
                 thread::park_timeout(Duration::from_millis(20));
                 continue;
@@ -638,8 +733,7 @@ impl RealtimeSession {
                     }
                 }
             }
-            metrics.input_peak_dbfs =
-                max_level(metrics.input_peak_dbfs, peak_dbfs(&capture.samples));
+            window_input_peak_dbfs = max_level(window_input_peak_dbfs, peak_dbfs(&capture.samples));
             metrics.input_clipped_samples = metrics
                 .input_clipped_samples
                 .saturating_add(clipped_sample_count(&capture.samples));
@@ -770,12 +864,12 @@ impl RealtimeSession {
                 }
             }
             let recovery_muted = recovery_mute_until.is_some_and(|until| Instant::now() < until);
-            let output = if self.safe_mode
-                || overload.mode() == ProcessingLoadMode::Protection
-                || recovery_muted
-            {
+            // Safe mode follows repeated crashes and the recovery window covers an AEC that has not
+            // reconverged yet, so both stay hard muted. CPU overload protection is a timing problem
+            // rather than a signal problem, so it follows the configured failure policy.
+            let output = if self.safe_mode || recovery_muted {
                 [0.0; DSP_SAMPLES_PER_FRAME]
-            } else if dsp_failed {
+            } else if dsp_failed || overload.mode() == ProcessingLoadMode::Protection {
                 match settings.failure_policy {
                     DspFailurePolicy::RawPassthrough => aligned_raw,
                     DspFailurePolicy::Mute => [0.0; DSP_SAMPLES_PER_FRAME],
@@ -783,7 +877,7 @@ impl RealtimeSession {
             } else {
                 processed
             };
-            metrics.output_peak_dbfs = max_level(metrics.output_peak_dbfs, peak_dbfs(&output));
+            window_output_peak_dbfs = max_level(window_output_peak_dbfs, peak_dbfs(&output));
             if !self.output.push_block(output) {
                 metrics.output_queue_overflows = self.output.counters().queue_overflows;
                 dsp_warning = Some(
@@ -858,6 +952,17 @@ impl RealtimeSession {
                 metrics.output_queue_depth_ms = output_counters.queue_depth_frames as f32 * 1_000.0
                     / xmic_engine_core::DSP_SAMPLE_RATE_HZ as f32;
                 metrics.output_rate_adjustment_ppm = output_counters.rate_adjustment_ppm as f32;
+                latency_breakdown(
+                    self.processing_latency_frames,
+                    source_counters.capture_packet_lag_100ns,
+                    window_capture_backlog_blocks,
+                    &output_counters,
+                    self.output.info().stream_latency_100ns,
+                )
+                .apply(metrics);
+                window_capture_backlog_blocks = 0;
+                metrics.input_peak_dbfs = window_input_peak_dbfs.take();
+                metrics.output_peak_dbfs = window_output_peak_dbfs.take();
                 metrics.processing_time_p99_us = self.processing_histogram.p99_us();
                 metrics.processing_time_max_us = self.processing_histogram.max_us();
                 metrics.processing_deadline_misses = self.processing_histogram.deadline_misses();
@@ -903,7 +1008,11 @@ impl RealtimeSession {
                     initial_detail(mode),
                     Some(self.active_route()),
                     metrics.clone(),
-                    combine_runtime_warnings(dsp_warning.clone(), overload.mode()),
+                    combine_runtime_warnings(
+                        dsp_warning.clone(),
+                        overload.mode(),
+                        settings.failure_policy,
+                    ),
                 );
                 last_status_update = Instant::now();
             }
@@ -1074,6 +1183,18 @@ fn set_worker_error(runtime: &Mutex<RuntimeSnapshot>, message: &str) {
     state.detail = "audio engine is waiting to reconnect".to_owned();
     state.active_route = None;
     state.warning = Some(message.to_owned());
+    state.configuration_issue = None;
+}
+
+fn set_configuration_issue(runtime: &Mutex<RuntimeSnapshot>, issue: ConfigurationIssue) {
+    let mut state = lock_unpoisoned(runtime);
+    state.mode = EngineMode::Sleeping;
+    state.detail = "physical microphone selection is required".to_owned();
+    state.active_route = None;
+    state.warning = None;
+    state.configuration_issue = Some(issue);
+    state.device_profile = None;
+    state.effective_dsp = None;
 }
 
 fn replace_runtime(
@@ -1090,6 +1211,7 @@ fn replace_runtime(
     state.active_route = active_route;
     state.metrics = metrics;
     state.warning = warning;
+    state.configuration_issue = None;
 }
 
 fn set_runtime_profile(
@@ -1133,13 +1255,17 @@ fn realtime_timing_faults(source: &DuplexSourceStream, output: &OutputSinkStream
 fn combine_runtime_warnings(
     dsp_warning: Option<String>,
     load_mode: ProcessingLoadMode,
+    failure_policy: DspFailurePolicy,
 ) -> Option<String> {
-    let overload_warning = match load_mode {
-        ProcessingLoadMode::Full => None,
-        ProcessingLoadMode::Reduced => {
+    let overload_warning = match (load_mode, failure_policy) {
+        (ProcessingLoadMode::Full, _) => None,
+        (ProcessingLoadMode::Reduced, _) => {
             Some("CPU overload: AGC2 is temporarily bypassed while AEC and noise removal continue")
         }
-        ProcessingLoadMode::Protection => Some(
+        (ProcessingLoadMode::Protection, DspFailurePolicy::RawPassthrough) => Some(
+            "CPU overload protection: sending the unprocessed microphone until realtime scheduling stabilizes",
+        ),
+        (ProcessingLoadMode::Protection, DspFailurePolicy::Mute) => Some(
             "CPU overload protection: microphone output is muted until realtime scheduling stabilizes",
         ),
     };
@@ -1149,6 +1275,51 @@ fn combine_runtime_warnings(
         (None, Some(overload)) => Some(overload.to_owned()),
         (None, None) => None,
     }
+}
+
+/// Added microphone latency the user can act on, split into the segment that is measured on the way
+/// in, the deterministic DSP look-ahead, and the segment measured on the way out. The virtual cable's
+/// internal buffering and the voice app's jitter buffer are not observable from here.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LatencyBreakdown {
+    capture_ms: f32,
+    dsp_ms: f32,
+    output_ms: f32,
+}
+
+impl LatencyBreakdown {
+    fn total_ms(&self) -> f32 {
+        self.capture_ms + self.dsp_ms + self.output_ms
+    }
+
+    fn apply(&self, metrics: &mut EngineMetrics) {
+        metrics.capture_latency_ms = self.capture_ms;
+        metrics.dsp_latency_ms = self.dsp_ms;
+        metrics.output_latency_ms = self.output_ms;
+        metrics.pipeline_latency_ms = self.total_ms();
+    }
+}
+
+fn latency_breakdown(
+    processing_latency_frames: usize,
+    capture_packet_lag_100ns: u64,
+    capture_backlog_blocks: usize,
+    output: &OutputCountersSnapshot,
+    output_stream_latency_100ns: u64,
+) -> LatencyBreakdown {
+    // The frame the worker is about to process does not count as backlog.
+    let backlog_ms = capture_backlog_blocks.saturating_sub(1) as f32 * DSP_FRAME_DURATION_MS as f32;
+    LatencyBreakdown {
+        capture_ms: capture_packet_lag_100ns as f32 / QPC_UNITS_PER_MILLISECOND + backlog_ms,
+        dsp_ms: processing_latency_frames as f32 * DSP_FRAME_DURATION_MS as f32,
+        output_ms: frames_to_ms(output.queue_depth_frames)
+            + frames_to_ms(output.endpoint_padding_frames)
+            + output_stream_latency_100ns as f32 / QPC_UNITS_PER_MILLISECOND,
+    }
+}
+
+fn frames_to_ms(frames: u64) -> f32 {
+    frames as f32 * 1_000.0 / xmic_engine_core::DSP_SAMPLE_RATE_HZ as f32
 }
 
 fn clear_aec_metrics(metrics: &mut EngineMetrics) {
@@ -1484,6 +1655,89 @@ mod tests {
     }
 
     #[test]
+    fn peak_level_windows_reset_after_publishing() {
+        let mut window = None;
+
+        window = max_level(window, peak_dbfs(&[0.5]));
+        window = max_level(window, peak_dbfs(&[0.1]));
+        let published = window.take();
+
+        assert_eq!(published, Some(peak_dbfs(&[0.5])));
+        assert_eq!(window, None);
+        assert_eq!(
+            max_level(window, peak_dbfs(&[0.1])),
+            Some(peak_dbfs(&[0.1]))
+        );
+    }
+
+    #[test]
+    fn pipeline_latency_counts_look_ahead_capture_and_output_queue() {
+        let natural = processing_latency_frames(&DspSettings::default()).unwrap();
+        let output = OutputCountersSnapshot {
+            queue_depth_frames: (DSP_SAMPLES_PER_FRAME * 3) as u64,
+            endpoint_padding_frames: 480,
+            ..OutputCountersSnapshot::default()
+        };
+
+        // 12 ms measured capture lag, one backlog block beyond the frame in flight.
+        let breakdown = latency_breakdown(natural, 120_000, 2, &output, 30_000);
+
+        assert_eq!(natural, 8);
+        assert_eq!(breakdown.capture_ms, 22.0);
+        assert_eq!(breakdown.dsp_ms, 80.0);
+        assert_eq!(breakdown.output_ms, 43.0);
+        assert_eq!(breakdown.total_ms(), 145.0);
+    }
+
+    #[test]
+    fn pipeline_latency_ignores_the_frame_in_flight_and_missing_measurements() {
+        let output = OutputCountersSnapshot::default();
+
+        let idle = latency_breakdown(8, 0, 1, &output, 0);
+
+        assert_eq!(idle.capture_ms, 0.0);
+        assert_eq!(idle.output_ms, 0.0);
+        assert_eq!(idle.total_ms(), 80.0);
+    }
+
+    #[test]
+    fn latency_breakdown_publishes_every_segment() {
+        let mut metrics = EngineMetrics::default();
+        let breakdown = LatencyBreakdown {
+            capture_ms: 11.0,
+            dsp_ms: 80.0,
+            output_ms: 32.0,
+        };
+
+        breakdown.apply(&mut metrics);
+
+        assert_eq!(metrics.capture_latency_ms, 11.0);
+        assert_eq!(metrics.dsp_latency_ms, 80.0);
+        assert_eq!(metrics.output_latency_ms, 32.0);
+        assert_eq!(metrics.pipeline_latency_ms, 123.0);
+    }
+
+    #[test]
+    fn overload_protection_warning_follows_the_failure_policy() {
+        let muted =
+            combine_runtime_warnings(None, ProcessingLoadMode::Protection, DspFailurePolicy::Mute)
+                .unwrap();
+        let raw = combine_runtime_warnings(
+            None,
+            ProcessingLoadMode::Protection,
+            DspFailurePolicy::RawPassthrough,
+        )
+        .unwrap();
+
+        assert!(muted.contains("muted"));
+        assert!(raw.contains("unprocessed"));
+        assert_eq!(
+            combine_runtime_warnings(None, ProcessingLoadMode::Full, DspFailurePolicy::Mute),
+            None
+        );
+    }
+
+    #[test]
     fn clipping_counter_only_counts_near_full_scale_samples() {
         assert_eq!(clipped_sample_count(&[-1.0, -0.999, 0.998, 0.999, 1.0]), 4);
     }
@@ -1496,12 +1750,41 @@ mod tests {
         assert!(!settings.dsp.agc2.enabled);
         assert!(settings.dsp.vad_gate.enabled);
 
+        assert!(!DspFeature::VadGate.toggle(&mut settings));
+        assert!(!DspFeature::Rnnoise.toggle(&mut settings));
+        assert!(!settings.dsp.aec.enabled);
+        assert!(!settings.dsp.vad_gate.enabled);
+
         assert!(DspFeature::Agc2.toggle(&mut settings));
         assert!(!settings.dsp.aec.enabled);
-        assert!(settings.dsp.vad_gate.enabled);
+        assert!(!settings.dsp.rnnoise.enabled);
 
-        assert!(!DspFeature::VadGate.toggle(&mut settings));
-        assert!(!settings.dsp.aec.enabled);
+        DspFeature::Rnnoise.set_enabled(&mut settings, true);
+        assert!(DspFeature::Rnnoise.enabled(&settings));
         assert!(settings.dsp.agc2.enabled);
+        assert!(!settings.dsp.vad_gate.enabled);
+    }
+
+    #[test]
+    fn enabling_agc2_arms_the_adaptive_gain() {
+        let mut settings = EngineSettings::default();
+        settings.dsp.agc2.adaptive_digital_enabled = false;
+
+        DspFeature::Agc2.set_enabled(&mut settings, true);
+
+        assert!(settings.dsp.agc2.adaptive_digital_enabled);
+        settings.validate().unwrap();
+    }
+
+    #[test]
+    fn dsp_feature_deserializes_frontend_identifiers() {
+        assert_eq!(
+            serde_json::from_str::<DspFeature>(r#""rnnoise""#).unwrap(),
+            DspFeature::Rnnoise
+        );
+        assert_eq!(
+            serde_json::from_str::<DspFeature>(r#""vadGate""#).unwrap(),
+            DspFeature::VadGate
+        );
     }
 }

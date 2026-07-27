@@ -36,11 +36,13 @@ use crate::{
         MmcssRegistration,
     },
     device_group_id, device_id, friendly_name, join_worker_with_timeout, operation_error,
-    AudioFormatDescriptor, ComApartment, WORKER_START_TIMEOUT,
+    smoothed_sample, AudioFormatDescriptor, ComApartment, QpcClock, WORKER_START_TIMEOUT,
 };
 
 const SOURCE_RING_BLOCKS: usize = 32;
 const EVENT_WAIT_MS: u32 = 100;
+/// Packet timestamps beyond this age are treated as driver noise rather than real latency.
+const MAX_CAPTURE_PACKET_LAG_100NS: u64 = 5_000_000;
 
 #[derive(Debug, Clone)]
 pub struct DuplexSourceRequest {
@@ -67,6 +69,9 @@ pub struct SourceCountersSnapshot {
     pub wait_timeouts: u64,
     pub data_discontinuities: u64,
     pub non_finite_samples_replaced: u64,
+    /// Smoothed age of a capture packet when the WASAPI worker receives it, in 100 ns units. This is
+    /// the measured device-to-process latency; 0 means no usable packet timestamp yet.
+    pub capture_packet_lag_100ns: u64,
 }
 
 #[derive(Default)]
@@ -78,6 +83,7 @@ struct SourceCounters {
     wait_timeouts: AtomicU64,
     data_discontinuities: AtomicU64,
     non_finite_samples_replaced: AtomicU64,
+    capture_packet_lag_100ns: AtomicU64,
 }
 
 impl SourceCounters {
@@ -90,7 +96,15 @@ impl SourceCounters {
             wait_timeouts: self.wait_timeouts.load(Ordering::Relaxed),
             data_discontinuities: self.data_discontinuities.load(Ordering::Relaxed),
             non_finite_samples_replaced: self.non_finite_samples_replaced.load(Ordering::Relaxed),
+            capture_packet_lag_100ns: self.capture_packet_lag_100ns.load(Ordering::Relaxed),
         }
+    }
+
+    /// Only the capture worker writes this, so a plain load/store pair is enough.
+    fn observe_capture_packet_lag(&self, sample_100ns: u64) {
+        let previous = self.capture_packet_lag_100ns.load(Ordering::Relaxed);
+        self.capture_packet_lag_100ns
+            .store(smoothed_sample(previous, sample_100ns), Ordering::Relaxed);
     }
 }
 
@@ -114,6 +128,11 @@ impl DuplexSourceStream {
 
     pub fn pop_capture(&mut self) -> Option<CaptureFrame> {
         self.capture_consumer.pop().ok()
+    }
+
+    /// Capture frames already normalized and waiting for the DSP thread, including the next one.
+    pub fn capture_queue_blocks(&self) -> usize {
+        self.capture_consumer.slots()
     }
 
     pub fn counters(&self) -> SourceCountersSnapshot {
@@ -317,6 +336,7 @@ struct PreparedSource {
     mapped: Vec<f32>,
     normalized: NormalizedBlock,
     timeline: OutputTimeline,
+    clock: QpcClock,
     producer: FrameProducer,
     counters: Arc<SourceCounters>,
     wake_thread: Thread,
@@ -432,6 +452,7 @@ fn prepare_source(
         normalized: NormalizedBlock::silence(output_channels)
             .map_err(|error| PlatformError::Operation(error.to_string()))?,
         timeline: OutputTimeline::default(),
+        clock: QpcClock::new()?,
         producer,
         counters,
         wake_thread,
@@ -577,6 +598,7 @@ fn process_source_packet(
             .data_discontinuities
             .fetch_add(1, Ordering::Relaxed);
     }
+    observe_capture_packet_lag(prepared, qpc_position, timestamp_error);
     let clock_update = prepared
         .normalizer
         .observe_clock(ClockObservation {
@@ -615,6 +637,29 @@ fn process_source_packet(
         push_normalized(prepared, timestamp);
     }
     Ok(())
+}
+
+/// Measures how stale the packet already is when the capture worker receives it. The render loopback
+/// stream shares these counters but only the microphone path feeds the DSP, so it is skipped.
+fn observe_capture_packet_lag(
+    prepared: &PreparedSource,
+    qpc_position_100ns: u64,
+    timestamp_error: bool,
+) {
+    if !matches!(prepared.producer, FrameProducer::Capture(_))
+        || timestamp_error
+        || qpc_position_100ns == 0
+    {
+        return;
+    }
+    let now_100ns = prepared.clock.now_100ns();
+    if now_100ns <= qpc_position_100ns {
+        return;
+    }
+    let lag_100ns = now_100ns - qpc_position_100ns;
+    if lag_100ns <= MAX_CAPTURE_PACKET_LAG_100NS {
+        prepared.counters.observe_capture_packet_lag(lag_100ns);
+    }
 }
 
 fn push_normalized(prepared: &mut PreparedSource, timestamp: FrameTimestamp) {

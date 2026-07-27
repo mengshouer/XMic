@@ -26,7 +26,7 @@ use xmic_platform_api::{DataFlow, EndpointDescriptor, PlatformError};
 use crate::{
     capture::{select_endpoint, EventHandle, MmcssRegistration},
     device_group_id, device_id, friendly_name, join_worker_with_timeout, operation_error,
-    ComApartment, WORKER_START_TIMEOUT,
+    smoothed_sample, ComApartment, WORKER_START_TIMEOUT,
 };
 
 const OUTPUT_RING_BLOCKS: usize = 32;
@@ -47,6 +47,8 @@ pub struct OutputSinkRequest {
 pub struct OutputStreamInfo {
     pub endpoint: EndpointDescriptor,
     pub endpoint_buffer_frames: u32,
+    /// Latency the driver reports for this stream, in 100 ns units.
+    pub stream_latency_100ns: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -59,6 +61,8 @@ pub struct OutputCountersSnapshot {
     pub underrun_events: u64,
     pub underrun_frames: u64,
     pub wait_timeouts: u64,
+    /// Smoothed number of frames still sitting in the endpoint buffer when the worker wakes up.
+    pub endpoint_padding_frames: u64,
 }
 
 #[derive(Default)]
@@ -72,6 +76,7 @@ struct OutputCounters {
     underrun_events: AtomicU64,
     underrun_frames: AtomicU64,
     wait_timeouts: AtomicU64,
+    endpoint_padding_frames: AtomicU64,
 }
 
 impl OutputCounters {
@@ -87,7 +92,15 @@ impl OutputCounters {
             underrun_events: self.underrun_events.load(Ordering::Relaxed),
             underrun_frames: self.underrun_frames.load(Ordering::Relaxed),
             wait_timeouts: self.wait_timeouts.load(Ordering::Relaxed),
+            endpoint_padding_frames: self.endpoint_padding_frames.load(Ordering::Relaxed),
         }
+    }
+
+    /// Only the output worker writes this, so a plain load/store pair is enough.
+    fn observe_endpoint_padding(&self, frames: u64) {
+        let previous = self.endpoint_padding_frames.load(Ordering::Relaxed);
+        self.endpoint_padding_frames
+            .store(smoothed_sample(previous, frames), Ordering::Relaxed);
     }
 }
 
@@ -209,6 +222,7 @@ struct PreparedOutput {
     event: EventHandle,
     endpoint: EndpointDescriptor,
     endpoint_buffer_frames: u32,
+    stream_latency_100ns: u64,
     consumer: Consumer<[f32; DSP_SAMPLES_PER_FRAME]>,
     current_block: [f32; DSP_SAMPLES_PER_FRAME],
     current_offset: usize,
@@ -228,6 +242,7 @@ impl PreparedOutput {
         OutputStreamInfo {
             endpoint: self.endpoint.clone(),
             endpoint_buffer_frames: self.endpoint_buffer_frames,
+            stream_latency_100ns: self.stream_latency_100ns,
         }
     }
 
@@ -356,6 +371,11 @@ fn prepare_output(
             .GetBufferSize()
             .map_err(|error| operation_error("read output buffer size", error))?
     };
+    // The driver's own latency figure completes the measured output path; a driver that refuses the
+    // call simply contributes nothing instead of failing the stream.
+    let stream_latency_100ns = unsafe { client.GetStreamLatency() }
+        .map(|latency| u64::try_from(latency).unwrap_or(0))
+        .unwrap_or(0);
     let render_client: IAudioRenderClient = unsafe {
         client
             .GetService()
@@ -368,6 +388,7 @@ fn prepare_output(
         event,
         endpoint,
         endpoint_buffer_frames,
+        stream_latency_100ns,
         consumer,
         current_block: [0.0; DSP_SAMPLES_PER_FRAME],
         current_offset: DSP_SAMPLES_PER_FRAME,
@@ -451,6 +472,9 @@ fn write_available_output(prepared: &mut PreparedOutput) -> Result<(), PlatformE
             .map_err(|error| operation_error("read WASAPI output padding", error))?
     };
     let available = prepared.endpoint_buffer_frames.saturating_sub(padding);
+    prepared
+        .counters
+        .observe_endpoint_padding(u64::from(padding));
     if available == 0 {
         return Ok(());
     }

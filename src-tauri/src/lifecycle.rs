@@ -11,11 +11,15 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
-use xmic_engine_protocol::AecPreset;
+use xmic_engine_protocol::{AecPreset, ConfigurationIssue, EngineSettings};
 use xmic_platform_api::SystemLifecycleEvent;
 use xmic_platform_windows::SystemLifecycleMonitor;
 
-use crate::{emit_application_state, engine::DspFeature, engine_client::EngineController};
+use crate::{
+    emit_application_state,
+    engine::{DspFeature, EngineStartError},
+    engine_client::EngineController,
+};
 
 const LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const PENDING_START_RETRY_INTERVAL: Duration = Duration::from_secs(5);
@@ -24,6 +28,7 @@ const PENDING_START_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 #[serde(default, rename_all = "camelCase")]
 pub struct LifecyclePreferences {
     pub launch_at_login: bool,
+    pub start_in_tray: bool,
     pub start_engine_on_launch: bool,
 }
 
@@ -31,6 +36,7 @@ pub struct LifecyclePreferences {
 #[serde(rename_all = "camelCase")]
 pub struct LifecycleStatus {
     pub launch_at_login: bool,
+    pub start_in_tray: bool,
     pub start_engine_on_launch: bool,
     pub session_available: bool,
     pub resume_pending: bool,
@@ -40,6 +46,7 @@ pub struct LifecycleStatus {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct StoredPreferences {
+    start_in_tray: bool,
     start_engine_on_launch: bool,
 }
 
@@ -95,6 +102,8 @@ struct LifecycleState {
     pause_reasons: u8,
     resume_pending: bool,
     last_error: Option<String>,
+    configuration_issue: Option<ConfigurationIssue>,
+    configuration_notice_pending: bool,
     exiting: bool,
 }
 
@@ -105,6 +114,8 @@ impl LifecycleState {
             pause_reasons: 0,
             resume_pending: false,
             last_error: None,
+            configuration_issue: None,
+            configuration_notice_pending: false,
             exiting: false,
         }
     }
@@ -127,11 +138,23 @@ impl LifecycleState {
         self.pause_reasons == 0 && !self.exiting
     }
 
-    fn synchronize_engine_state(&mut self, start_requested: bool, running: bool) -> bool {
-        if !self.session_available() {
-            return false;
+    fn synchronize_engine_state(
+        &mut self,
+        start_requested: bool,
+        running: bool,
+        configuration_issue: Option<ConfigurationIssue>,
+    ) -> bool {
+        if let Some(issue) = configuration_issue {
+            return self.block_for_configuration(issue, true);
         }
         let mut changed = false;
+        if self.configuration_issue.take().is_some() {
+            self.configuration_notice_pending = false;
+            changed = true;
+        }
+        if !self.session_available() {
+            return changed;
+        }
         if running {
             if self.resume_pending {
                 self.resume_pending = false;
@@ -143,6 +166,20 @@ impl LifecycleState {
         } else if start_requested && !self.resume_pending {
             self.resume_pending = true;
             changed = true;
+        }
+        changed
+    }
+
+    fn block_for_configuration(&mut self, issue: ConfigurationIssue, notify: bool) -> bool {
+        let changed = self.configuration_issue.as_ref() != Some(&issue)
+            || self.resume_pending
+            || self.last_error.is_some();
+        let new_issue = self.configuration_issue.as_ref() != Some(&issue);
+        self.configuration_issue = Some(issue);
+        self.resume_pending = false;
+        self.last_error = None;
+        if notify && new_issue {
+            self.configuration_notice_pending = true;
         }
         changed
     }
@@ -183,6 +220,7 @@ impl LifecycleController {
         let state = lock_unpoisoned(&self.state);
         LifecycleStatus {
             launch_at_login,
+            start_in_tray: state.preferences.start_in_tray,
             start_engine_on_launch: state.preferences.start_engine_on_launch,
             session_available: state.session_available(),
             resume_pending: state.resume_pending,
@@ -196,14 +234,23 @@ impl LifecycleController {
             .start_engine_on_launch
     }
 
-    pub fn set_start_engine_on_launch(&self, enabled: bool) -> Result<(), String> {
+    pub fn start_in_tray(&self) -> bool {
+        lock_unpoisoned(&self.state).preferences.start_in_tray
+    }
+
+    pub fn set_startup_preferences(
+        &self,
+        start_in_tray: bool,
+        start_engine_on_launch: bool,
+    ) -> Result<(), String> {
         let mut state = lock_unpoisoned(&self.state);
-        if state.preferences.start_engine_on_launch == enabled {
+        let preferences = StoredPreferences {
+            start_in_tray,
+            start_engine_on_launch,
+        };
+        if state.preferences == preferences {
             return Ok(());
         }
-        let preferences = StoredPreferences {
-            start_engine_on_launch: enabled,
-        };
         self.store.save(preferences)?;
         state.preferences = preferences;
         Ok(())
@@ -215,6 +262,35 @@ impl LifecycleController {
 
     pub fn has_pending_start(&self) -> bool {
         lock_unpoisoned(&self.state).resume_pending
+    }
+
+    pub fn configuration_issue(&self) -> Option<ConfigurationIssue> {
+        lock_unpoisoned(&self.state).configuration_issue.clone()
+    }
+
+    pub fn synchronize_configuration_issue(
+        &self,
+        issue: Option<ConfigurationIssue>,
+        notify: bool,
+    ) -> bool {
+        let mut state = lock_unpoisoned(&self.state);
+        match issue {
+            Some(issue) => state.block_for_configuration(issue, notify),
+            None => {
+                let changed = state.configuration_issue.take().is_some();
+                state.configuration_notice_pending = false;
+                changed
+            }
+        }
+    }
+
+    pub fn take_configuration_notice(&self) -> Option<ConfigurationIssue> {
+        let mut state = lock_unpoisoned(&self.state);
+        if !state.configuration_notice_pending {
+            return None;
+        }
+        state.configuration_notice_pending = false;
+        state.configuration_issue.clone()
     }
 
     pub fn start_manually(&self, engine: &EngineController) -> Result<(), String> {
@@ -237,10 +313,14 @@ impl LifecycleController {
         }
         match engine.start() {
             Ok(()) => {
-                self.clear_error();
+                self.clear_start_state();
                 Ok(())
             }
-            Err(error) => {
+            Err(EngineStartError::ConfigurationRequired(issue)) => {
+                lock_unpoisoned(&self.state).block_for_configuration(issue, true);
+                Err("audio device configuration is required".to_owned())
+            }
+            Err(EngineStartError::Runtime(error)) => {
                 let start_requested = engine.start_requested();
                 let mut state = lock_unpoisoned(&self.state);
                 if start_requested && state.session_available() {
@@ -281,6 +361,23 @@ impl LifecycleController {
         self.reconfigure_engine(engine, |engine| engine.toggle_dsp_feature(feature))
     }
 
+    pub(crate) fn set_dsp_feature_enabled(
+        &self,
+        engine: &EngineController,
+        feature: DspFeature,
+        enabled: bool,
+    ) -> Result<bool, String> {
+        let _operation = lock_unpoisoned(&self.operation);
+        let Some(settings) = updated_dsp_feature_settings(engine.settings(), feature, enabled)?
+        else {
+            return Ok(false);
+        };
+        self.reconfigure_engine(engine, move |engine| {
+            engine.update_settings(settings)?;
+            Ok(true)
+        })
+    }
+
     pub(crate) fn set_aec_preset(
         &self,
         engine: &EngineController,
@@ -318,7 +415,10 @@ impl LifecycleController {
                     match engine.start() {
                         Ok(()) => format!("更新 DSP 设置失败：{error}"),
                         Err(restart_error) => {
-                            lock_unpoisoned(&self.state).resume_pending = true;
+                            record_restart_failure(
+                                &mut lock_unpoisoned(&self.state),
+                                &restart_error,
+                            );
                             format!(
                                 "更新 DSP 设置失败：{error}；恢复原处理配置也失败：{restart_error}"
                             )
@@ -334,7 +434,7 @@ impl LifecycleController {
 
         if was_running {
             if let Err(error) = engine.start() {
-                lock_unpoisoned(&self.state).resume_pending = true;
+                record_restart_failure(&mut lock_unpoisoned(&self.state), &error);
                 let message = format!("DSP 设置已保存，但恢复处理失败：{error}");
                 self.set_error(message.clone());
                 return Err(message);
@@ -372,8 +472,17 @@ impl LifecycleController {
         true
     }
 
-    pub fn synchronize_engine_state(&self, start_requested: bool, running: bool) -> bool {
-        lock_unpoisoned(&self.state).synchronize_engine_state(start_requested, running)
+    pub fn synchronize_engine_state(
+        &self,
+        start_requested: bool,
+        running: bool,
+        configuration_issue: Option<ConfigurationIssue>,
+    ) -> bool {
+        lock_unpoisoned(&self.state).synchronize_engine_state(
+            start_requested,
+            running,
+            configuration_issue,
+        )
     }
 
     pub fn handle_system_event(&self, event: SystemLifecycleEvent, engine: &EngineController) {
@@ -454,9 +563,15 @@ impl LifecycleController {
                 let mut state = lock_unpoisoned(&self.state);
                 state.resume_pending = false;
                 state.last_error = None;
+                state.configuration_issue = None;
+                state.configuration_notice_pending = false;
                 Ok(())
             }
-            Err(error) => {
+            Err(EngineStartError::ConfigurationRequired(issue)) => {
+                lock_unpoisoned(&self.state).block_for_configuration(issue, true);
+                Err("audio device configuration is required".to_owned())
+            }
+            Err(EngineStartError::Runtime(error)) => {
                 self.set_error(format!("{error_context}：{error}"));
                 Err(error)
             }
@@ -467,8 +582,37 @@ impl LifecycleController {
         lock_unpoisoned(&self.state).last_error = None;
     }
 
+    fn clear_start_state(&self) {
+        let mut state = lock_unpoisoned(&self.state);
+        state.last_error = None;
+        state.configuration_issue = None;
+        state.configuration_notice_pending = false;
+    }
+
     fn set_error(&self, error: String) {
         lock_unpoisoned(&self.state).last_error = Some(error);
+    }
+}
+
+fn updated_dsp_feature_settings(
+    mut settings: EngineSettings,
+    feature: DspFeature,
+    enabled: bool,
+) -> Result<Option<EngineSettings>, String> {
+    if feature.enabled(&settings) == enabled {
+        return Ok(None);
+    }
+    feature.set_enabled(&mut settings, enabled);
+    settings.validate().map_err(|error| error.to_string())?;
+    Ok(Some(settings))
+}
+
+fn record_restart_failure(state: &mut LifecycleState, error: &EngineStartError) {
+    match error {
+        EngineStartError::ConfigurationRequired(issue) => {
+            state.block_for_configuration(issue.clone(), true);
+        }
+        EngineStartError::Runtime(_) => state.resume_pending = true,
     }
 }
 
@@ -539,13 +683,20 @@ fn run_background_lifecycle(app: AppHandle, monitor: SystemLifecycleMonitor, sto
             next_retry = Instant::now() + PENDING_START_RETRY_INTERVAL;
         }
 
-        let (running, start_requested) = {
+        let (running, start_requested, configuration_issue) = {
             let engine = app.state::<EngineController>();
-            (engine.is_running(), engine.start_requested())
+            let running = engine.is_running();
+            (
+                running,
+                engine.start_requested(),
+                engine.configuration_issue(),
+            )
         };
-        let lifecycle_changed = app
-            .state::<LifecycleController>()
-            .synchronize_engine_state(start_requested, running);
+        let lifecycle_changed = app.state::<LifecycleController>().synchronize_engine_state(
+            start_requested,
+            running,
+            configuration_issue,
+        );
         let running_changed = last_running
             .replace(running)
             .is_some_and(|last| last != running);
@@ -565,6 +716,40 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn unchanged_dsp_feature_does_not_require_reconfiguration() {
+        let settings = EngineSettings::default();
+
+        assert!(
+            updated_dsp_feature_settings(settings, DspFeature::Aec, true)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn invalid_dsp_dependency_is_rejected_before_reconfiguration() {
+        let settings = EngineSettings::default();
+
+        let error = updated_dsp_feature_settings(settings, DspFeature::Rnnoise, false).unwrap_err();
+
+        assert_eq!(error, "VAD gate requires RNNoise");
+    }
+
+    #[test]
+    fn valid_dsp_feature_update_changes_only_the_requested_state() {
+        let settings = EngineSettings::default();
+
+        let updated = updated_dsp_feature_settings(settings, DspFeature::Agc2, true)
+            .unwrap()
+            .unwrap();
+
+        assert!(updated.dsp.aec.enabled);
+        assert!(updated.dsp.rnnoise.enabled);
+        assert!(updated.dsp.agc2.enabled);
+        assert!(updated.dsp.vad_gate.enabled);
+    }
 
     #[test]
     fn overlapping_pause_reasons_resume_only_after_all_clear() {
@@ -590,13 +775,43 @@ mod tests {
         let mut state = LifecycleState::new(StoredPreferences::default());
         state.last_error = Some("start failed".to_owned());
 
-        assert!(state.synchronize_engine_state(true, false));
+        assert!(state.synchronize_engine_state(true, false, None));
         assert!(state.resume_pending);
         assert!(state.last_error.is_some());
 
-        assert!(state.synchronize_engine_state(true, true));
+        assert!(state.synchronize_engine_state(true, true, None));
         assert!(!state.resume_pending);
         assert!(state.last_error.is_none());
+    }
+
+    #[test]
+    fn repeated_configuration_blocker_only_requests_one_notice() {
+        let mut state = LifecycleState::new(StoredPreferences::default());
+        state.resume_pending = true;
+        state.last_error = Some("route unavailable".to_owned());
+        let issue = physical_capture_required();
+
+        assert!(state.block_for_configuration(issue.clone(), true));
+        assert!(!state.resume_pending);
+        assert!(state.last_error.is_none());
+        assert!(state.configuration_notice_pending);
+
+        state.configuration_notice_pending = false;
+        assert!(!state.block_for_configuration(issue, true));
+        assert!(!state.configuration_notice_pending);
+    }
+
+    #[test]
+    fn clearing_configuration_blocker_restores_normal_start_tracking() {
+        let mut state = LifecycleState::new(StoredPreferences::default());
+        state.block_for_configuration(physical_capture_required(), true);
+
+        assert!(state.synchronize_engine_state(false, false, None));
+        assert!(state.configuration_issue.is_none());
+        assert!(!state.configuration_notice_pending);
+
+        assert!(state.synchronize_engine_state(true, false, None));
+        assert!(state.resume_pending);
     }
 
     #[test]
@@ -609,6 +824,7 @@ mod tests {
         ));
         let store = LifecyclePreferencesStore::new(path.clone());
         let preferences = StoredPreferences {
+            start_in_tray: false,
             start_engine_on_launch: true,
         };
 
@@ -616,5 +832,28 @@ mod tests {
 
         assert_eq!(store.load(), preferences);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_preferences_show_the_main_window_by_default() {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "xmic-lifecycle-legacy-{}-{}.json",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&path, r#"{"startEngineOnLaunch":true}"#).unwrap();
+
+        let preferences = LifecyclePreferencesStore::new(path.clone()).load();
+
+        assert!(!preferences.start_in_tray);
+        assert!(preferences.start_engine_on_launch);
+        let _ = fs::remove_file(path);
+    }
+
+    fn physical_capture_required() -> ConfigurationIssue {
+        ConfigurationIssue::PhysicalCaptureRequired {
+            virtual_capture_endpoint_id: Some("cable-output".to_owned()),
+        }
     }
 }

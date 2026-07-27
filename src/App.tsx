@@ -8,13 +8,18 @@ import {
   AudioWaveform,
   Cable,
   ChevronRight,
+  CircleCheck,
   CircleGauge,
   Clock3,
+  Copy,
   Cpu,
+  ExternalLink,
   Gauge,
   GitMerge,
   Languages,
   LayoutDashboard,
+  LoaderCircle,
+  LockKeyhole,
   Mic2,
   Network,
   Play,
@@ -27,6 +32,7 @@ import {
   SlidersHorizontal,
   Speaker,
   Square,
+  Trash2,
   Waves,
 } from "lucide-react";
 import {
@@ -34,6 +40,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import "./App.css";
@@ -66,10 +73,41 @@ type EngineMode =
   | "error";
 type AecPreset = "natural" | "balanced" | "strong";
 type DspFailurePolicy = "rawPassthrough" | "mute";
+type VirtualDeviceMode = "vbCable" | "custom";
+type VirtualDeviceIssueReason =
+  | "vbCableUnavailable"
+  | "customPairIncomplete"
+  | "customPairUnconfirmed";
+type VirtualRouteConflictKind =
+  | "defaultRender"
+  | "fixedRender"
+  | "physicalCapture";
 type DelayCalibrationState = "uncalibrated" | "warmingUp" | "calibrated";
 type ProcessingLoadMode = "full" | "reduced" | "protection";
 type ViewId = "monitor" | "routing" | "processing";
 type DspStageId = "aec" | "rnnoise" | "agc2" | "vad" | "limiter";
+type DspFeatureId = "aec" | "rnnoise" | "agc2" | "vadGate";
+
+interface PhysicalCaptureRequiredIssue {
+  type: "physicalCaptureRequired";
+  virtualCaptureEndpointId: string | null;
+}
+
+interface VirtualDeviceRequiredIssue {
+  type: "virtualDeviceRequired";
+  reason: VirtualDeviceIssueReason;
+}
+
+interface VirtualRouteConflictIssue {
+  type: "virtualRouteConflict";
+  kind: VirtualRouteConflictKind;
+  endpointId: string;
+}
+
+type ConfigurationIssue =
+  | PhysicalCaptureRequiredIssue
+  | VirtualDeviceRequiredIssue
+  | VirtualRouteConflictIssue;
 
 interface EndpointDescriptor {
   platform: string;
@@ -125,12 +163,22 @@ interface DspSettings {
   limiter: LimiterSettings;
 }
 
+interface TrustedVirtualAudioPair {
+  renderEndpointId: string;
+  captureEndpointId: string;
+  renderName: string;
+  captureName: string;
+}
+
 interface EngineSettings {
   followDefaultRender: boolean;
   renderEndpointId: string | null;
   captureEndpointId: string | null;
   captureChannel: number | null;
   outputEndpointId: string | null;
+  virtualDeviceMode: VirtualDeviceMode | null;
+  virtualCaptureEndpointId: string | null;
+  trustedVirtualAudioPairs: TrustedVirtualAudioPair[];
   failurePolicy: DspFailurePolicy;
   dsp: DspSettings;
 }
@@ -165,6 +213,10 @@ interface EngineMetrics {
   processingOverloadEvents: number;
   processingRecoveryEvents: number;
   processingLoadMode: ProcessingLoadMode;
+  captureLatencyMs: number;
+  dspLatencyMs: number;
+  outputLatencyMs: number;
+  pipelineLatencyMs: number;
   hostDelayMs?: number | null;
   hostDelayRawSkewMs?: number | null;
   hostDelayJitterMs?: number | null;
@@ -198,12 +250,14 @@ interface EngineStatus {
   settings: EngineSettings;
   activeRoute: ActiveRoute | null;
   activeDeviceProfile: ActiveDeviceProfile | null;
+  configurationIssue: ConfigurationIssue | null;
   metrics: EngineMetrics;
   warning: string | null;
 }
 
 interface LifecyclePreferences {
   launchAtLogin: boolean;
+  startInTray: boolean;
   startEngineOnLaunch: boolean;
 }
 
@@ -221,6 +275,30 @@ function formatOptionalMetric(
   return value == null ? "--" : `${value.toFixed(digits)} ${suffix}`;
 }
 
+// Mirrors processing_latency_frames() in crates/engine-runtime/src/processor.rs so the editor can
+// price a gate change before it is applied. Only the DSP segment is predictable from settings alone;
+// the capture and output segments are measured at runtime and reported in EngineMetrics.
+const FRAME_DURATION_MS = 10;
+const GATE_SPEECH_ONSET_PRE_ROLL_FRAMES = 4;
+const ECHO_GUARD_NEAREND_CONFIRMATION_FRAMES = 6;
+const ECHO_GUARD_SMOOTHING_PRE_ROLL_FRAMES = 2;
+
+function estimatedDspLatencyMs(dsp: DspSettings) {
+  const confirmationFrames = Math.ceil(dsp.vadGate.confirmationMs / FRAME_DURATION_MS);
+  const echoGuardEnabled =
+    dsp.aec.enabled && dsp.vadGate.enabled && dsp.aec.preset === "strong";
+  const gateFrames = dsp.vadGate.enabled
+    ? Math.max(confirmationFrames - 1, 0) +
+      GATE_SPEECH_ONSET_PRE_ROLL_FRAMES +
+      (echoGuardEnabled
+        ? ECHO_GUARD_NEAREND_CONFIRMATION_FRAMES -
+          1 +
+          ECHO_GUARD_SMOOTHING_PRE_ROLL_FRAMES
+        : 0)
+    : 0;
+  return ((dsp.rnnoise.enabled ? 1 : 0) + gateFrames) * FRAME_DURATION_MS;
+}
+
 function App() {
   const [language, setLanguage] = useState<Language>(readStoredLanguage);
   const [activeView, setActiveView] = useState<ViewId>("monitor");
@@ -232,10 +310,69 @@ function App() {
   const [draft, setDraft] = useState<EngineSettings | null>(null);
   const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [quickDspBusy, setQuickDspBusy] = useState<DspFeatureId | null>(null);
   const [lifecycleBusy, setLifecycleBusy] = useState(false);
   const [pageVisible, setPageVisible] = useState(!document.hidden);
   const [error, setError] = useState<string | null>(null);
+  const [diagnosticsCopied, setDiagnosticsCopied] = useState(false);
+  const captureSelectRef = useRef<HTMLSelectElement>(null);
+  const virtualOutputSelectRef = useRef<HTMLSelectElement>(null);
   const copy = translations[language];
+
+  const navigateToView = useCallback((view: ViewId) => {
+    setActiveView(view);
+    const container = document.querySelector<HTMLElement>(".page-content");
+    const section = document.getElementById(`view-${view}`);
+    if (!container || !section) return;
+    const target =
+      section.querySelector<HTMLElement>(".view-section-heading") ?? section;
+    const top =
+      container.scrollTop +
+      target.getBoundingClientRect().top -
+      container.getBoundingClientRect().top -
+      14;
+    container.scrollTo({
+      top,
+      behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
+        ? "auto"
+        : "smooth",
+    });
+  }, []);
+
+  const focusPhysicalCapture = useCallback(() => {
+    navigateToView("routing");
+    window.setTimeout(() => captureSelectRef.current?.focus(), 180);
+  }, [navigateToView]);
+
+  const focusVirtualDevice = useCallback(() => {
+    navigateToView("routing");
+    window.setTimeout(() => virtualOutputSelectRef.current?.focus(), 180);
+  }, [navigateToView]);
+
+  const focusPlaybackReference = useCallback(() => {
+    navigateToView("routing");
+    window.setTimeout(() => {
+      document
+        .getElementById("playback-reference-configuration")
+        ?.querySelector<HTMLElement>(
+          "input:not(:disabled), select:not(:disabled), button:not(:disabled)",
+        )
+        ?.focus();
+    }, 180);
+  }, [navigateToView]);
+
+  const focusConfigurationIssue = useCallback(
+    (issue: ConfigurationIssue) => {
+      if (issue.type === "physicalCaptureRequired") {
+        focusPhysicalCapture();
+      } else if (issue.type === "virtualRouteConflict") {
+        focusPlaybackReference();
+      } else {
+        focusVirtualDevice();
+      }
+    },
+    [focusPhysicalCapture, focusPlaybackReference, focusVirtualDevice],
+  );
 
   useEffect(() => {
     document.documentElement.lang = language;
@@ -272,6 +409,21 @@ function App() {
       .then(setLifecycleStatus)
       .catch((reason) => setError(String(reason)));
   }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    listen<ConfigurationIssue>("navigate-to-configuration", (event) => {
+      if (!disposed) focusConfigurationIssue(event.payload);
+    }).then((stopListening) => {
+      if (disposed) stopListening();
+      else unlisten = stopListening;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [focusConfigurationIssue]);
 
   useEffect(() => {
     let disposed = false;
@@ -323,12 +475,24 @@ function App() {
     () => status?.endpoints.filter((endpoint) => endpoint.flow === "render") ?? [],
     [status],
   );
+  const allCaptureEndpoints = useMemo(
+    () => status?.endpoints.filter((endpoint) => endpoint.flow === "capture") ?? [],
+    [status],
+  );
+  const vbCablePair = useMemo(
+    () => findStandardVbCablePair(status?.endpoints ?? []),
+    [status],
+  );
+  const effectiveVirtualMode: VirtualDeviceMode =
+    draft?.virtualDeviceMode === "custom" || !vbCablePair
+      ? "custom"
+      : "vbCable";
   const captureEndpoints = useMemo(
     () =>
       status?.endpoints.filter(
         (endpoint) =>
           endpoint.flow === "capture" &&
-          !isVirtualCableCapture(endpoint) &&
+          !isConfiguredVirtualCapture(endpoint, draft, status.endpoints) &&
           !sameEndpointGroup(
             endpoint,
             status.endpoints.find(
@@ -336,30 +500,192 @@ function App() {
             ),
           ),
       ) ?? [],
-    [draft?.outputEndpointId, status],
-  );
-  const virtualOutputs = useMemo(
-    () => renderEndpoints.filter(isVirtualCableOutput),
-    [renderEndpoints],
+    [draft, status],
   );
   const otherOutputs = useMemo(
-    () => renderEndpoints.filter((endpoint) => !isVirtualCableOutput(endpoint)),
-    [renderEndpoints],
-  );
-  const routeConflictMessage = useMemo(
     () =>
-      draft
-        ? getRenderOutputConflictMessage(draft, renderEndpoints, copy.routing)
+      renderEndpoints.filter(
+        (endpoint) => endpoint.id !== vbCablePair?.render.id,
+      ),
+    [renderEndpoints, vbCablePair?.render.id],
+  );
+  const customCaptureEndpoints = useMemo(
+    () =>
+      allCaptureEndpoints.filter(
+        (endpoint) =>
+          endpoint.id !== draft?.captureEndpointId &&
+          endpoint.id !== vbCablePair?.capture.id,
+      ),
+    [allCaptureEndpoints, draft?.captureEndpointId, vbCablePair?.capture.id],
+  );
+  const customPairTrusted = useMemo(
+    () => (draft ? activeCustomPairIsTrusted(draft) : false),
+    [draft],
+  );
+  const customPairOffline = useMemo(
+    () =>
+      Boolean(
+        draft?.virtualDeviceMode === "custom" &&
+          customPairTrusted &&
+          (!renderEndpoints.some(
+            (endpoint) => endpoint.id === draft.outputEndpointId,
+          ) ||
+            !allCaptureEndpoints.some(
+              (endpoint) => endpoint.id === draft.virtualCaptureEndpointId,
+            )),
+      ),
+    [allCaptureEndpoints, customPairTrusted, draft, renderEndpoints],
+  );
+  const configurationIssue = useMemo(
+    () => {
+      if (!draft || !status) return null;
+      return (
+        getConfigurationIssue(draft, status.endpoints) ??
+        (dirty ? null : status.configurationIssue)
+      );
+    },
+    [dirty, draft, status],
+  );
+  const captureConfigurationIssue =
+    configurationIssue?.type === "physicalCaptureRequired"
+      ? configurationIssue
+      : null;
+  const virtualConfigurationIssue =
+    configurationIssue?.type === "virtualDeviceRequired"
+      ? configurationIssue
+      : null;
+  const configurationIssueMessage = useMemo(
+    () =>
+      configurationIssue
+        ? describeConfigurationIssue(
+            configurationIssue,
+            status?.endpoints ?? [],
+            copy.routing,
+          )
         : null,
-    [copy.routing, draft, renderEndpoints],
+    [configurationIssue, copy.routing, status?.endpoints],
+  );
+  const followDefaultCaptureBlocked = useMemo(
+    () =>
+      draft && status
+        ? effectiveVirtualMode === "custom" ||
+          getConfigurationIssue(
+            { ...draft, captureEndpointId: null },
+            status.endpoints,
+          )?.type === "physicalCaptureRequired"
+        : false,
+    [draft, effectiveVirtualMode, status],
   );
   const running = status?.running ?? false;
   const engineRequested = running || (lifecycleStatus?.resumePending ?? false);
-  const controlsDisabled = running || busy;
+  const controlsDisabled = running || busy || quickDspBusy !== null;
 
   const changeSettings = (update: (current: EngineSettings) => EngineSettings) => {
     setDraft((current) => (current ? update(current) : current));
     setDirty(true);
+  };
+
+  const selectVirtualMode = (mode: VirtualDeviceMode) => {
+    changeSettings((current) => {
+      if (mode === "vbCable" && vbCablePair) {
+        return {
+          ...current,
+          virtualDeviceMode: "vbCable",
+          outputEndpointId: vbCablePair.render.id,
+          virtualCaptureEndpointId: vbCablePair.capture.id,
+        };
+      }
+      return {
+        ...current,
+        virtualDeviceMode: "custom",
+        outputEndpointId:
+          current.virtualDeviceMode === "custom"
+            ? current.outputEndpointId
+            : null,
+        virtualCaptureEndpointId:
+          current.virtualDeviceMode === "custom"
+            ? current.virtualCaptureEndpointId
+            : null,
+      };
+    });
+  };
+
+  const confirmCustomPair = () => {
+    if (!draft?.outputEndpointId || !draft.virtualCaptureEndpointId) return;
+    const render = renderEndpoints.find(
+      (endpoint) => endpoint.id === draft.outputEndpointId,
+    );
+    const capture = allCaptureEndpoints.find(
+      (endpoint) => endpoint.id === draft.virtualCaptureEndpointId,
+    );
+    if (!render || !capture) return;
+    const trusted: TrustedVirtualAudioPair = {
+      renderEndpointId: render.id,
+      captureEndpointId: capture.id,
+      renderName: render.friendlyName,
+      captureName: capture.friendlyName,
+    };
+    changeSettings((current) => ({
+      ...current,
+      trustedVirtualAudioPairs: [
+        ...current.trustedVirtualAudioPairs.filter(
+          (pair) =>
+            pair.renderEndpointId !== trusted.renderEndpointId ||
+            pair.captureEndpointId !== trusted.captureEndpointId,
+        ),
+        trusted,
+      ].slice(-32),
+    }));
+  };
+
+  const revokeTrustedPair = async (pair: TrustedVirtualAudioPair) => {
+    if (!draft) return;
+    const settings = {
+      ...draft,
+      trustedVirtualAudioPairs: draft.trustedVirtualAudioPairs.filter(
+        (candidate) =>
+          candidate.renderEndpointId !== pair.renderEndpointId ||
+          candidate.captureEndpointId !== pair.captureEndpointId,
+      ),
+    };
+    setBusy(true);
+    setError(null);
+    try {
+      if (engineRequested) await invoke<EngineStatus>("stop_engine");
+      const next = await invoke<EngineStatus>("update_engine_settings", {
+        settings,
+      });
+      setDirty(false);
+      acceptStatus(next, true);
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const copyDeviceDiagnostics = async () => {
+    if (!status) return;
+    const text = buildDeviceDiagnostics(
+      status.endpoints,
+      draft ?? status.settings,
+      configurationIssue,
+    );
+    try {
+      await navigator.clipboard.writeText(text);
+      setDiagnosticsCopied(true);
+      window.setTimeout(() => setDiagnosticsCopied(false), 1800);
+    } catch (reason) {
+      setError(String(reason));
+    }
+  };
+
+  const openVbCableDownload = async () => {
+    try {
+      await invoke("open_vb_cable_download");
+    } catch (reason) {
+      setError(String(reason));
+    }
   };
 
   const applySettings = async (): Promise<boolean> => {
@@ -381,9 +707,46 @@ function App() {
     }
   };
 
+  const mergeQuickDspStatus = (
+    next: EngineStatus,
+    feature: DspFeatureId,
+  ) => {
+    acceptStatus(next);
+    const enabled = dspFeatureEnabled(next.settings, feature);
+    setDraft((current) =>
+      current ? withDspFeatureEnabled(current, feature, enabled) : next.settings,
+    );
+  };
+
+  const setQuickDspFeature = async (
+    feature: DspFeatureId,
+    enabled: boolean,
+  ) => {
+    if (quickDspBusy) return;
+    setQuickDspBusy(feature);
+    setError(null);
+    try {
+      const next = await invoke<EngineStatus>("set_dsp_feature_enabled", {
+        feature,
+        enabled,
+      });
+      mergeQuickDspStatus(next, feature);
+    } catch (reason) {
+      setError(String(reason));
+      try {
+        const next = await invoke<EngineStatus>("get_engine_status");
+        mergeQuickDspStatus(next, feature);
+      } catch {
+        // Keep the original reconfiguration error visible.
+      }
+    } finally {
+      setQuickDspBusy(null);
+    }
+  };
+
   const toggleEngine = async () => {
-    if (!engineRequested && routeConflictMessage) {
-      setError(routeConflictMessage);
+    if (!engineRequested && configurationIssue) {
+      focusConfigurationIssue(configurationIssue);
       return;
     }
     setBusy(true);
@@ -410,12 +773,26 @@ function App() {
     }
   };
 
+  const retryEngine = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const next = await invoke<EngineStatus>("start_engine");
+      acceptStatus(next);
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const updateLifecyclePreferences = async (
     patch: Partial<LifecyclePreferences>,
   ) => {
     if (!lifecycleStatus) return;
     const preferences: LifecyclePreferences = {
       launchAtLogin: lifecycleStatus.launchAtLogin,
+      startInTray: lifecycleStatus.startInTray,
       startEngineOnLaunch: lifecycleStatus.startEngineOnLaunch,
       ...patch,
     };
@@ -463,6 +840,16 @@ function App() {
       ...current,
       dsp: { ...current.dsp, agc2: { ...current.dsp.agc2, ...patch } },
     }));
+  // AGC2 without adaptive digital and without fixed gain only runs its internal limiter, which
+  // validation rejects, so enabling the stage arms the adaptive default alongside it.
+  const enableAgc2 = (enabled: boolean) =>
+    updateAgc2(
+      enabled &&
+        !draft.dsp.agc2.adaptiveDigitalEnabled &&
+        draft.dsp.agc2.fixedGainDb <= 0
+        ? { enabled, adaptiveDigitalEnabled: true }
+        : { enabled },
+    );
   const updateVad = (patch: Partial<VadGateSettings>) =>
     changeSettings((current) => ({
       ...current,
@@ -485,13 +872,16 @@ function App() {
       endpoint.defaultRoles.includes("multimedia"),
     ) ?? renderEndpoints[0];
   const defaultCapture =
-    captureEndpoints.find((endpoint) =>
-      endpoint.defaultRoles.includes("communications"),
-    ) ??
-    captureEndpoints.find((endpoint) =>
+    allCaptureEndpoints.find((endpoint) =>
       endpoint.defaultRoles.includes("multimedia"),
-    ) ??
-    captureEndpoints[0];
+    );
+  const selectedCapture = draft.captureEndpointId
+    ? captureEndpoints.find(
+        (endpoint) => endpoint.id === draft.captureEndpointId,
+      )
+    : followDefaultCaptureBlocked
+      ? undefined
+      : defaultCapture;
   const visibleRenderId =
     status.activeRoute?.renderEndpointId ??
     (draft.followDefaultRender
@@ -515,27 +905,12 @@ function App() {
     vad: draft.dsp.vadGate.enabled,
     limiter: true,
   };
-
-  const navigateToView = (view: ViewId) => {
-    setActiveView(view);
-    const container = document.querySelector<HTMLElement>(".page-content");
-    const section = document.getElementById(`view-${view}`);
-    if (!container || !section) return;
-    const target =
-      section.querySelector<HTMLElement>(".view-section-heading") ?? section;
-
-    const top =
-      container.scrollTop +
-      target.getBoundingClientRect().top -
-      container.getBoundingClientRect().top -
-      14;
-    container.scrollTo({
-      top,
-      behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
-        ? "auto"
-        : "smooth",
-    });
-  };
+  const quickDsp = status.settings.dsp;
+  const quickControlsLocked = busy || quickDspBusy !== null;
+  const agc2Bypassed =
+    running &&
+    quickDsp.agc2.enabled &&
+    status.metrics.processingLoadMode === "reduced";
 
   const openProcessor = (stage: DspStageId) => {
     setActiveDspStage(stage);
@@ -590,7 +965,7 @@ function App() {
             className={`engine-action ${engineRequested ? "is-stop" : "is-start"}`}
             type="button"
             onClick={toggleEngine}
-            disabled={busy || (!engineRequested && routeConflictMessage !== null)}
+            disabled={busy || quickDspBusy !== null}
           >
             {engineRequested ? <Square size={15} /> : <Play size={16} />}
             <span>
@@ -649,11 +1024,31 @@ function App() {
         </header>
 
         <div className="banner-stack">
-          {(error || routeConflictMessage) && (
+          {error && (
             <div className="alert-banner error-banner" role="alert">
               <AlertTriangle size={16} />
-              <span>{error || routeConflictMessage}</span>
+              <span>{error}</span>
+              {!running && engineRequested && (
+                <button type="button" onClick={retryEngine} disabled={busy}>
+                  <RefreshCw size={14} />
+                  {copy.common.retryStart}
+                </button>
+              )}
             </div>
+          )}
+          {configurationIssue && configurationIssueMessage && (
+            <button
+              className="alert-banner configuration-banner"
+              type="button"
+              onClick={() => focusConfigurationIssue(configurationIssue)}
+            >
+              <AlertTriangle size={16} />
+              <span>
+                <strong>{copy.routing.configurationRequired}</strong>
+                {configurationIssueMessage}
+              </span>
+              <ChevronRight size={15} aria-hidden="true" />
+            </button>
           )}
           {status.warning && (
             <div className="alert-banner warning-banner" role="status">
@@ -779,6 +1174,17 @@ function App() {
                   </div>
                   <div className="snapshot-list">
                     <SnapshotItem
+                      label={copy.views.monitor.pipelineLatency}
+                      value={
+                        running
+                          ? formatOptionalMetric(
+                              status.metrics.pipelineLatencyMs,
+                              "ms",
+                            )
+                          : "--"
+                      }
+                    />
+                    <SnapshotItem
                       label={copy.views.monitor.calibration}
                       value={
                         running
@@ -870,36 +1276,103 @@ function App() {
                     title={copy.views.monitor.chainTitle}
                     subtitle={copy.views.monitor.chainSubtitle}
                   />
-                  <div className="chain-nodes">
-                    <ChainNode
+                  <div
+                    className="dsp-quick-grid"
+                    aria-label={copy.views.monitor.quickControlsAria}
+                  >
+                    <QuickDspControl
                       label="AEC3"
+                      description={copy.views.monitor.aecQuickDescription}
                       icon={<Waves size={15} />}
-                      enabled={stageEnabled.aec}
-                      onClick={() => openProcessor("aec")}
+                      enabled={quickDsp.aec.enabled}
+                      status={quickDspStatus(
+                        quickDsp.aec.enabled,
+                        false,
+                        quickDspBusy === "aec",
+                        copy,
+                      )}
+                      busy={quickDspBusy === "aec"}
+                      controlsLocked={quickControlsLocked}
+                      onOpen={() => openProcessor("aec")}
+                      onToggle={(enabled) => setQuickDspFeature("aec", enabled)}
+                      copy={copy}
                     />
-                    <ChainNode
+                    <QuickDspControl
                       label="RNNoise"
+                      description={copy.views.monitor.rnnoiseQuickDescription}
                       icon={<AudioLines size={15} />}
-                      enabled={stageEnabled.rnnoise}
-                      onClick={() => openProcessor("rnnoise")}
+                      enabled={quickDsp.rnnoise.enabled}
+                      status={quickDspStatus(
+                        quickDsp.rnnoise.enabled,
+                        false,
+                        quickDspBusy === "rnnoise",
+                        copy,
+                      )}
+                      busy={quickDspBusy === "rnnoise"}
+                      controlsLocked={quickControlsLocked}
+                      disabledReason={
+                        quickDsp.rnnoise.enabled && quickDsp.vadGate.enabled
+                          ? copy.views.monitor.rnnoiseRequiredByVad
+                          : undefined
+                      }
+                      onOpen={() => openProcessor("rnnoise")}
+                      onToggle={(enabled) =>
+                        setQuickDspFeature("rnnoise", enabled)
+                      }
+                      copy={copy}
                     />
-                    <ChainNode
+                    <QuickDspControl
                       label="AGC2"
+                      description={copy.views.monitor.agc2QuickDescription}
                       icon={<Gauge size={15} />}
-                      enabled={stageEnabled.agc2}
-                      onClick={() => openProcessor("agc2")}
+                      enabled={quickDsp.agc2.enabled}
+                      bypassed={agc2Bypassed}
+                      status={quickDspStatus(
+                        quickDsp.agc2.enabled,
+                        agc2Bypassed,
+                        quickDspBusy === "agc2",
+                        copy,
+                      )}
+                      busy={quickDspBusy === "agc2"}
+                      controlsLocked={quickControlsLocked}
+                      onOpen={() => openProcessor("agc2")}
+                      onToggle={(enabled) => setQuickDspFeature("agc2", enabled)}
+                      copy={copy}
                     />
-                    <ChainNode
+                    <QuickDspControl
                       label="VAD Gate"
+                      description={copy.views.monitor.vadQuickDescription}
                       icon={<Mic2 size={15} />}
-                      enabled={stageEnabled.vad}
-                      onClick={() => openProcessor("vad")}
+                      enabled={quickDsp.vadGate.enabled}
+                      status={quickDspStatus(
+                        quickDsp.vadGate.enabled,
+                        false,
+                        quickDspBusy === "vadGate",
+                        copy,
+                      )}
+                      busy={quickDspBusy === "vadGate"}
+                      controlsLocked={quickControlsLocked}
+                      disabledReason={
+                        !quickDsp.vadGate.enabled && !quickDsp.rnnoise.enabled
+                          ? copy.views.monitor.vadRequiresRnnoise
+                          : undefined
+                      }
+                      onOpen={() => openProcessor("vad")}
+                      onToggle={(enabled) =>
+                        setQuickDspFeature("vadGate", enabled)
+                      }
+                      copy={copy}
                     />
-                    <ChainNode
+                    <QuickDspControl
                       label="Limiter"
+                      description={copy.views.monitor.limiterQuickDescription}
                       icon={<ShieldCheck size={15} />}
                       enabled
-                      onClick={() => openProcessor("limiter")}
+                      status={copy.views.monitor.alwaysEnabled}
+                      locked
+                      controlsLocked={quickControlsLocked}
+                      onOpen={() => openProcessor("limiter")}
+                      copy={copy}
                     />
                   </div>
                 </section>
@@ -967,57 +1440,69 @@ function App() {
                   }
                 />
                 <div className="routing-controls">
-                  <Toggle
-                    label={copy.routing.followDefaultRender}
-                    help={copy.routing.followDefaultRenderHelp}
-                    checked={draft.followDefaultRender}
-                    disabled={controlsDisabled}
-                    onChange={(checked) =>
-                      changeSettings((current) => ({
-                        ...current,
-                        followDefaultRender: checked,
-                        renderEndpointId: checked
-                          ? null
-                          : (current.renderEndpointId ?? defaultRender?.id ?? null),
-                      }))
-                    }
-                  />
-
-                  {!draft.followDefaultRender && (
-                    <SelectControl
-                      label={copy.routing.renderReference}
-                      help={copy.routing.renderReferenceHelp}
-                      value={draft.renderEndpointId ?? ""}
+                  <div
+                    className="playback-reference-configuration"
+                    id="playback-reference-configuration"
+                  >
+                    <Toggle
+                      label={copy.routing.followDefaultRender}
+                      help={copy.routing.followDefaultRenderHelp}
+                      checked={draft.followDefaultRender}
                       disabled={controlsDisabled}
-                      onChange={(value) =>
+                      onChange={(checked) =>
                         changeSettings((current) => ({
                           ...current,
-                          renderEndpointId: value || null,
+                          followDefaultRender: checked,
+                          renderEndpointId: checked
+                            ? null
+                            : (current.renderEndpointId ?? defaultRender?.id ?? null),
                         }))
                       }
-                    >
-                      <option value="">{copy.routing.selectRender}</option>
-                      {draft.renderEndpointId &&
-                        !renderEndpoints.some(
-                          (endpoint) => endpoint.id === draft.renderEndpointId,
-                        ) && (
-                          <option value={draft.renderEndpointId}>
-                            {copy.routing.savedRenderUnavailable}
+                    />
+
+                    {!draft.followDefaultRender && (
+                      <SelectControl
+                        label={copy.routing.renderReference}
+                        help={copy.routing.renderReferenceHelp}
+                        value={draft.renderEndpointId ?? ""}
+                        disabled={controlsDisabled}
+                        onChange={(value) =>
+                          changeSettings((current) => ({
+                            ...current,
+                            renderEndpointId: value || null,
+                          }))
+                        }
+                      >
+                        <option value="">{copy.routing.selectRender}</option>
+                        {draft.renderEndpointId &&
+                          !renderEndpoints.some(
+                            (endpoint) => endpoint.id === draft.renderEndpointId,
+                          ) && (
+                            <option value={draft.renderEndpointId}>
+                              {copy.routing.savedRenderUnavailable}
+                            </option>
+                          )}
+                        {renderEndpoints.map((endpoint) => (
+                          <option key={endpoint.id} value={endpoint.id}>
+                            {endpoint.friendlyName}
                           </option>
-                        )}
-                      {renderEndpoints.map((endpoint) => (
-                        <option key={endpoint.id} value={endpoint.id}>
-                          {endpoint.friendlyName}
-                        </option>
-                      ))}
-                    </SelectControl>
-                  )}
+                        ))}
+                      </SelectControl>
+                    )}
+                  </div>
 
                   <SelectControl
                     label={copy.routing.captureInput}
                     help={copy.routing.captureInputHelp}
                     value={draft.captureEndpointId ?? ""}
                     disabled={controlsDisabled}
+                    invalid={captureConfigurationIssue !== null}
+                    ariaDescribedBy={
+                      captureConfigurationIssue
+                        ? "physical-capture-required"
+                        : undefined
+                    }
+                    selectRef={captureSelectRef}
                     onChange={(value) =>
                       changeSettings((current) => ({
                         ...current,
@@ -1025,7 +1510,14 @@ function App() {
                       }))
                     }
                   >
-                    <option value="">{copy.routing.followDefaultCapture}</option>
+                    <option
+                      value=""
+                      disabled={followDefaultCaptureBlocked}
+                    >
+                      {effectiveVirtualMode === "custom"
+                        ? copy.routing.selectPhysicalCapture
+                        : copy.routing.followDefaultCapture}
+                    </option>
                     {draft.captureEndpointId &&
                       !captureEndpoints.some(
                         (endpoint) => endpoint.id === draft.captureEndpointId,
@@ -1040,6 +1532,30 @@ function App() {
                       </option>
                     ))}
                   </SelectControl>
+
+                  {captureConfigurationIssue && (
+                    <button
+                      id="physical-capture-required"
+                      className="configuration-blocker"
+                      type="button"
+                      onClick={focusPhysicalCapture}
+                    >
+                      <AlertTriangle size={15} aria-hidden="true" />
+                      <span>
+                        <strong>{copy.routing.physicalCaptureRequired}</strong>
+                        <small>
+                          {copy.routing.physicalCaptureRequiredHelp(
+                            routeName(
+                              captureConfigurationIssue.virtualCaptureEndpointId ??
+                                undefined,
+                              status.endpoints,
+                            ),
+                          )}
+                        </small>
+                      </span>
+                      <ChevronRight size={15} aria-hidden="true" />
+                    </button>
+                  )}
 
                   <SelectControl
                     label={copy.routing.captureChannel}
@@ -1070,50 +1586,285 @@ function App() {
                     ))}
                   </SelectControl>
 
-                  <SelectControl
-                    label={copy.routing.processedOutput}
-                    help={copy.routing.processedOutputHelp}
-                    value={draft.outputEndpointId ?? ""}
-                    disabled={controlsDisabled}
-                    onChange={(value) =>
-                      changeSettings((current) => ({
-                        ...current,
-                        outputEndpointId: value || null,
-                      }))
-                    }
+                  <div
+                    className="virtual-device-configuration"
+                    id="virtual-device-configuration"
                   >
-                    <option value="">
-                      {virtualOutputs.length === 0
-                        ? copy.routing.selectVirtualOutput
-                        : copy.routing.selectCableInput}
-                    </option>
-                    {draft.outputEndpointId &&
-                      !renderEndpoints.some(
-                        (endpoint) => endpoint.id === draft.outputEndpointId,
-                      ) && (
-                        <option value={draft.outputEndpointId}>
-                          {copy.routing.savedOutputUnavailable}
-                        </option>
-                      )}
-                    {virtualOutputs.length > 0 && (
-                      <optgroup label={copy.routing.detectedVirtualDevices}>
-                        {virtualOutputs.map((endpoint) => (
-                          <option key={endpoint.id} value={endpoint.id}>
-                            {endpoint.friendlyName}
-                          </option>
-                        ))}
-                      </optgroup>
+                    <div className="field-heading">
+                      <ControlLabel
+                        label={copy.routing.virtualDeviceMode}
+                        help={copy.routing.virtualDeviceModeHelp}
+                      />
+                    </div>
+                    <div className="segmented-control virtual-mode-control">
+                      <button
+                        type="button"
+                        aria-pressed={effectiveVirtualMode === "vbCable"}
+                        disabled={controlsDisabled || !vbCablePair}
+                        onClick={() => selectVirtualMode("vbCable")}
+                      >
+                        {copy.routing.vbCableMode}
+                      </button>
+                      <button
+                        type="button"
+                        aria-pressed={effectiveVirtualMode === "custom"}
+                        disabled={controlsDisabled}
+                        onClick={() => selectVirtualMode("custom")}
+                      >
+                        {copy.routing.customVirtualMode}
+                      </button>
+                    </div>
+
+                    {(customPairOffline || !vbCablePair) && (
+                      <div
+                        className={`virtual-device-notice${
+                          customPairTrusted ? " is-advisory" : ""
+                        }`}
+                        role={customPairTrusted ? "status" : "alert"}
+                      >
+                        <AlertTriangle size={17} aria-hidden="true" />
+                        <div>
+                          <strong>
+                            {customPairOffline
+                              ? copy.routing.customDeviceWaiting
+                              : customPairTrusted
+                              ? copy.routing.customDeviceActive
+                              : copy.routing.vbCableMissing}
+                          </strong>
+                          <p>
+                            {customPairOffline
+                              ? copy.routing.customDeviceWaitingHelp
+                              : customPairTrusted
+                              ? copy.routing.customDeviceActiveHelp
+                              : copy.routing.vbCableMissingHelp}
+                          </p>
+                          {!customPairTrusted && (
+                            <ol>
+                              <li>{copy.routing.vbCableInstallStepDownload}</li>
+                              <li>{copy.routing.vbCableInstallStepAdmin}</li>
+                              <li>{copy.routing.vbCableInstallStepRefresh}</li>
+                            </ol>
+                          )}
+                          <div className="inline-actions">
+                            {!customPairTrusted && (
+                              <button
+                                type="button"
+                                onClick={openVbCableDownload}
+                              >
+                                <ExternalLink size={14} aria-hidden="true" />
+                                {copy.routing.openVbCableDownload}
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={copyDeviceDiagnostics}
+                            >
+                              {diagnosticsCopied ? (
+                                <CircleCheck size={14} aria-hidden="true" />
+                              ) : (
+                                <Copy size={14} aria-hidden="true" />
+                              )}
+                              {diagnosticsCopied
+                                ? copy.routing.diagnosticsCopied
+                                : copy.routing.copyDeviceDiagnostics}
+                            </button>
+                          </div>
+                        </div>
+                      </div>
                     )}
-                    {otherOutputs.length > 0 && (
-                      <optgroup label={copy.routing.otherRenderEndpoints}>
-                        {otherOutputs.map((endpoint) => (
-                          <option key={endpoint.id} value={endpoint.id}>
-                            {endpoint.friendlyName}
+
+                    {effectiveVirtualMode === "vbCable" && vbCablePair ? (
+                      <div className="detected-device-pair">
+                        <CircleCheck size={17} aria-hidden="true" />
+                        <div>
+                          <strong>{copy.routing.vbCableDetected}</strong>
+                          <span>
+                            {vbCablePair.render.friendlyName}
+                            <ArrowRight size={13} aria-hidden="true" />
+                            {vbCablePair.capture.friendlyName}
+                          </span>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="custom-virtual-pair">
+                        <SelectControl
+                          label={copy.routing.customVirtualRender}
+                          help={copy.routing.customVirtualRenderHelp}
+                          value={
+                            draft.virtualDeviceMode === "custom"
+                              ? (draft.outputEndpointId ?? "")
+                              : ""
+                          }
+                          disabled={controlsDisabled}
+                          invalid={
+                            virtualConfigurationIssue?.reason ===
+                            "customPairIncomplete"
+                          }
+                          selectRef={virtualOutputSelectRef}
+                          onChange={(value) => {
+                            const output = renderEndpoints.find(
+                              (endpoint) => endpoint.id === value,
+                            );
+                            const inferredCapture = output
+                              ? inferPairedCapture(
+                                  output,
+                                  customCaptureEndpoints,
+                                )
+                              : undefined;
+                            changeSettings((current) => ({
+                              ...current,
+                              virtualDeviceMode: "custom",
+                              outputEndpointId: value || null,
+                              virtualCaptureEndpointId:
+                                inferredCapture?.id ??
+                                (current.virtualDeviceMode === "custom"
+                                  ? current.virtualCaptureEndpointId
+                                  : null),
+                            }));
+                          }}
+                        >
+                          <option value="">
+                            {copy.routing.selectCustomVirtualRender}
                           </option>
-                        ))}
-                      </optgroup>
+                          {draft.virtualDeviceMode === "custom" &&
+                            draft.outputEndpointId &&
+                            !renderEndpoints.some(
+                              (endpoint) =>
+                                endpoint.id === draft.outputEndpointId,
+                            ) && (
+                              <option value={draft.outputEndpointId}>
+                                {copy.routing.savedOutputUnavailable}
+                              </option>
+                            )}
+                          {otherOutputs.map((endpoint) => (
+                            <option key={endpoint.id} value={endpoint.id}>
+                              {endpoint.friendlyName}
+                            </option>
+                          ))}
+                        </SelectControl>
+
+                        <SelectControl
+                          label={copy.routing.customVirtualCapture}
+                          help={copy.routing.customVirtualCaptureHelp}
+                          value={
+                            draft.virtualDeviceMode === "custom"
+                              ? (draft.virtualCaptureEndpointId ?? "")
+                              : ""
+                          }
+                          disabled={controlsDisabled}
+                          invalid={
+                            virtualConfigurationIssue?.reason ===
+                            "customPairIncomplete"
+                          }
+                          onChange={(value) =>
+                            changeSettings((current) => ({
+                              ...current,
+                              virtualDeviceMode: "custom",
+                              virtualCaptureEndpointId: value || null,
+                            }))
+                          }
+                        >
+                          <option value="">
+                            {copy.routing.selectCustomVirtualCapture}
+                          </option>
+                          {draft.virtualDeviceMode === "custom" &&
+                            draft.virtualCaptureEndpointId &&
+                            !allCaptureEndpoints.some(
+                              (endpoint) =>
+                                endpoint.id ===
+                                draft.virtualCaptureEndpointId,
+                            ) && (
+                              <option value={draft.virtualCaptureEndpointId}>
+                                {copy.routing.savedVirtualCaptureUnavailable}
+                              </option>
+                            )}
+                          {customCaptureEndpoints.map((endpoint) => (
+                            <option key={endpoint.id} value={endpoint.id}>
+                              {endpoint.friendlyName}
+                            </option>
+                          ))}
+                        </SelectControl>
+
+                        <label
+                          className={`custom-pair-confirmation${
+                            customPairTrusted ? " is-confirmed" : ""
+                          }`}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={customPairTrusted}
+                            disabled={
+                              busy ||
+                              !draft.outputEndpointId ||
+                              !draft.virtualCaptureEndpointId
+                            }
+                            onChange={(event) => {
+                              if (event.target.checked) {
+                                confirmCustomPair();
+                                return;
+                              }
+                              const pair = draft.trustedVirtualAudioPairs.find(
+                                (candidate) =>
+                                  candidate.renderEndpointId ===
+                                    draft.outputEndpointId &&
+                                  candidate.captureEndpointId ===
+                                    draft.virtualCaptureEndpointId,
+                              );
+                              if (pair) void revokeTrustedPair(pair);
+                            }}
+                          />
+                          <span>
+                            <strong>{copy.routing.confirmCustomPair}</strong>
+                            <small>{copy.routing.confirmCustomPairHelp}</small>
+                          </span>
+                        </label>
+
+                        {virtualConfigurationIssue && (
+                          <div className="virtual-configuration-error" role="alert">
+                            <AlertTriangle size={15} aria-hidden="true" />
+                            <span>
+                              {virtualConfigurationIssue.reason ===
+                              "customPairUnconfirmed"
+                                ? copy.routing.customPairUnconfirmed
+                                : copy.routing.customPairIncomplete}
+                            </span>
+                          </div>
+                        )}
+
+                        {draft.trustedVirtualAudioPairs.length > 0 && (
+                          <details className="trusted-device-manager">
+                            <summary>
+                              {copy.routing.manageTrustedDevices} ·{" "}
+                              {draft.trustedVirtualAudioPairs.length}
+                            </summary>
+                            <div className="trusted-device-list">
+                              {draft.trustedVirtualAudioPairs.map((pair) => (
+                                <div
+                                  className="trusted-device-row"
+                                  key={`${pair.renderEndpointId}:${pair.captureEndpointId}`}
+                                >
+                                  <span>
+                                    <strong>{pair.renderName}</strong>
+                                    <small>{pair.captureName}</small>
+                                  </span>
+                                  <button
+                                    className="icon-button"
+                                    type="button"
+                                    title={copy.routing.revokeTrustedDevice}
+                                    aria-label={copy.routing.revokeTrustedDevice}
+                                    disabled={busy}
+                                    onClick={() => void revokeTrustedPair(pair)}
+                                  >
+                                    <Trash2 size={14} aria-hidden="true" />
+                                  </button>
+                                </div>
+                              ))}
+                            </div>
+                          </details>
+                        )}
+                      </div>
                     )}
-                  </SelectControl>
+                  </div>
                 </div>
               </section>
 
@@ -1135,11 +1886,15 @@ function App() {
                     />
                     <RouteLine
                       icon={<Mic2 size={14} />}
-                      label={copy.routing.capture}
-                      value={routeName(
-                        status.activeRoute?.captureEndpointId,
-                        status.endpoints,
-                      )}
+                      label={copy.routing.windowsDefaultCapture}
+                      value={defaultCapture?.friendlyName ?? "-"}
+                    />
+                    <RouteLine
+                      icon={<Mic2 size={14} />}
+                      label={copy.routing.xmicPhysicalCapture}
+                      value={
+                        selectedCapture?.friendlyName ?? copy.routing.notSelected
+                      }
                     />
                     <RouteLine
                       icon={<Cable size={14} />}
@@ -1207,6 +1962,15 @@ function App() {
                   />
                   <div className="lifecycle-controls">
                     <Toggle
+                      label={copy.routing.startInTray}
+                      help={copy.routing.startInTrayHelp}
+                      checked={lifecycleStatus?.startInTray ?? false}
+                      disabled={!lifecycleStatus || lifecycleBusy}
+                      onChange={(startInTray) =>
+                        updateLifecyclePreferences({ startInTray })
+                      }
+                    />
+                    <Toggle
                       label={copy.routing.launchAtLogin}
                       help={copy.routing.launchAtLoginHelp}
                       checked={lifecycleStatus?.launchAtLogin ?? false}
@@ -1217,9 +1981,20 @@ function App() {
                     />
                     <Toggle
                       label={copy.routing.startOnLaunch}
-                      help={copy.routing.startOnLaunchHelp}
+                      help={
+                        configurationIssue
+                          ? copy.routing.startOnLaunchBlockedHelp
+                          : copy.routing.startOnLaunchHelp
+                      }
                       checked={lifecycleStatus?.startEngineOnLaunch ?? false}
-                      disabled={!lifecycleStatus || lifecycleBusy}
+                      disabled={
+                        !lifecycleStatus ||
+                        lifecycleBusy ||
+                        Boolean(
+                          configurationIssue &&
+                            !lifecycleStatus.startEngineOnLaunch,
+                        )
+                      }
                       onChange={(startEngineOnLaunch) =>
                         updateLifecyclePreferences({ startEngineOnLaunch })
                       }
@@ -1335,7 +2110,7 @@ function App() {
                         help={copy.dsp.agc2.enabledHelp}
                         checked={draft.dsp.agc2.enabled}
                         disabled={controlsDisabled}
-                        onChange={(enabled) => updateAgc2({ enabled })}
+                        onChange={(enabled) => enableAgc2(enabled)}
                       />
                     )}
                     {activeDspStage === "vad" && (
@@ -1448,7 +2223,12 @@ function App() {
                           label={copy.dsp.agc2.adaptive}
                           help={copy.dsp.agc2.adaptiveHelp}
                           checked={draft.dsp.agc2.adaptiveDigitalEnabled}
-                          disabled={controlsDisabled || !draft.dsp.agc2.enabled}
+                          disabled={
+                            controlsDisabled ||
+                            !draft.dsp.agc2.enabled ||
+                            (draft.dsp.agc2.adaptiveDigitalEnabled &&
+                              draft.dsp.agc2.fixedGainDb <= 0)
+                          }
                           onChange={(adaptiveDigitalEnabled) =>
                             updateAgc2({ adaptiveDigitalEnabled })
                           }
@@ -1531,6 +2311,11 @@ function App() {
 
                   {activeDspStage === "vad" && (
                     <>
+                      <div className="latency-estimate">
+                        <span>{copy.dsp.vad.latencyEstimate}</span>
+                        <strong>{`${estimatedDspLatencyMs(draft.dsp)} ms`}</strong>
+                        <small>{copy.dsp.vad.latencyEstimateHelp}</small>
+                      </div>
                       <div className="focused-control">
                         <RangeControl
                           label={copy.dsp.vad.threshold}
@@ -1799,28 +2584,104 @@ function RouteNode({
   );
 }
 
-function ChainNode({
+function QuickDspControl({
   label,
+  description,
   icon,
   enabled,
-  onClick,
+  bypassed = false,
+  status,
+  busy = false,
+  locked = false,
+  controlsLocked,
+  disabledReason,
+  onOpen,
+  onToggle,
+  copy,
 }: {
   label: string;
+  description: string;
   icon: ReactNode;
   enabled: boolean;
-  onClick: () => void;
+  bypassed?: boolean;
+  status: string;
+  busy?: boolean;
+  locked?: boolean;
+  controlsLocked: boolean;
+  disabledReason?: string;
+  onOpen: () => void;
+  onToggle?: (enabled: boolean) => void;
+  copy: Translation;
 }) {
+  const dependencyBlocked = Boolean(disabledReason);
+  const state = busy
+    ? "busy"
+    : bypassed
+      ? "bypassed"
+      : locked
+        ? "locked"
+        : enabled
+          ? "enabled"
+          : "disabled";
+
   return (
-    <button
-      className="chain-node"
-      type="button"
+    <div
+      className="dsp-quick-control"
       data-enabled={enabled}
-      onClick={onClick}
+      data-state={state}
     >
-      <span>{icon}</span>
-      <strong>{label}</strong>
-      <i aria-hidden="true" />
-    </button>
+      <button
+        className="dsp-module-open"
+        type="button"
+        aria-label={copy.views.monitor.openModule(label)}
+        onClick={onOpen}
+      >
+        <span className="dsp-module-icon">{icon}</span>
+        <span className="dsp-module-copy">
+          <strong>{label}</strong>
+          <small>{description}</small>
+        </span>
+        <ChevronRight size={13} aria-hidden="true" />
+      </button>
+      <span className="dsp-module-action">
+        <small className="dsp-module-status">{status}</small>
+        {locked ? (
+          <span
+            className="dsp-module-lock"
+            title={copy.views.monitor.alwaysEnabled}
+            aria-label={`${label}: ${copy.views.monitor.alwaysEnabled}`}
+          >
+            <LockKeyhole size={14} aria-hidden="true" />
+          </span>
+        ) : (
+          <button
+            className="dsp-quick-switch"
+            type="button"
+            role="switch"
+            aria-checked={enabled}
+            aria-disabled={dependencyBlocked || undefined}
+            aria-label={copy.views.monitor.toggleModule(label)}
+            title={
+              disabledReason ?? copy.views.monitor.toggleModule(label)
+            }
+            disabled={controlsLocked}
+            onClick={() => {
+              if (!dependencyBlocked && !controlsLocked) onToggle?.(!enabled);
+            }}
+          >
+            {busy ? (
+              <LoaderCircle
+                className="dsp-switch-spinner"
+                size={13}
+                aria-hidden="true"
+              />
+            ) : (
+              <span aria-hidden="true" />
+            )}
+          </button>
+        )}
+      </span>
+    </div>
   );
 }
 
@@ -1853,7 +2714,7 @@ function RouteLine({
   return (
     <div className="route-line">
       <span className="route-line-icon">{icon}</span>
-      <span>{label}</span>
+      <span title={label}>{label}</span>
       <strong title={value}>{value}</strong>
     </div>
   );
@@ -1904,6 +2765,26 @@ function AecDiagnostics({
 }) {
   return (
     <div className="diagnostics-grid" aria-label={copy.dsp.aec.diagnosticsAria}>
+      <DiagnosticCell
+        label={copy.dsp.diagnostics.pipelineLatency}
+        value={formatOptionalMetric(metrics.pipelineLatencyMs, "ms")}
+        title={copy.dsp.diagnostics.pipelineLatencyHelp}
+      />
+      <DiagnosticCell
+        label={copy.dsp.diagnostics.captureLatency}
+        value={formatOptionalMetric(metrics.captureLatencyMs, "ms", 1)}
+        title={copy.dsp.diagnostics.captureLatencyHelp}
+      />
+      <DiagnosticCell
+        label={copy.dsp.diagnostics.dspLatency}
+        value={formatOptionalMetric(metrics.dspLatencyMs, "ms")}
+        title={copy.dsp.diagnostics.dspLatencyHelp}
+      />
+      <DiagnosticCell
+        label={copy.dsp.diagnostics.outputLatency}
+        value={formatOptionalMetric(metrics.outputLatencyMs, "ms", 1)}
+        title={copy.dsp.diagnostics.outputLatencyHelp}
+      />
       <DiagnosticCell
         label={copy.dsp.diagnostics.hostDelay}
         value={formatOptionalMetric(metrics.hostDelayMs, "ms")}
@@ -2075,6 +2956,80 @@ function stageSubtitle(stage: DspStageId, copy: Translation) {
   return copy.dsp.limiterSubtitle;
 }
 
+function dspFeatureEnabled(
+  settings: EngineSettings,
+  feature: DspFeatureId,
+) {
+  if (feature === "aec") return settings.dsp.aec.enabled;
+  if (feature === "rnnoise") return settings.dsp.rnnoise.enabled;
+  if (feature === "agc2") return settings.dsp.agc2.enabled;
+  return settings.dsp.vadGate.enabled;
+}
+
+function withDspFeatureEnabled(
+  settings: EngineSettings,
+  feature: DspFeatureId,
+  enabled: boolean,
+): EngineSettings {
+  if (feature === "aec") {
+    return {
+      ...settings,
+      dsp: {
+        ...settings.dsp,
+        aec: { ...settings.dsp.aec, enabled },
+      },
+    };
+  }
+  if (feature === "rnnoise") {
+    return {
+      ...settings,
+      dsp: {
+        ...settings.dsp,
+        rnnoise: { ...settings.dsp.rnnoise, enabled },
+      },
+    };
+  }
+  if (feature === "agc2") {
+    // Mirrors DspFeature::set_enabled in src-tauri/src/engine.rs, which arms the adaptive gain so
+    // the quick toggle cannot leave AGC2 enabled but transparent.
+    const armAdaptive =
+      enabled &&
+      !settings.dsp.agc2.adaptiveDigitalEnabled &&
+      settings.dsp.agc2.fixedGainDb <= 0;
+    return {
+      ...settings,
+      dsp: {
+        ...settings.dsp,
+        agc2: {
+          ...settings.dsp.agc2,
+          enabled,
+          ...(armAdaptive ? { adaptiveDigitalEnabled: true } : {}),
+        },
+      },
+    };
+  }
+  return {
+    ...settings,
+    dsp: {
+      ...settings.dsp,
+      vadGate: { ...settings.dsp.vadGate, enabled },
+    },
+  };
+}
+
+function quickDspStatus(
+  enabled: boolean,
+  bypassed: boolean,
+  busy: boolean,
+  copy: Translation,
+) {
+  if (busy) return copy.views.monitor.applying;
+  if (bypassed) return copy.views.monitor.bypassed;
+  return enabled
+    ? copy.views.monitor.moduleEnabled
+    : copy.views.monitor.moduleDisabled;
+}
+
 function booleanState(
   value: boolean | null | undefined,
   positive: string,
@@ -2115,31 +3070,133 @@ function routeName(
   );
 }
 
-function getRenderOutputConflictMessage(
-  settings: EngineSettings,
-  renderEndpoints: EndpointDescriptor[],
+function describeConfigurationIssue(
+  issue: ConfigurationIssue,
+  endpoints: EndpointDescriptor[],
   messages: Translation["routing"],
 ) {
-  if (!settings.outputEndpointId) return null;
-  const renderEndpoint = settings.followDefaultRender
-    ? renderEndpoints.find((endpoint) =>
-        endpoint.defaultRoles.includes("multimedia"),
-      )
-    : renderEndpoints.find(
-        (endpoint) => endpoint.id === settings.renderEndpointId,
-      );
-  if (!renderEndpoint || renderEndpoint.id !== settings.outputEndpointId) {
-    const outputEndpoint = renderEndpoints.find(
-      (endpoint) => endpoint.id === settings.outputEndpointId,
+  if (issue.type === "physicalCaptureRequired") {
+    return messages.physicalCaptureRequiredHelp(
+      routeName(issue.virtualCaptureEndpointId ?? undefined, endpoints),
     );
-    if (!renderEndpoint || !sameEndpointGroup(renderEndpoint, outputEndpoint)) {
-      return null;
+  }
+  if (issue.type === "virtualDeviceRequired") {
+    if (issue.reason === "vbCableUnavailable") {
+      return messages.vbCableMissingHelp;
     }
+    return issue.reason === "customPairUnconfirmed"
+      ? messages.customPairUnconfirmed
+      : messages.customPairIncomplete;
   }
-  if (settings.followDefaultRender) {
-    return messages.defaultRenderConflict(renderEndpoint.friendlyName);
+  const name = routeName(issue.endpointId, endpoints);
+  if (issue.kind === "defaultRender") {
+    return messages.defaultRenderConflict(name);
   }
-  return messages.renderConflict(renderEndpoint.friendlyName);
+  if (issue.kind === "fixedRender") return messages.renderConflict(name);
+  return messages.physicalCaptureConflict(name);
+}
+
+function getConfigurationIssue(
+  settings: EngineSettings,
+  endpoints: EndpointDescriptor[],
+): ConfigurationIssue | null {
+  if (settings.virtualDeviceMode === "custom") {
+    if (!settings.captureEndpointId) {
+      return {
+        type: "physicalCaptureRequired",
+        virtualCaptureEndpointId: settings.virtualCaptureEndpointId,
+      };
+    }
+    if (!settings.outputEndpointId || !settings.virtualCaptureEndpointId) {
+      return {
+        type: "virtualDeviceRequired",
+        reason: "customPairIncomplete",
+      };
+    }
+    if (!activeCustomPairIsTrusted(settings)) {
+      return {
+        type: "virtualDeviceRequired",
+        reason: "customPairUnconfirmed",
+      };
+    }
+    const physical = findEndpoint(
+      endpoints,
+      "capture",
+      settings.captureEndpointId,
+    );
+    const virtualRender = findEndpoint(
+      endpoints,
+      "render",
+      settings.outputEndpointId,
+    );
+    const virtualCapture = findEndpoint(
+      endpoints,
+      "capture",
+      settings.virtualCaptureEndpointId,
+    );
+    if (
+      physical &&
+      (sameEndpoint(physical, virtualRender) ||
+        sameEndpoint(physical, virtualCapture))
+    ) {
+      return {
+        type: "physicalCaptureRequired",
+        virtualCaptureEndpointId: physical.id,
+      };
+    }
+    return virtualRender
+      ? getVirtualRouteConflict(settings, endpoints, virtualRender)
+      : null;
+  }
+
+  const pair = findStandardVbCablePair(endpoints);
+  if (!pair) {
+    return {
+      type: "virtualDeviceRequired",
+      reason: "vbCableUnavailable",
+    };
+  }
+  const capture = settings.captureEndpointId
+    ? findEndpoint(endpoints, "capture", settings.captureEndpointId)
+    : endpoints.find(
+        (endpoint) =>
+          endpoint.flow === "capture" &&
+          endpoint.defaultRoles.includes("multimedia"),
+      );
+  if (
+    capture &&
+    (sameEndpoint(capture, pair.capture) ||
+      sameEndpoint(capture, pair.render) ||
+      isStandardVbCableCapture(capture))
+  ) {
+    return {
+      type: "physicalCaptureRequired",
+      virtualCaptureEndpointId: capture.id,
+    };
+  }
+  return getVirtualRouteConflict(settings, endpoints, pair.render);
+}
+
+function getVirtualRouteConflict(
+  settings: EngineSettings,
+  endpoints: EndpointDescriptor[],
+  output: EndpointDescriptor,
+): VirtualRouteConflictIssue | null {
+  const render = settings.followDefaultRender
+    ? endpoints.find(
+        (endpoint) =>
+          endpoint.flow === "render" &&
+          endpoint.defaultRoles.includes("multimedia"),
+      )
+    : settings.renderEndpointId
+      ? findEndpoint(endpoints, "render", settings.renderEndpointId)
+      : undefined;
+  if (!render || !sameEndpoint(render, output)) return null;
+  return {
+    type: "virtualRouteConflict",
+    kind: settings.followDefaultRender ? "defaultRender" : "fixedRender",
+    endpointId: render.id,
+  };
 }
 
 function sameEndpointGroup(
@@ -2149,14 +3206,130 @@ function sameEndpointGroup(
   return Boolean(left?.groupId && right?.groupId && left.groupId === right.groupId);
 }
 
-function isVirtualCableOutput(endpoint: EndpointDescriptor) {
-  const name = endpoint.friendlyName.toLowerCase();
-  return name.includes("cable input") || name.includes("vb-audio virtual cable");
+function sameEndpoint(
+  left: EndpointDescriptor | undefined,
+  right: EndpointDescriptor | undefined,
+) {
+  return Boolean(left && right && (left.id === right.id || sameEndpointGroup(left, right)));
 }
 
-function isVirtualCableCapture(endpoint: EndpointDescriptor) {
-  const name = endpoint.friendlyName.toLowerCase();
-  return name.includes("cable output") || name.includes("vb-audio virtual cable");
+function findEndpoint(
+  endpoints: EndpointDescriptor[],
+  flow: DataFlow,
+  id: string,
+) {
+  return endpoints.find(
+    (endpoint) => endpoint.flow === flow && endpoint.id === id,
+  );
+}
+
+function findStandardVbCablePair(endpoints: EndpointDescriptor[]) {
+  const renders = endpoints.filter(isStandardVbCableRender);
+  const captures = endpoints.filter(isStandardVbCableCapture);
+  for (const render of renders) {
+    const capture = captures.find((candidate) =>
+      sameEndpointGroup(render, candidate),
+    );
+    if (capture) return { render, capture };
+  }
+  if (renders.length === 1 && captures.length === 1) {
+    return { render: renders[0], capture: captures[0] };
+  }
+  return null;
+}
+
+function isStandardVbCableRender(endpoint: EndpointDescriptor) {
+  return (
+    endpoint.flow === "render" &&
+    standardVbName(endpoint.friendlyName, "cable input")
+  );
+}
+
+function isStandardVbCableCapture(endpoint: EndpointDescriptor) {
+  return (
+    endpoint.flow === "capture" &&
+    standardVbName(endpoint.friendlyName, "cable output")
+  );
+}
+
+function standardVbName(name: string, endpointName: string) {
+  const normalized = name.trim().toLowerCase();
+  return (
+    normalized === endpointName ||
+    (normalized.startsWith(`${endpointName} (`) &&
+      normalized.includes("vb-audio virtual cable"))
+  );
+}
+
+function isConfiguredVirtualCapture(
+  endpoint: EndpointDescriptor,
+  settings: EngineSettings | null,
+  endpoints: EndpointDescriptor[],
+) {
+  if (isStandardVbCableCapture(endpoint)) return true;
+  if (!settings?.virtualCaptureEndpointId) return false;
+  const configured = findEndpoint(
+    endpoints,
+    "capture",
+    settings.virtualCaptureEndpointId,
+  );
+  return sameEndpoint(endpoint, configured);
+}
+
+function activeCustomPairIsTrusted(settings: EngineSettings) {
+  if (
+    settings.virtualDeviceMode !== "custom" ||
+    !settings.outputEndpointId ||
+    !settings.virtualCaptureEndpointId
+  ) {
+    return false;
+  }
+  return settings.trustedVirtualAudioPairs.some(
+    (pair) =>
+      pair.renderEndpointId === settings.outputEndpointId &&
+      pair.captureEndpointId === settings.virtualCaptureEndpointId,
+  );
+}
+
+function inferPairedCapture(
+  render: EndpointDescriptor,
+  captures: EndpointDescriptor[],
+) {
+  if (!render.groupId) return undefined;
+  const matches = captures.filter(
+    (capture) => capture.groupId && capture.groupId === render.groupId,
+  );
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+function buildDeviceDiagnostics(
+  endpoints: EndpointDescriptor[],
+  settings: EngineSettings,
+  issue: ConfigurationIssue | null,
+) {
+  const vbCable = findStandardVbCablePair(endpoints);
+  const lines = [
+    "XMic audio device diagnostics",
+    `VB-CABLE: ${vbCable ? "detected" : "not detected"}`,
+    `Mode: ${settings.virtualDeviceMode ?? "automatic"}`,
+    `Configuration issue: ${issue ? `${issue.type}:${"reason" in issue ? issue.reason : "kind" in issue ? issue.kind : "capture"}` : "none"}`,
+    "Endpoints:",
+  ];
+  for (const endpoint of endpoints) {
+    lines.push(
+      `- [${endpoint.flow}] ${endpoint.friendlyName} | roles=${endpoint.defaultRoles.join(",") || "none"} | group=${endpoint.groupId ? "present" : "none"} | id#=${shortEndpointHash(endpoint.id)}`,
+    );
+  }
+  return lines.join("\n");
+}
+
+function shortEndpointHash(value: string) {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
 }
 
 export default App;

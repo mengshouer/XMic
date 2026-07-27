@@ -285,6 +285,8 @@ pub struct VadGate {
     attack_coefficient: f32,
     release_coefficient: f32,
     voice_candidate_frames: usize,
+    primary_voice_seen: bool,
+    secondary_voice_seen: bool,
     hold_remaining: usize,
     delayed_frames: VecDeque<[f32; DSP_SAMPLES_PER_FRAME]>,
     gain: f32,
@@ -324,6 +326,8 @@ impl VadGate {
             attack_coefficient: smoothing_coefficient(config.attack_ms),
             release_coefficient: smoothing_coefficient(config.release_ms),
             voice_candidate_frames: 0,
+            primary_voice_seen: false,
+            secondary_voice_seen: false,
             hold_remaining: 0,
             delayed_frames,
             gain: if config.enabled { floor_gain } else { 1.0 },
@@ -333,6 +337,15 @@ impl VadGate {
     pub fn process_frame(
         &mut self,
         vad_probability: f32,
+        samples: &mut [f32],
+    ) -> Result<VadGateFrameMetrics, PostProcessConfigError> {
+        self.process_frame_with_secondary_vad(vad_probability, None, samples)
+    }
+
+    pub fn process_frame_with_secondary_vad(
+        &mut self,
+        vad_probability: f32,
+        secondary_voice_active: Option<bool>,
         samples: &mut [f32],
     ) -> Result<VadGateFrameMetrics, PostProcessConfigError> {
         if samples.len() != DSP_SAMPLES_PER_FRAME {
@@ -348,17 +361,26 @@ impl VadGate {
             });
         }
 
-        let voice_candidate =
+        let primary_voice_candidate =
             vad_probability.is_finite() && vad_probability >= self.config.threshold;
+        let secondary_voice_candidate = secondary_voice_active == Some(true);
+        let voice_candidate = primary_voice_candidate || secondary_voice_candidate;
         if voice_candidate {
             self.voice_candidate_frames = self
                 .voice_candidate_frames
                 .saturating_add(1)
                 .min(self.config.confirmation_frames);
+            self.primary_voice_seen |= primary_voice_candidate;
+            self.secondary_voice_seen |=
+                secondary_voice_candidate || secondary_voice_active.is_none();
         } else {
             self.voice_candidate_frames = 0;
+            self.primary_voice_seen = false;
+            self.secondary_voice_seen = false;
         }
-        let voice_active = self.voice_candidate_frames >= self.config.confirmation_frames;
+        let voice_active = self.voice_candidate_frames >= self.config.confirmation_frames
+            && self.primary_voice_seen
+            && self.secondary_voice_seen;
         if voice_active {
             self.hold_remaining = self.config.hold_frames;
         } else if self.hold_remaining > 0 {
@@ -589,6 +611,124 @@ mod tests {
         for probability in [1.0, 0.0, 0.0] {
             let mut samples = [0.5; DSP_SAMPLES_PER_FRAME];
             assert!(!gate.process_frame(probability, &mut samples).unwrap().open);
+        }
+    }
+
+    #[test]
+    fn secondary_vad_only_needs_to_confirm_once_during_a_candidate() {
+        let mut gate = VadGate::new(VadGateConfig {
+            enabled: true,
+            confirmation_frames: 3,
+            pre_roll_frames: 0,
+            hold_frames: 0,
+            ..VadGateConfig::default()
+        })
+        .unwrap();
+        let mut samples = [0.5; DSP_SAMPLES_PER_FRAME];
+
+        assert!(
+            !gate
+                .process_frame_with_secondary_vad(1.0, Some(false), &mut samples)
+                .unwrap()
+                .open
+        );
+        assert!(
+            !gate
+                .process_frame_with_secondary_vad(1.0, Some(true), &mut samples)
+                .unwrap()
+                .open
+        );
+        assert!(
+            gate.process_frame_with_secondary_vad(1.0, Some(false), &mut samples)
+                .unwrap()
+                .open
+        );
+    }
+
+    #[test]
+    fn primary_and_secondary_vad_may_confirm_on_different_frames() {
+        let mut gate = VadGate::new(VadGateConfig {
+            enabled: true,
+            confirmation_frames: 3,
+            pre_roll_frames: 0,
+            hold_frames: 0,
+            ..VadGateConfig::default()
+        })
+        .unwrap();
+        let mut samples = [0.5; DSP_SAMPLES_PER_FRAME];
+
+        assert!(
+            !gate
+                .process_frame_with_secondary_vad(0.0, Some(true), &mut samples)
+                .unwrap()
+                .open
+        );
+        assert!(
+            !gate
+                .process_frame_with_secondary_vad(1.0, Some(false), &mut samples)
+                .unwrap()
+                .open
+        );
+        assert!(
+            gate.process_frame_with_secondary_vad(1.0, Some(false), &mut samples)
+                .unwrap()
+                .open
+        );
+    }
+
+    #[test]
+    fn secondary_vad_rejects_an_unconfirmed_candidate() {
+        let mut gate = VadGate::new(VadGateConfig {
+            enabled: true,
+            confirmation_frames: 3,
+            pre_roll_frames: 0,
+            hold_frames: 0,
+            ..VadGateConfig::default()
+        })
+        .unwrap();
+        let mut samples = [0.5; DSP_SAMPLES_PER_FRAME];
+
+        for _ in 0..4 {
+            assert!(
+                !gate
+                    .process_frame_with_secondary_vad(1.0, Some(false), &mut samples)
+                    .unwrap()
+                    .open
+            );
+        }
+    }
+
+    #[test]
+    fn a_candidate_gap_clears_secondary_vad_confirmation() {
+        let mut gate = VadGate::new(VadGateConfig {
+            enabled: true,
+            confirmation_frames: 3,
+            pre_roll_frames: 0,
+            hold_frames: 0,
+            ..VadGateConfig::default()
+        })
+        .unwrap();
+        let mut samples = [0.5; DSP_SAMPLES_PER_FRAME];
+
+        assert!(
+            !gate
+                .process_frame_with_secondary_vad(1.0, Some(true), &mut samples)
+                .unwrap()
+                .open
+        );
+        assert!(
+            !gate
+                .process_frame_with_secondary_vad(0.0, Some(false), &mut samples)
+                .unwrap()
+                .open
+        );
+        for _ in 0..3 {
+            assert!(
+                !gate
+                    .process_frame_with_secondary_vad(1.0, Some(false), &mut samples)
+                    .unwrap()
+                    .open
+            );
         }
     }
 

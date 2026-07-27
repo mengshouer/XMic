@@ -18,6 +18,7 @@ use windows::{
             StructuredStorage::PropVariantToStringAlloc, CLSCTX_ALL, COINIT_MULTITHREADED,
             STGM_READ,
         },
+        System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
     },
 };
 use xmic_platform_api::{AudioPlatform, DataFlow, DeviceRole, EndpointDescriptor, PlatformError};
@@ -32,6 +33,49 @@ mod system_lifecycle;
 
 const WORKER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+const QPC_UNITS_PER_SECOND: i64 = 10_000_000;
+const LATENCY_SMOOTHING_SHIFT: u32 = 3;
+
+/// WASAPI reports packet timestamps as performance-counter values already converted to 100 ns
+/// units, so measuring how stale a packet is when the worker sees it needs "now" in the same unit.
+pub(crate) struct QpcClock {
+    frequency: i64,
+}
+
+impl QpcClock {
+    pub(crate) fn new() -> Result<Self, PlatformError> {
+        let mut frequency = 0i64;
+        unsafe { QueryPerformanceFrequency(&mut frequency) }
+            .map_err(|error| operation_error("read performance counter frequency", error))?;
+        if frequency <= 0 {
+            return Err(PlatformError::Operation(
+                "performance counter frequency is not positive".to_owned(),
+            ));
+        }
+        Ok(Self { frequency })
+    }
+
+    /// Returns 0 when the counter cannot be read so callers simply skip the sample.
+    pub(crate) fn now_100ns(&self) -> u64 {
+        let mut counter = 0i64;
+        if unsafe { QueryPerformanceCounter(&mut counter) }.is_err() || counter < 0 {
+            return 0;
+        }
+        u64::try_from(
+            i128::from(counter) * i128::from(QPC_UNITS_PER_SECOND) / i128::from(self.frequency),
+        )
+        .unwrap_or(0)
+    }
+}
+
+/// Exponential average with a 1/8 step. Latency samples jitter by a frame or more, and the workers
+/// can only publish through a single atomic, so the smoothing happens where the sample is taken.
+pub(crate) fn smoothed_sample(previous: u64, sample: u64) -> u64 {
+    if previous == 0 {
+        return sample;
+    }
+    previous - (previous >> LATENCY_SMOOTHING_SHIFT) + (sample >> LATENCY_SMOOTHING_SHIFT)
+}
 
 fn join_worker_with_timeout<T>(
     worker: JoinHandle<T>,
@@ -255,5 +299,41 @@ impl ComApartment {
 impl Drop for ComApartment {
     fn drop(&mut self) {
         unsafe { CoUninitialize() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smoothing_starts_at_the_first_sample() {
+        assert_eq!(smoothed_sample(0, 120_000), 120_000);
+    }
+
+    #[test]
+    fn smoothing_moves_an_eighth_of_the_way() {
+        assert_eq!(smoothed_sample(80_000, 160_000), 90_000);
+        assert_eq!(smoothed_sample(80_000, 0), 70_000);
+    }
+
+    #[test]
+    fn smoothing_converges_on_a_stable_sample() {
+        let mut value = 0;
+        for _ in 0..64 {
+            value = smoothed_sample(value, 100_000);
+        }
+
+        assert_eq!(value, 100_000);
+    }
+
+    #[test]
+    fn qpc_clock_advances() {
+        let clock = QpcClock::new().unwrap();
+        let first = clock.now_100ns();
+        let second = clock.now_100ns();
+
+        assert!(first > 0);
+        assert!(second >= first);
     }
 }

@@ -1,10 +1,12 @@
 use std::{
-    ffi::OsStr,
     fs,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU8, Ordering},
     thread,
 };
+
+#[cfg(target_os = "windows")]
+use std::{os::windows::process::CommandExt, process::Command};
 
 use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
@@ -12,7 +14,10 @@ use tauri::{
     AppHandle, Emitter, Manager, RunEvent, State, Wry,
 };
 use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
-use xmic_engine_protocol::{AecPreset, EngineSettings, EngineStatus};
+use tauri_plugin_notification::NotificationExt;
+use xmic_engine_protocol::{
+    AecPreset, ConfigurationIssue, EngineSettings, EngineStatus, VirtualDeviceIssueReason,
+};
 use xmic_platform_api::{AudioPlatform, EndpointDescriptor};
 use xmic_platform_windows::{start_system_lifecycle_monitor, WasapiPlatform};
 
@@ -22,6 +27,7 @@ mod engine_client;
 mod engine_ipc;
 mod engine_process;
 mod lifecycle;
+mod route_validation;
 mod settings_store;
 
 use engine::DspFeature;
@@ -36,6 +42,10 @@ pub fn run_audio_engine_process() -> Result<(), String> {
 }
 
 const AUTOSTART_ARGUMENT: &str = "--autostart";
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(target_os = "windows")]
+const VB_CABLE_DOWNLOAD_URL: &str = "https://vb-audio.com/Cable/";
 const TRAY_ID: &str = "main-tray";
 const MENU_SHOW: &str = "show";
 const MENU_TOGGLE_PROCESSING: &str = "toggle-processing";
@@ -85,11 +95,13 @@ struct TrayLabels {
     start_processing: &'static str,
     stop_processing: &'static str,
     cancel_pending: &'static str,
+    configure_microphone: &'static str,
     preset: &'static str,
     quit: &'static str,
     stopped_tooltip: &'static str,
     processing_tooltip: &'static str,
     pending_tooltip: &'static str,
+    configuration_tooltip: &'static str,
 }
 
 fn tray_labels(language: UiLanguage) -> TrayLabels {
@@ -99,22 +111,26 @@ fn tray_labels(language: UiLanguage) -> TrayLabels {
             start_processing: "启动处理",
             stop_processing: "停止处理",
             cancel_pending: "取消自动启动",
+            configure_microphone: "配置音频设备",
             preset: "处理强度",
             quit: "退出 XMic",
             stopped_tooltip: "XMic - 已停止",
             processing_tooltip: "XMic - 处理中",
             pending_tooltip: "XMic - 等待恢复处理",
+            configuration_tooltip: "XMic - 需要配置音频设备",
         },
         UiLanguage::En => TrayLabels {
             show: "Open XMic",
             start_processing: "Start processing",
             stop_processing: "Stop processing",
             cancel_pending: "Cancel automatic start",
+            configure_microphone: "Configure audio devices",
             preset: "Processing strength",
             quit: "Quit XMic",
             stopped_tooltip: "XMic - Stopped",
             processing_tooltip: "XMic - Processing",
             pending_tooltip: "XMic - Waiting to resume",
+            configuration_tooltip: "XMic - Audio device setup required",
         },
     }
 }
@@ -154,6 +170,8 @@ fn get_engine_status(
     controller: State<'_, EngineController>,
 ) -> Result<EngineStatus, String> {
     let status = engine_status(&controller)?;
+    app.state::<LifecycleController>()
+        .synchronize_configuration_issue(status.configuration_issue.clone(), false);
     schedule_tray_refresh(&app);
     Ok(status)
 }
@@ -179,6 +197,23 @@ fn set_ui_language(app: AppHandle, language: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn open_vb_cable_download() -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("rundll32.exe")
+            .args(["url.dll,FileProtocolHandler", VB_CABLE_DOWNLOAD_URL])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("open VB-CABLE download page: {error}"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("opening the VB-CABLE page is only supported on Windows".to_owned())
+    }
+}
+
+#[tauri::command]
 fn update_lifecycle_preferences(
     app: AppHandle,
     lifecycle: State<'_, LifecycleController>,
@@ -194,7 +229,10 @@ fn update_lifecycle_preferences(
         set_launch_at_login(&autolaunch, preferences.launch_at_login)?;
     }
 
-    if let Err(error) = lifecycle.set_start_engine_on_launch(preferences.start_engine_on_launch) {
+    if let Err(error) = lifecycle.set_startup_preferences(
+        preferences.start_in_tray,
+        preferences.start_engine_on_launch,
+    ) {
         if launch_setting_changed {
             if let Err(rollback_error) = set_launch_at_login(&autolaunch, previous_launch_at_login)
             {
@@ -229,10 +267,31 @@ fn set_launch_at_login(
 fn update_engine_settings(
     app: AppHandle,
     controller: State<'_, EngineController>,
+    lifecycle: State<'_, LifecycleController>,
     settings: EngineSettings,
 ) -> Result<EngineStatus, String> {
     controller.update_settings(settings)?;
-    emit_status(&app, &controller)
+    let status = emit_status(&app, &controller)?;
+    lifecycle.synchronize_configuration_issue(status.configuration_issue.clone(), false);
+    let _ = emit_lifecycle_status(&app);
+    Ok(status)
+}
+
+#[tauri::command]
+fn set_dsp_feature_enabled(
+    app: AppHandle,
+    controller: State<'_, EngineController>,
+    lifecycle: State<'_, LifecycleController>,
+    feature: DspFeature,
+    enabled: bool,
+) -> Result<EngineStatus, String> {
+    if let Err(error) = lifecycle.set_dsp_feature_enabled(&controller, feature, enabled) {
+        emit_application_state(&app);
+        return Err(error);
+    }
+    let status = emit_status(&app, &controller)?;
+    let _ = emit_lifecycle_status(&app);
+    Ok(status)
 }
 
 #[tauri::command]
@@ -241,7 +300,10 @@ fn start_engine(
     controller: State<'_, EngineController>,
     lifecycle: State<'_, LifecycleController>,
 ) -> Result<EngineStatus, String> {
-    lifecycle.start_manually(&controller)?;
+    if let Err(error) = lifecycle.start_manually(&controller) {
+        emit_application_state(&app);
+        return Err(error);
+    }
     let status = emit_status(&app, &controller)?;
     let _ = emit_lifecycle_status(&app);
     Ok(status)
@@ -265,6 +327,8 @@ fn engine_status(controller: &EngineController) -> Result<EngineStatus, String> 
 
 fn emit_status(app: &AppHandle, controller: &EngineController) -> Result<EngineStatus, String> {
     let status = engine_status(controller)?;
+    app.state::<LifecycleController>()
+        .synchronize_configuration_issue(status.configuration_issue.clone(), false);
     app.emit("engine-status", &status)
         .map_err(|error| error.to_string())?;
     schedule_tray_refresh(app);
@@ -295,6 +359,54 @@ pub(crate) fn emit_application_state(app: &AppHandle) {
     let controller = app.state::<EngineController>();
     let _ = emit_status(app, &controller);
     let _ = emit_lifecycle_status(app);
+    send_pending_configuration_notice(app);
+}
+
+fn send_pending_configuration_notice(app: &AppHandle) {
+    let lifecycle = app.state::<LifecycleController>();
+    let Some(issue) = lifecycle.take_configuration_notice() else {
+        return;
+    };
+    let language = app
+        .try_state::<TrayMenuState>()
+        .map(|menu| UiLanguage::from_code(menu.language.load(Ordering::Relaxed)))
+        .unwrap_or(UiLanguage::ZhCn);
+    let (title, body) = match (language, issue) {
+        (UiLanguage::ZhCn, ConfigurationIssue::PhysicalCaptureRequired { .. }) => (
+            "XMic 需要选择物理麦克风",
+            "请打开 XMic，在设备与运行中明确选择 3.5 mm 或 USB 物理麦克风。",
+        ),
+        (UiLanguage::En, ConfigurationIssue::PhysicalCaptureRequired { .. }) => (
+            "XMic needs a physical microphone",
+            "Open XMic and explicitly select the physical 3.5 mm or USB microphone under Devices & runtime.",
+        ),
+        (
+            UiLanguage::ZhCn,
+            ConfigurationIssue::VirtualDeviceRequired {
+                reason: VirtualDeviceIssueReason::VbCableUnavailable,
+            },
+        ) => (
+            "XMic 未检测到虚拟麦克风",
+            "请打开 XMic 安装 VB-CABLE，或配置并确认其他虚拟音频设备。",
+        ),
+        (UiLanguage::ZhCn, ConfigurationIssue::VirtualDeviceRequired { .. }) => (
+            "XMic 需要配置虚拟麦克风",
+            "请打开 XMic，完成自定义虚拟设备的写入端、读取端和安全确认。",
+        ),
+        (UiLanguage::En, ConfigurationIssue::VirtualDeviceRequired { .. }) => (
+            "XMic needs a virtual microphone",
+            "Open XMic to install VB-CABLE or finish configuring and confirming another virtual audio device.",
+        ),
+        (UiLanguage::ZhCn, ConfigurationIssue::VirtualRouteConflict { .. }) => (
+            "XMic 音频路由冲突",
+            "虚拟写入端不能同时作为实际播放设备。请打开 XMic 修正音频路由。",
+        ),
+        (UiLanguage::En, ConfigurationIssue::VirtualRouteConflict { .. }) => (
+            "XMic audio route conflict",
+            "The virtual input cannot also be the physical playback device. Open XMic to correct the route.",
+        ),
+    };
+    let _ = app.notification().builder().title(title).body(body).show();
 }
 
 fn native_library_path(app: &tauri::App) -> Result<PathBuf, tauri::Error> {
@@ -463,6 +575,12 @@ fn show_main_window(app: &AppHandle) {
         let _ = window.show();
         let _ = window.set_focus();
     }
+    if let Some(issue) = app
+        .try_state::<LifecycleController>()
+        .and_then(|lifecycle| lifecycle.configuration_issue())
+    {
+        let _ = app.emit("navigate-to-configuration", issue);
+    }
 }
 
 fn spawn_tray_engine_toggle(app: AppHandle) {
@@ -471,6 +589,11 @@ fn spawn_tray_engine_toggle(app: AppHandle) {
         .spawn(move || {
             let controller = app.state::<EngineController>();
             let lifecycle = app.state::<LifecycleController>();
+            if lifecycle.configuration_issue().is_some() {
+                show_main_window(&app);
+                emit_application_state(&app);
+                return;
+            }
             if controller.is_running() || lifecycle.has_pending_start() {
                 let _ = lifecycle.stop_manually(&controller);
             } else {
@@ -483,6 +606,7 @@ fn spawn_tray_engine_toggle(app: AppHandle) {
 fn spawn_tray_dsp_toggle(app: AppHandle, feature: DspFeature) {
     let thread_name = match feature {
         DspFeature::Aec => "xmic-tray-aec-toggle",
+        DspFeature::Rnnoise => "xmic-tray-rnnoise-toggle",
         DspFeature::Agc2 => "xmic-tray-agc2-toggle",
         DspFeature::VadGate => "xmic-tray-vad-gate-toggle",
     };
@@ -537,10 +661,17 @@ fn refresh_tray(app: &AppHandle) {
     let running = controller.is_running();
     let settings = controller.settings();
     let pending = lifecycle.has_pending_start();
+    let configuration_required = lifecycle.configuration_issue().is_some();
     let available = lifecycle.is_session_available();
     let labels = tray_labels(UiLanguage::from_code(menu.language.load(Ordering::Relaxed)));
     let (label, tooltip, enabled) = if running {
         (labels.stop_processing, labels.processing_tooltip, true)
+    } else if configuration_required {
+        (
+            labels.configure_microphone,
+            labels.configuration_tooltip,
+            available,
+        )
     } else if pending {
         (labels.cancel_pending, labels.pending_tooltip, true)
     } else {
@@ -572,13 +703,10 @@ fn refresh_tray(app: &AppHandle) {
     }
 }
 
-fn launched_from_autostart() -> bool {
-    std::env::args_os().any(|argument| argument == OsStr::new(AUTOSTART_ARGUMENT))
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .plugin(
             tauri_plugin_autostart::Builder::new()
                 .arg(AUTOSTART_ARGUMENT)
@@ -624,7 +752,7 @@ pub fn run() {
                 }
             }
 
-            if !launched_from_autostart() {
+            if !app.state::<LifecycleController>().start_in_tray() {
                 show_main_window(app.handle());
             }
             refresh_tray(app.handle());
@@ -640,9 +768,11 @@ pub fn run() {
             get_engine_status,
             get_lifecycle_status,
             set_ui_language,
+            open_vb_cable_download,
             list_audio_endpoints,
             update_lifecycle_preferences,
             update_engine_settings,
+            set_dsp_feature_enabled,
             start_engine,
             stop_engine
         ])
