@@ -4,6 +4,7 @@ mod channel;
 mod delay;
 mod normalize;
 mod post_process;
+mod speech_presence;
 
 pub use channel::{ChannelMapError, ChannelMapper};
 pub use delay::{DelayCalibrationState, HostDelayEstimator, HostDelayObservation};
@@ -15,6 +16,7 @@ pub use post_process::{
     EchoGuard, EchoGuardConfig, EchoGuardFrameMetrics, LimiterFrameMetrics, PostProcessConfigError,
     SafetyLimiter, SafetyLimiterConfig, VadGate, VadGateConfig, VadGateFrameMetrics,
 };
+pub use speech_presence::SpeechPresenceDetector;
 
 pub const DSP_SAMPLE_RATE_HZ: usize = 48_000;
 pub const DSP_FRAME_DURATION_MS: usize = 10;

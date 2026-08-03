@@ -19,6 +19,7 @@ const zhCN = {
     retryStart: "重试启动",
     applySettings: "应用设置",
     pendingSettings: "有未应用的设置更改",
+    version: "版本",
   },
   app: {
     eyebrow: "LOCAL AUDIO ENGINE",
@@ -86,8 +87,8 @@ const zhCN = {
       configurationSubtitle: "输入、参考与输出端点",
       active: "当前活动路由",
       activeSubtitle: "引擎实际使用的端点",
-      safety: "故障保护",
-      safetySubtitle: "DSP 异常时的输出策略",
+      safety: "未处理时的输出",
+      safetySubtitle: "XMic 没在处理时虚拟麦克风的内容",
       lifecycle: "后台生命周期",
       lifecycleSubtitle: "登录与启动行为",
     },
@@ -104,13 +105,13 @@ const zhCN = {
     },
   },
   engineModes: {
-    sleeping: "已停止",
+    sleeping: "未处理",
     starting: "正在启动",
     converging: "AEC 收敛中",
     active: "处理中",
-    rawFallback: "原始麦克风直通",
+    rawFallback: "未处理 · 原始麦克风",
     safeMode: "安全模式",
-    muted: "故障静音",
+    muted: "未处理 · 静音",
     error: "等待重连",
   },
   processingLoads: {
@@ -133,7 +134,11 @@ const zhCN = {
       "虚拟输出队列深度及为补偿独立设备时钟漂移而施加的当前 resampling 修正。",
     audioAnomalies: "音频异常计数",
     audioAnomaliesHelp:
-      "播放欠载 / 播放溢出 / 采集溢出 / 输出欠载 / 输出溢出 / DSP 故障",
+      "播放欠载 / 播放溢出 / 采集溢出 / 输出欠载 / 输出溢出 / 设备丢包 / DSP 故障",
+    deviceDiscontinuities: "设备丢包",
+    deviceDiscontinuitiesHelp:
+      "音频驱动在数据到达 XMic 之前就丢掉的包数。蓝牙等无线设备链路不稳时这个数字会一直涨，属于设备问题，不是 CPU 或 DSP 的问题。",
+    pausedWillResume: "已暂停 · 将自动恢复",
   },
   routing: {
     title: "设备与运行",
@@ -218,11 +223,11 @@ const zhCN = {
     customizedProfile: "当前设备组合 · 已保存",
     defaultProfile: "当前设备组合 · 默认参数",
     waitingProfile: "等待设备组合",
-    failurePolicy: "DSP 故障策略",
-    failurePolicyHelp:
-      "DSP 运行失败时的输出方式。原始直通可以继续说话，但可能泄漏回声和噪声；静音不会泄漏声音，但故障期间对方听不到你。",
-    rawPassthrough: "原始直通",
-    mute: "静音",
+    unprocessedOutput: "未处理时的输出",
+    unprocessedOutputHelp:
+      "XMic 没在处理时（未启动、启动失败、DSP 故障、安全模式、CPU 过载保护），虚拟麦克风输出什么。原始麦克风让对方始终能听到你，但没有回声消除，对方可能听到自己的声音；静音不会泄漏任何声音，但这段时间对方完全听不到你。两种情况下，只要检测到你在说话，都会提醒一次。",
+    rawMicrophone: "原始麦克风",
+    silence: "静音",
     background: "后台与启动",
     backgroundHelp:
       "关闭主窗口后 XMic 会继续驻留系统托盘。锁屏、断开 Windows 会话或睡眠时会暂停处理，并在会话恢复后按之前状态重启。",
@@ -436,6 +441,7 @@ const en = {
     retryStart: "Retry start",
     applySettings: "Apply settings",
     pendingSettings: "Settings have unapplied changes",
+    version: "Version",
   },
   app: {
     eyebrow: "LOCAL AUDIO ENGINE",
@@ -503,8 +509,8 @@ const en = {
       configurationSubtitle: "Input, reference, and output endpoints",
       active: "Current active route",
       activeSubtitle: "Endpoints used by the engine",
-      safety: "Failure protection",
-      safetySubtitle: "Output policy after a DSP failure",
+      safety: "Output when not processing",
+      safetySubtitle: "What the virtual microphone carries while XMic is not processing",
       lifecycle: "Background lifecycle",
       lifecycleSubtitle: "Login and launch behavior",
     },
@@ -521,13 +527,13 @@ const en = {
     },
   },
   engineModes: {
-    sleeping: "Stopped",
+    sleeping: "Not processing",
     starting: "Starting",
     converging: "AEC converging",
     active: "Processing",
-    rawFallback: "Raw microphone passthrough",
+    rawFallback: "Not processing · raw microphone",
     safeMode: "Safe mode",
-    muted: "Muted after failure",
+    muted: "Not processing · silent",
     error: "Waiting to reconnect",
   },
   processingLoads: {
@@ -550,7 +556,11 @@ const en = {
       "Virtual output queue depth and the current resampling correction applied to compensate for drift between independent device clocks.",
     audioAnomalies: "Audio anomaly counts",
     audioAnomaliesHelp:
-      "Render underrun / render overflow / capture overflow / output underrun / output overflow / DSP failure",
+      "Render underrun / render overflow / capture overflow / output underrun / output overflow / dropped device packets / DSP failure",
+    deviceDiscontinuities: "Dropped device packets",
+    deviceDiscontinuitiesHelp:
+      "Packets the audio driver dropped before XMic ever saw them. This climbs on an unstable wireless link such as Bluetooth; it is a device problem, not CPU or DSP load.",
+    pausedWillResume: "Paused · resumes automatically",
   },
   routing: {
     title: "Devices & runtime",
@@ -640,11 +650,11 @@ const en = {
     customizedProfile: "Current device pair · Saved settings",
     defaultProfile: "Current device pair · Default settings",
     waitingProfile: "Waiting for device pair",
-    failurePolicy: "DSP failure policy",
-    failurePolicyHelp:
-      "Select the output behavior after a DSP failure. Raw passthrough keeps your microphone available but may leak echo and noise. Mute prevents leakage, but others cannot hear you during the failure.",
-    rawPassthrough: "Raw passthrough",
-    mute: "Mute",
+    unprocessedOutput: "Output when not processing",
+    unprocessedOutputHelp:
+      "What the virtual microphone carries while XMic is not processing: never started, failed to start, a DSP failure, safe mode, or CPU overload protection. The raw microphone keeps you audible but without echo cancellation, so others may hear themselves. Silence leaks nothing, but nobody can hear you meanwhile. Either way, XMic notifies you once if it hears you talking.",
+    rawMicrophone: "Raw microphone",
+    silence: "Silence",
     background: "Background and startup",
     backgroundHelp:
       "XMic remains in the system tray after the main window closes. Processing pauses while Windows is locked, disconnected, or asleep, then resumes in its previous state when the session returns.",

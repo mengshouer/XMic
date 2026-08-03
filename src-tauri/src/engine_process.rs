@@ -1,8 +1,7 @@
 use std::{ffi::OsString, path::PathBuf, process, thread};
 
 use xmic_engine_protocol::{EngineRequest, EngineResponse, PROTOCOL_VERSION};
-use xmic_platform_api::AudioPlatform;
-use xmic_platform_windows::{wait_for_process_exit, LocalIpcServer, WasapiPlatform};
+use xmic_platform_windows::{wait_for_process_exit, LocalIpcServer};
 
 use crate::{
     device_profiles::DeviceProfileStore,
@@ -77,20 +76,10 @@ fn handle_request(
                 )
             }
         }
-        EngineRequest::GetStatus { include_endpoints } => {
-            let endpoints = if include_endpoints {
-                match WasapiPlatform::new().active_endpoints() {
-                    Ok(endpoints) => endpoints,
-                    Err(error) => return (EngineResponse::Error(error.to_string()), false),
-                }
-            } else {
-                Vec::new()
-            };
-            (
-                EngineResponse::Status(Box::new(controller.status(endpoints))),
-                false,
-            )
-        }
+        EngineRequest::GetStatus { permit } => (
+            EngineResponse::Status(Box::new(controller.status(permit))),
+            false,
+        ),
         EngineRequest::UpdateSettings { settings } => match controller.update_settings(*settings) {
             Ok(()) => (EngineResponse::Ack, false),
             Err(error) => (EngineResponse::Error(error), false),
@@ -107,7 +96,7 @@ fn handle_request(
             Err(error) => (EngineResponse::Error(error), false),
         },
         EngineRequest::Shutdown => {
-            let response = match controller.stop() {
+            let response = match controller.shutdown() {
                 Ok(()) => EngineResponse::Ack,
                 Err(error) => EngineResponse::Error(error),
             };

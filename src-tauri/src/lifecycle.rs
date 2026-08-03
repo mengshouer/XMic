@@ -170,13 +170,19 @@ impl LifecycleState {
         changed
     }
 
+    /// Blocks on an audio route XMic cannot use right now.
+    ///
+    /// The pending resume is deliberately preserved. Waking from sleep re-enumerates the audio
+    /// endpoints over a second or two, so the route looks incomplete for a moment — and treating that
+    /// as "the user has to intervene" used to discard the intent to keep processing, which left the
+    /// engine stopped until somebody pressed the button even though the devices had come back. The
+    /// retry loop picks it up again on its own once the route is usable; until then the configuration
+    /// issue takes precedence in the tray and the window, so the pending start stays invisible.
     fn block_for_configuration(&mut self, issue: ConfigurationIssue, notify: bool) -> bool {
-        let changed = self.configuration_issue.as_ref() != Some(&issue)
-            || self.resume_pending
-            || self.last_error.is_some();
+        let changed =
+            self.configuration_issue.as_ref() != Some(&issue) || self.last_error.is_some();
         let new_issue = self.configuration_issue.as_ref() != Some(&issue);
         self.configuration_issue = Some(issue);
-        self.resume_pending = false;
         self.last_error = None;
         if notify && new_issue {
             self.configuration_notice_pending = true;
@@ -258,6 +264,17 @@ impl LifecycleController {
 
     pub fn is_session_available(&self) -> bool {
         lock_unpoisoned(&self.state).session_available()
+    }
+
+    /// The helper may only open audio devices while nothing is being processed if the Windows session
+    /// is usable, XMic is not exiting, and the audio route is complete — a route that is still missing
+    /// a physical microphone or a confirmed virtual device could feed the virtual cable into itself.
+    pub fn refresh_idle_permit(&self, engine: &EngineController) {
+        let allowed = {
+            let state = lock_unpoisoned(&self.state);
+            state.session_available() && state.configuration_issue.is_none()
+        };
+        engine.set_idle_bypass_allowed(allowed);
     }
 
     pub fn has_pending_start(&self) -> bool {
@@ -519,12 +536,16 @@ impl LifecycleController {
             state.exiting = true;
             state.resume_pending = false;
         }
+        self.refresh_idle_permit(engine);
         let _ = engine.stop();
     }
 
     fn pause(&self, reason: PauseReason, engine: &EngineController) {
         let running = engine.is_running();
         let should_stop = lock_unpoisoned(&self.state).pause(reason, running);
+        // Revoke the permit before stopping, so the idle session cannot take over the microphone the
+        // pause is meant to release.
+        self.refresh_idle_permit(engine);
         if should_stop {
             if let Err(error) = engine.stop() {
                 lock_unpoisoned(&self.state).resume_pending = false;
@@ -535,6 +556,7 @@ impl LifecycleController {
 
     fn resume(&self, reason: PauseReason, engine: &EngineController) {
         let should_resume = lock_unpoisoned(&self.state).resume(reason);
+        self.refresh_idle_permit(engine);
         if should_resume {
             let _ = self.try_pending_start(engine, "恢复处理失败");
         }
@@ -697,10 +719,18 @@ fn run_background_lifecycle(app: AppHandle, monitor: SystemLifecycleMonitor, sto
             running,
             configuration_issue,
         );
+        {
+            let engine = app.state::<EngineController>();
+            app.state::<LifecycleController>()
+                .refresh_idle_permit(&engine);
+        }
+        // The engine can start hearing unprocessed speech without anything else changing, so this poll
+        // is the one place guaranteed to notice it.
+        let speech_notice = crate::send_unprocessed_speech_notice(&app);
         let running_changed = last_running
             .replace(running)
             .is_some_and(|last| last != running);
-        if running_changed || lifecycle_changed {
+        if running_changed || lifecycle_changed || speech_notice {
             emit_application_state(&app);
         }
     }
@@ -792,13 +822,38 @@ mod tests {
         let issue = physical_capture_required();
 
         assert!(state.block_for_configuration(issue.clone(), true));
-        assert!(!state.resume_pending);
+        assert!(state.resume_pending);
         assert!(state.last_error.is_none());
         assert!(state.configuration_notice_pending);
 
         state.configuration_notice_pending = false;
         assert!(!state.block_for_configuration(issue, true));
         assert!(!state.configuration_notice_pending);
+    }
+
+    #[test]
+    fn a_route_that_is_briefly_unusable_after_wake_keeps_the_pending_resume() {
+        let mut state = LifecycleState::new(StoredPreferences::default());
+
+        // Processing was running when the machine went to sleep.
+        assert!(state.pause(PauseReason::SystemSuspended, true));
+        assert!(state.resume_pending);
+        assert!(state.resume(PauseReason::SystemSuspended));
+
+        // Waking up re-enumerates the audio endpoints, so for a second or two the route looks
+        // incomplete. That must not be mistaken for "the user has to fix something".
+        state.synchronize_engine_state(false, false, Some(physical_capture_required()));
+        assert!(
+            state.resume_pending,
+            "the intent to keep processing has to survive a transient route"
+        );
+
+        // Once the devices are back the blocker clears and the retry loop still has work to do, so
+        // processing returns without anybody pressing the button.
+        state.synchronize_engine_state(false, false, None);
+        assert!(state.configuration_issue.is_none());
+        assert!(state.resume_pending);
+        assert!(state.session_available());
     }
 
     #[test]

@@ -6,9 +6,12 @@ use std::{
 use serde::{Deserialize, Serialize};
 use xmic_engine_protocol::EngineSettings;
 
-/// Bumped whenever stored DSP values need a one-shot rewrite. The version lives in the file but not
-/// in `EngineSettings`, so it never crosses the IPC or Tauri boundary.
-const SETTINGS_SCHEMA_VERSION: u16 = 1;
+/// Bumped whenever a stored file needs a one-shot rewrite. The version lives in the file but not in
+/// `EngineSettings`, so it never crosses the IPC or Tauri boundary.
+/// - 1: rewrote the superseded VAD gate defaults and repaired a pass-through AGC2.
+/// - 2: renamed `failurePolicy` to `unprocessedOutput`; `serde` aliases read the old key, and the
+///   rewrite is what makes the file stop carrying it.
+const SETTINGS_SCHEMA_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -83,13 +86,15 @@ impl SettingsStore {
         }
     }
 
-    /// Rewrites superseded DSP defaults once and records the new schema version, so a value the user
+    /// Applies the steps the stored version is missing and records the new one, so a value the user
     /// later tunes back to an old default is never rewritten again.
     fn migrate(&self, mut stored: StoredSettings) -> EngineSettings {
         if stored.schema_version >= SETTINGS_SCHEMA_VERSION {
             return stored.settings;
         }
-        stored.settings.dsp.migrate_legacy_defaults();
+        if stored.schema_version < 1 {
+            stored.settings.dsp.migrate_legacy_defaults();
+        }
         if stored.settings.validate().is_ok() {
             let _ = self.save(&stored.settings);
         }
@@ -125,7 +130,7 @@ fn load_valid_settings(path: &Path) -> Option<StoredSettings> {
 mod tests {
     use super::*;
     use xmic_engine_protocol::{
-        AecPreset, DspFailurePolicy, TrustedVirtualAudioPair, VirtualDeviceMode,
+        AecPreset, TrustedVirtualAudioPair, UnprocessedOutput, VirtualDeviceMode,
         LEGACY_VAD_CONFIRMATION_MS, LEGACY_VAD_FLOOR_DB,
     };
 
@@ -170,7 +175,7 @@ mod tests {
                 render_name: "Custom render".to_owned(),
                 capture_name: "Custom capture".to_owned(),
             }],
-            failure_policy: DspFailurePolicy::Mute,
+            unprocessed_output: UnprocessedOutput::Silence,
             ..EngineSettings::default()
         };
         legacy_defaults.dsp.vad_gate.confirmation_ms = LEGACY_VAD_CONFIRMATION_MS;
@@ -227,7 +232,7 @@ mod tests {
     fn full_settings_round_trip_through_json() {
         let mut settings = EngineSettings {
             capture_channel: Some(3),
-            failure_policy: DspFailurePolicy::RawPassthrough,
+            unprocessed_output: UnprocessedOutput::RawMicrophone,
             ..EngineSettings::default()
         };
         settings.dsp.aec.preset = AecPreset::Strong;
@@ -254,9 +259,47 @@ mod tests {
         route.apply_to(&mut settings);
 
         assert_eq!(settings.dsp.aec.preset, AecPreset::Strong);
-        assert_eq!(settings.failure_policy, DspFailurePolicy::Mute);
+        assert_eq!(settings.unprocessed_output, UnprocessedOutput::Silence);
         assert_eq!(settings.capture_channel, Some(1));
         assert_eq!(settings.render_endpoint_id.as_deref(), Some("render-id"));
+    }
+
+    #[test]
+    fn a_schema_one_file_converges_to_the_new_key_without_retuning_dsp_values() {
+        let (directory, store) = temporary_store("rename");
+        let mut settings = EngineSettings {
+            unprocessed_output: UnprocessedOutput::RawMicrophone,
+            ..EngineSettings::default()
+        };
+        // A value the user deliberately tuned back to a superseded default: schema 1 already ran the
+        // DSP migration, so bumping to 2 must not touch it again.
+        settings.dsp.vad_gate.confirmation_ms = LEGACY_VAD_CONFIRMATION_MS;
+        let stored = serde_json::to_value(StoredSettings {
+            schema_version: 1,
+            settings,
+        })
+        .unwrap();
+        let mut object = stored.as_object().unwrap().clone();
+        object.remove("unprocessedOutput");
+        object.insert("failurePolicy".to_owned(), "rawPassthrough".into());
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(&store.path, serde_json::to_string_pretty(&object).unwrap()).unwrap();
+
+        let migrated = store.load();
+
+        assert_eq!(
+            migrated.unprocessed_output,
+            UnprocessedOutput::RawMicrophone
+        );
+        assert_eq!(
+            migrated.dsp.vad_gate.confirmation_ms,
+            LEGACY_VAD_CONFIRMATION_MS
+        );
+        let rewritten = fs::read_to_string(&store.path).unwrap();
+        assert!(rewritten.contains("\"unprocessedOutput\": \"rawMicrophone\""));
+        assert!(!rewritten.contains("failurePolicy"));
+        assert!(rewritten.contains("\"schemaVersion\": 2"));
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]

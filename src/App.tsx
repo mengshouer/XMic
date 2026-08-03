@@ -1,3 +1,4 @@
+import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -59,9 +60,25 @@ import {
   type Language,
   type Translation,
 } from "./i18n";
+import {
+  activeCustomPairIsTrusted,
+  findStandardVbCablePair,
+  getConfigurationIssue,
+  inferPairedCapture,
+  isConfiguredVirtualCapture,
+  sameEndpointGroup,
+  type ConfigurationIssue,
+  type EndpointDescriptor,
+  type TrustedVirtualAudioPair,
+  type VirtualDeviceMode,
+} from "./routeValidation";
+import {
+  activeViewAt,
+  markerOffset,
+  VIEWS,
+  type ViewId,
+} from "./scrollSpy";
 
-type DataFlow = "render" | "capture";
-type DeviceRole = "console" | "multimedia" | "communications";
 type EngineMode =
   | "sleeping"
   | "starting"
@@ -72,51 +89,11 @@ type EngineMode =
   | "muted"
   | "error";
 type AecPreset = "natural" | "balanced" | "strong";
-type DspFailurePolicy = "rawPassthrough" | "mute";
-type VirtualDeviceMode = "vbCable" | "custom";
-type VirtualDeviceIssueReason =
-  | "vbCableUnavailable"
-  | "customPairIncomplete"
-  | "customPairUnconfirmed";
-type VirtualRouteConflictKind =
-  | "defaultRender"
-  | "fixedRender"
-  | "physicalCapture";
+type UnprocessedOutput = "rawMicrophone" | "silence";
 type DelayCalibrationState = "uncalibrated" | "warmingUp" | "calibrated";
 type ProcessingLoadMode = "full" | "reduced" | "protection";
-type ViewId = "monitor" | "routing" | "processing";
 type DspStageId = "aec" | "rnnoise" | "agc2" | "vad" | "limiter";
 type DspFeatureId = "aec" | "rnnoise" | "agc2" | "vadGate";
-
-interface PhysicalCaptureRequiredIssue {
-  type: "physicalCaptureRequired";
-  virtualCaptureEndpointId: string | null;
-}
-
-interface VirtualDeviceRequiredIssue {
-  type: "virtualDeviceRequired";
-  reason: VirtualDeviceIssueReason;
-}
-
-interface VirtualRouteConflictIssue {
-  type: "virtualRouteConflict";
-  kind: VirtualRouteConflictKind;
-  endpointId: string;
-}
-
-type ConfigurationIssue =
-  | PhysicalCaptureRequiredIssue
-  | VirtualDeviceRequiredIssue
-  | VirtualRouteConflictIssue;
-
-interface EndpointDescriptor {
-  platform: string;
-  id: string;
-  groupId?: string | null;
-  friendlyName: string;
-  flow: DataFlow;
-  defaultRoles: DeviceRole[];
-}
 
 interface AecSettings {
   enabled: boolean;
@@ -163,13 +140,6 @@ interface DspSettings {
   limiter: LimiterSettings;
 }
 
-interface TrustedVirtualAudioPair {
-  renderEndpointId: string;
-  captureEndpointId: string;
-  renderName: string;
-  captureName: string;
-}
-
 interface EngineSettings {
   followDefaultRender: boolean;
   renderEndpointId: string | null;
@@ -179,7 +149,7 @@ interface EngineSettings {
   virtualDeviceMode: VirtualDeviceMode | null;
   virtualCaptureEndpointId: string | null;
   trustedVirtualAudioPairs: TrustedVirtualAudioPair[];
-  failurePolicy: DspFailurePolicy;
+  unprocessedOutput: UnprocessedOutput;
   dsp: DspSettings;
 }
 
@@ -200,6 +170,7 @@ interface EngineMetrics {
   renderUnderruns: number;
   renderOverflows: number;
   captureOverflows: number;
+  deviceDiscontinuities: number;
   outputUnderruns: number;
   outputQueueOverflows: number;
   outputQueueDepthMs: number;
@@ -253,6 +224,8 @@ interface EngineStatus {
   configurationIssue: ConfigurationIssue | null;
   metrics: EngineMetrics;
   warning: string | null;
+  /** Mirrored from `EngineStatus`; the one-shot notification for it is sent from the Rust side. */
+  unprocessedSpeechDetected: boolean;
 }
 
 interface LifecyclePreferences {
@@ -307,6 +280,7 @@ function App() {
   const [status, setStatus] = useState<EngineStatus | null>(null);
   const [lifecycleStatus, setLifecycleStatus] =
     useState<LifecycleStatus | null>(null);
+  const [appVersion, setAppVersion] = useState<string | null>(null);
   const [draft, setDraft] = useState<EngineSettings | null>(null);
   const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -317,6 +291,9 @@ function App() {
   const [diagnosticsCopied, setDiagnosticsCopied] = useState(false);
   const captureSelectRef = useRef<HTMLSelectElement>(null);
   const virtualOutputSelectRef = useRef<HTMLSelectElement>(null);
+  // Scroll-spy geometry. Neither value changes while scrolling, so both are measured when the layout
+  // changes instead of on every scroll event.
+  const scrollSpy = useRef({ markerOffset: 0, sectionTops: [] as number[] });
   const copy = translations[language];
 
   const navigateToView = useCallback((view: ViewId) => {
@@ -411,6 +388,10 @@ function App() {
   }, []);
 
   useEffect(() => {
+    getVersion().then(setAppVersion).catch(() => setAppVersion(null));
+  }, []);
+
+  useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
     listen<ConfigurationIssue>("navigate-to-configuration", (event) => {
@@ -455,6 +436,37 @@ function App() {
     };
   }, []);
 
+  // Two mechanisms, because neither covers the other's case.
+  //
+  // Going to the tray hides the window with ShowWindow(SW_HIDE), and WebView2 does not report that
+  // as document.hidden — the page keeps running, invisible, and used to keep polling forever.
+  // Rust performs the hide and the show, so it says which happened. It also answers for the state
+  // the window started in, which no event can: with "start in tray" it is never shown at all.
+  //
+  // visibilitychange still covers minimising and occlusion, which WebView2 does report.
+  useEffect(() => {
+    invoke<boolean>("is_main_window_visible")
+      .then(setPageVisible)
+      .catch(() => setPageVisible(true));
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    listen<boolean>("window-visibility", (event) => {
+      if (disposed) return;
+      setPageVisible(event.payload);
+      if (event.payload) refresh();
+    }).then((stopListening) => {
+      if (disposed) stopListening();
+      else unlisten = stopListening;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [refresh]);
+
   useEffect(() => {
     const updateVisibility = () => {
       const visible = !document.hidden;
@@ -470,6 +482,35 @@ function App() {
     const timer = window.setInterval(refresh, 1000);
     return () => window.clearInterval(timer);
   }, [pageVisible, refresh, status?.running]);
+
+  // `offsetTop` and `clientHeight` both force a synchronous layout, and the scroll handler read four
+  // of them per event — events that arrive at frame rate. Neither changes while scrolling: they change
+  // when the content's height does, which is what the observer watches. Observing the container and
+  // every section means the triggers do not have to be enumerated — a banner appearing, the apply
+  // dock, a diagnostics panel opening, switching processor tabs — any of them re-measures.
+  const contentReady = Boolean(status && draft);
+  useEffect(() => {
+    if (!contentReady) return;
+    const container = document.querySelector<HTMLElement>(".page-content");
+    if (!container) return;
+    const sections = VIEWS.map((view) => document.getElementById(`view-${view}`));
+    const measure = () => {
+      scrollSpy.current = {
+        markerOffset: markerOffset(container.clientHeight),
+        // A section that is not in the DOM must never match, the way `if (section && ...)` did.
+        sectionTops: sections.map(
+          (section) => section?.offsetTop ?? Number.POSITIVE_INFINITY,
+        ),
+      };
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(container);
+    for (const section of sections) {
+      if (section) observer.observe(section);
+    }
+    return () => observer.disconnect();
+  }, [contentReady]);
 
   const renderEndpoints = useMemo(
     () => status?.endpoints.filter((endpoint) => endpoint.flow === "render") ?? [],
@@ -577,7 +618,11 @@ function App() {
     [draft, effectiveVirtualMode, status],
   );
   const running = status?.running ?? false;
-  const engineRequested = running || (lifecycleStatus?.resumePending ?? false);
+  // A pending resume means XMic will start processing again by itself. A configuration issue takes
+  // precedence: while the route is unusable the button has to lead to the fix, not to a cancellation.
+  const resumePending =
+    (lifecycleStatus?.resumePending ?? false) && !configurationIssue;
+  const engineRequested = running || resumePending;
   const controlsDisabled = running || busy || quickDspBusy !== null;
 
   const changeSettings = (update: (current: EngineSettings) => EngineSettings) => {
@@ -958,7 +1003,11 @@ function App() {
             </span>
             <span className="state-copy">
               <small>{copy.status.title}</small>
-              <strong>{copy.engineModes[status.mode]}</strong>
+              <strong>
+                {resumePending && !running
+                  ? copy.status.pausedWillResume
+                  : copy.engineModes[status.mode]}
+              </strong>
             </span>
           </div>
           <button
@@ -1006,7 +1055,14 @@ function App() {
         <header className="page-header">
           <div className="page-title-block">
             <span>{copy.app.eyebrow}</span>
-            <h1>XMic</h1>
+            <h1>
+              XMic
+              {appVersion && (
+                <span className="app-version" title={copy.common.version}>
+                  v{appVersion}
+                </span>
+              )}
+            </h1>
             <p>{copy.app.subtitle}</p>
           </div>
           <div className="header-runtime" aria-label={copy.status.title}>
@@ -1070,14 +1126,12 @@ function App() {
         <main
           className="page-content"
           onScroll={(event) => {
-            const container = event.currentTarget;
-            const marker =
-              container.scrollTop + Math.min(container.clientHeight * 0.28, 180);
-            let visibleView: ViewId = "monitor";
-            for (const view of ["monitor", "routing", "processing"] as const) {
-              const section = document.getElementById(`view-${view}`);
-              if (section && section.offsetTop <= marker) visibleView = view;
-            }
+            const spy = scrollSpy.current;
+            const visibleView = activeViewAt(
+              event.currentTarget.scrollTop,
+              spy.markerOffset,
+              spy.sectionTops,
+            );
             setActiveView((current) =>
               current === visibleView ? current : visibleView,
             );
@@ -1169,7 +1223,11 @@ function App() {
                   />
                   <div className="mode-readout" data-mode={status.mode}>
                     <span>{copy.status.title}</span>
-                    <strong>{copy.engineModes[status.mode]}</strong>
+                    <strong>
+                      {resumePending && !running
+                        ? copy.status.pausedWillResume
+                        : copy.engineModes[status.mode]}
+                    </strong>
                     <small>{status.detail || copy.app.subtitle}</small>
                   </div>
                   <div className="snapshot-list">
@@ -1401,6 +1459,13 @@ function App() {
                       label={copy.status.audioAnomalies}
                       value={audioAnomalyTotal(status.metrics).toLocaleString(language)}
                       title={copy.status.audioAnomaliesHelp}
+                    />
+                    <MetricReadout
+                      label={copy.status.deviceDiscontinuities}
+                      value={status.metrics.deviceDiscontinuities.toLocaleString(
+                        language,
+                      )}
+                      title={copy.status.deviceDiscontinuitiesHelp}
                     />
                   </div>
                 </section>
@@ -1920,36 +1985,36 @@ function App() {
                   />
                   <div className="field-heading">
                     <ControlLabel
-                      label={copy.routing.failurePolicy}
-                      help={copy.routing.failurePolicyHelp}
+                      label={copy.routing.unprocessedOutput}
+                      help={copy.routing.unprocessedOutputHelp}
                     />
                   </div>
                   <div className="segmented-control">
                     <button
                       type="button"
-                      aria-pressed={draft.failurePolicy === "rawPassthrough"}
+                      aria-pressed={draft.unprocessedOutput === "rawMicrophone"}
                       disabled={controlsDisabled}
                       onClick={() =>
                         changeSettings((current) => ({
                           ...current,
-                          failurePolicy: "rawPassthrough",
+                          unprocessedOutput: "rawMicrophone",
                         }))
                       }
                     >
-                      {copy.routing.rawPassthrough}
+                      {copy.routing.rawMicrophone}
                     </button>
                     <button
                       type="button"
-                      aria-pressed={draft.failurePolicy === "mute"}
+                      aria-pressed={draft.unprocessedOutput === "silence"}
                       disabled={controlsDisabled}
                       onClick={() =>
                         changeSettings((current) => ({
                           ...current,
-                          failurePolicy: "mute",
+                          unprocessedOutput: "silence",
                         }))
                       }
                     >
-                      {copy.routing.mute}
+                      {copy.routing.silence}
                     </button>
                   </div>
                 </section>
@@ -3053,6 +3118,7 @@ function audioAnomalyTotal(metrics: EngineMetrics) {
     metrics.renderUnderruns +
     metrics.renderOverflows +
     metrics.captureOverflows +
+    metrics.deviceDiscontinuities +
     metrics.outputUnderruns +
     metrics.outputQueueOverflows +
     metrics.dspFailures
@@ -3094,212 +3160,6 @@ function describeConfigurationIssue(
   }
   if (issue.kind === "fixedRender") return messages.renderConflict(name);
   return messages.physicalCaptureConflict(name);
-}
-
-function getConfigurationIssue(
-  settings: EngineSettings,
-  endpoints: EndpointDescriptor[],
-): ConfigurationIssue | null {
-  if (settings.virtualDeviceMode === "custom") {
-    if (!settings.captureEndpointId) {
-      return {
-        type: "physicalCaptureRequired",
-        virtualCaptureEndpointId: settings.virtualCaptureEndpointId,
-      };
-    }
-    if (!settings.outputEndpointId || !settings.virtualCaptureEndpointId) {
-      return {
-        type: "virtualDeviceRequired",
-        reason: "customPairIncomplete",
-      };
-    }
-    if (!activeCustomPairIsTrusted(settings)) {
-      return {
-        type: "virtualDeviceRequired",
-        reason: "customPairUnconfirmed",
-      };
-    }
-    const physical = findEndpoint(
-      endpoints,
-      "capture",
-      settings.captureEndpointId,
-    );
-    const virtualRender = findEndpoint(
-      endpoints,
-      "render",
-      settings.outputEndpointId,
-    );
-    const virtualCapture = findEndpoint(
-      endpoints,
-      "capture",
-      settings.virtualCaptureEndpointId,
-    );
-    if (
-      physical &&
-      (sameEndpoint(physical, virtualRender) ||
-        sameEndpoint(physical, virtualCapture))
-    ) {
-      return {
-        type: "physicalCaptureRequired",
-        virtualCaptureEndpointId: physical.id,
-      };
-    }
-    return virtualRender
-      ? getVirtualRouteConflict(settings, endpoints, virtualRender)
-      : null;
-  }
-
-  const pair = findStandardVbCablePair(endpoints);
-  if (!pair) {
-    return {
-      type: "virtualDeviceRequired",
-      reason: "vbCableUnavailable",
-    };
-  }
-  const capture = settings.captureEndpointId
-    ? findEndpoint(endpoints, "capture", settings.captureEndpointId)
-    : endpoints.find(
-        (endpoint) =>
-          endpoint.flow === "capture" &&
-          endpoint.defaultRoles.includes("multimedia"),
-      );
-  if (
-    capture &&
-    (sameEndpoint(capture, pair.capture) ||
-      sameEndpoint(capture, pair.render) ||
-      isStandardVbCableCapture(capture))
-  ) {
-    return {
-      type: "physicalCaptureRequired",
-      virtualCaptureEndpointId: capture.id,
-    };
-  }
-  return getVirtualRouteConflict(settings, endpoints, pair.render);
-}
-
-function getVirtualRouteConflict(
-  settings: EngineSettings,
-  endpoints: EndpointDescriptor[],
-  output: EndpointDescriptor,
-): VirtualRouteConflictIssue | null {
-  const render = settings.followDefaultRender
-    ? endpoints.find(
-        (endpoint) =>
-          endpoint.flow === "render" &&
-          endpoint.defaultRoles.includes("multimedia"),
-      )
-    : settings.renderEndpointId
-      ? findEndpoint(endpoints, "render", settings.renderEndpointId)
-      : undefined;
-  if (!render || !sameEndpoint(render, output)) return null;
-  return {
-    type: "virtualRouteConflict",
-    kind: settings.followDefaultRender ? "defaultRender" : "fixedRender",
-    endpointId: render.id,
-  };
-}
-
-function sameEndpointGroup(
-  left: EndpointDescriptor | undefined,
-  right: EndpointDescriptor | undefined,
-) {
-  return Boolean(left?.groupId && right?.groupId && left.groupId === right.groupId);
-}
-
-function sameEndpoint(
-  left: EndpointDescriptor | undefined,
-  right: EndpointDescriptor | undefined,
-) {
-  return Boolean(left && right && (left.id === right.id || sameEndpointGroup(left, right)));
-}
-
-function findEndpoint(
-  endpoints: EndpointDescriptor[],
-  flow: DataFlow,
-  id: string,
-) {
-  return endpoints.find(
-    (endpoint) => endpoint.flow === flow && endpoint.id === id,
-  );
-}
-
-function findStandardVbCablePair(endpoints: EndpointDescriptor[]) {
-  const renders = endpoints.filter(isStandardVbCableRender);
-  const captures = endpoints.filter(isStandardVbCableCapture);
-  for (const render of renders) {
-    const capture = captures.find((candidate) =>
-      sameEndpointGroup(render, candidate),
-    );
-    if (capture) return { render, capture };
-  }
-  if (renders.length === 1 && captures.length === 1) {
-    return { render: renders[0], capture: captures[0] };
-  }
-  return null;
-}
-
-function isStandardVbCableRender(endpoint: EndpointDescriptor) {
-  return (
-    endpoint.flow === "render" &&
-    standardVbName(endpoint.friendlyName, "cable input")
-  );
-}
-
-function isStandardVbCableCapture(endpoint: EndpointDescriptor) {
-  return (
-    endpoint.flow === "capture" &&
-    standardVbName(endpoint.friendlyName, "cable output")
-  );
-}
-
-function standardVbName(name: string, endpointName: string) {
-  const normalized = name.trim().toLowerCase();
-  return (
-    normalized === endpointName ||
-    (normalized.startsWith(`${endpointName} (`) &&
-      normalized.includes("vb-audio virtual cable"))
-  );
-}
-
-function isConfiguredVirtualCapture(
-  endpoint: EndpointDescriptor,
-  settings: EngineSettings | null,
-  endpoints: EndpointDescriptor[],
-) {
-  if (isStandardVbCableCapture(endpoint)) return true;
-  if (!settings?.virtualCaptureEndpointId) return false;
-  const configured = findEndpoint(
-    endpoints,
-    "capture",
-    settings.virtualCaptureEndpointId,
-  );
-  return sameEndpoint(endpoint, configured);
-}
-
-function activeCustomPairIsTrusted(settings: EngineSettings) {
-  if (
-    settings.virtualDeviceMode !== "custom" ||
-    !settings.outputEndpointId ||
-    !settings.virtualCaptureEndpointId
-  ) {
-    return false;
-  }
-  return settings.trustedVirtualAudioPairs.some(
-    (pair) =>
-      pair.renderEndpointId === settings.outputEndpointId &&
-      pair.captureEndpointId === settings.virtualCaptureEndpointId,
-  );
-}
-
-function inferPairedCapture(
-  render: EndpointDescriptor,
-  captures: EndpointDescriptor[],
-) {
-  if (!render.groupId) return undefined;
-  const matches = captures.filter(
-    (capture) => capture.groupId && capture.groupId === render.groupId,
-  );
-  return matches.length === 1 ? matches[0] : undefined;
 }
 
 function buildDeviceDiagnostics(

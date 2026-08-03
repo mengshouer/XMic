@@ -1,0 +1,483 @@
+[
+  {
+    "name": "a renamed cable is not guessed to be VB-CABLE",
+    "why": "Recognising a virtual cable by name is deliberate: guessing from a shared device container would let any two grouped endpoints pass as the virtual microphone.",
+    "settings": {
+      "followDefaultRender": true,
+      "renderEndpointId": null,
+      "captureEndpointId": null,
+      "outputEndpointId": null,
+      "virtualDeviceMode": null,
+      "virtualCaptureEndpointId": null,
+      "trustedVirtualAudioPairs": []
+    },
+    "endpoints": [
+      {
+        "platform": "windows",
+        "id": "custom-in",
+        "groupId": "cable",
+        "friendlyName": "Stream Input",
+        "flow": "render",
+        "defaultRoles": []
+      },
+      {
+        "platform": "windows",
+        "id": "custom-out",
+        "groupId": "cable",
+        "friendlyName": "Stream Output",
+        "flow": "capture",
+        "defaultRoles": []
+      }
+    ],
+    "expected": { "type": "virtualDeviceRequired", "reason": "vbCableUnavailable" }
+  },
+  {
+    "name": "no endpoints at all blocks configuration",
+    "why": "The endpoint list is briefly empty every time Windows wakes from sleep, so this has to read as 'not configured yet' rather than as a crash.",
+    "settings": {
+      "followDefaultRender": true,
+      "renderEndpointId": null,
+      "captureEndpointId": null,
+      "outputEndpointId": null,
+      "virtualDeviceMode": null,
+      "virtualCaptureEndpointId": null,
+      "trustedVirtualAudioPairs": []
+    },
+    "endpoints": [],
+    "expected": { "type": "virtualDeviceRequired", "reason": "vbCableUnavailable" }
+  },
+  {
+    "name": "the virtual capture being the Windows default is not a physical microphone",
+    "why": "VB-CABLE installs itself as the default recording device, so 'follow the Windows default' would feed the cable back into itself. The physical microphone has to be named explicitly.",
+    "settings": {
+      "followDefaultRender": true,
+      "renderEndpointId": null,
+      "captureEndpointId": null,
+      "outputEndpointId": "cable-input",
+      "virtualDeviceMode": "vbCable",
+      "virtualCaptureEndpointId": "cable-output",
+      "trustedVirtualAudioPairs": []
+    },
+    "endpoints": [
+      {
+        "platform": "windows",
+        "id": "cable-input",
+        "groupId": "cable",
+        "friendlyName": "CABLE Input (VB-Audio Virtual Cable)",
+        "flow": "render",
+        "defaultRoles": []
+      },
+      {
+        "platform": "windows",
+        "id": "cable-output",
+        "groupId": "cable",
+        "friendlyName": "CABLE Output (VB-Audio Virtual Cable)",
+        "flow": "capture",
+        "defaultRoles": ["multimedia"]
+      }
+    ],
+    "expected": {
+      "type": "physicalCaptureRequired",
+      "virtualCaptureEndpointId": "cable-output"
+    }
+  },
+  {
+    "name": "an explicit physical microphone lets the virtual capture stay the Windows default",
+    "why": "Once the microphone is named, VB-CABLE keeping the default recording role is exactly the intended setup — the voice app picks up the cable while XMic reads the real microphone.",
+    "settings": {
+      "followDefaultRender": true,
+      "renderEndpointId": null,
+      "captureEndpointId": "microphone",
+      "outputEndpointId": "cable-input",
+      "virtualDeviceMode": "vbCable",
+      "virtualCaptureEndpointId": "cable-output",
+      "trustedVirtualAudioPairs": []
+    },
+    "endpoints": [
+      {
+        "platform": "windows",
+        "id": "cable-input",
+        "groupId": "cable",
+        "friendlyName": "CABLE Input (VB-Audio Virtual Cable)",
+        "flow": "render",
+        "defaultRoles": []
+      },
+      {
+        "platform": "windows",
+        "id": "cable-output",
+        "groupId": "cable",
+        "friendlyName": "CABLE Output (VB-Audio Virtual Cable)",
+        "flow": "capture",
+        "defaultRoles": ["multimedia"]
+      },
+      {
+        "platform": "windows",
+        "id": "microphone",
+        "groupId": "microphone",
+        "friendlyName": "Physical microphone",
+        "flow": "capture",
+        "defaultRoles": []
+      }
+    ],
+    "expected": null
+  },
+  {
+    "name": "custom mode still requires an explicit physical microphone",
+    "why": "A confirmed custom pair says which endpoints are the virtual cable; it says nothing about which one is the real microphone.",
+    "settings": {
+      "followDefaultRender": true,
+      "renderEndpointId": null,
+      "captureEndpointId": null,
+      "outputEndpointId": "virtual-render",
+      "virtualDeviceMode": "custom",
+      "virtualCaptureEndpointId": "virtual-capture",
+      "trustedVirtualAudioPairs": [
+        {
+          "renderEndpointId": "virtual-render",
+          "captureEndpointId": "virtual-capture",
+          "renderName": "Custom virtual input",
+          "captureName": "Custom virtual output"
+        }
+      ]
+    },
+    "endpoints": [],
+    "expected": {
+      "type": "physicalCaptureRequired",
+      "virtualCaptureEndpointId": "virtual-capture"
+    }
+  },
+  {
+    "name": "an unconfirmed custom pair is refused",
+    "why": "XMic cannot tell a virtual cable from a real speaker by inspection, and writing processed audio into a real speaker would be audible feedback. The user confirms the pair once.",
+    "settings": {
+      "followDefaultRender": true,
+      "renderEndpointId": null,
+      "captureEndpointId": "microphone",
+      "outputEndpointId": "virtual-render",
+      "virtualDeviceMode": "custom",
+      "virtualCaptureEndpointId": "virtual-capture",
+      "trustedVirtualAudioPairs": []
+    },
+    "endpoints": [],
+    "expected": {
+      "type": "virtualDeviceRequired",
+      "reason": "customPairUnconfirmed"
+    }
+  },
+  {
+    "name": "a half-filled custom pair is incomplete before it is unconfirmed",
+    "why": "Asking the user to confirm a pair that has only one half selected would be asking them to confirm nothing. Incompleteness has to be reported first.",
+    "settings": {
+      "followDefaultRender": true,
+      "renderEndpointId": null,
+      "captureEndpointId": "microphone",
+      "outputEndpointId": "virtual-render",
+      "virtualDeviceMode": "custom",
+      "virtualCaptureEndpointId": null,
+      "trustedVirtualAudioPairs": []
+    },
+    "endpoints": [],
+    "expected": {
+      "type": "virtualDeviceRequired",
+      "reason": "customPairIncomplete"
+    }
+  },
+  {
+    "name": "a confirmed custom pair may be temporarily offline",
+    "why": "A virtual driver disappears while its installer runs and a USB interface disappears when it is unplugged. Neither is a reason to make the user reconfirm a pair they already trusted.",
+    "settings": {
+      "followDefaultRender": true,
+      "renderEndpointId": null,
+      "captureEndpointId": "microphone",
+      "outputEndpointId": "virtual-render",
+      "virtualDeviceMode": "custom",
+      "virtualCaptureEndpointId": "virtual-capture",
+      "trustedVirtualAudioPairs": [
+        {
+          "renderEndpointId": "virtual-render",
+          "captureEndpointId": "virtual-capture",
+          "renderName": "Custom virtual input",
+          "captureName": "Custom virtual output"
+        }
+      ]
+    },
+    "endpoints": [],
+    "expected": null
+  },
+  {
+    "name": "containerless playback devices are not the virtual microphone",
+    "why": "Windows reports a placeholder container for every endpoint that belongs to no container, so a virtual cable, a second virtual cable and an unused S/PDIF output all used to look like one device. Switching a Bluetooth speaker off promotes S/PDIF to default playback, and treating that as a shared container produced a phantom feedback conflict that stopped processing until somebody intervened.",
+    "settings": {
+      "followDefaultRender": true,
+      "renderEndpointId": null,
+      "captureEndpointId": "microphone",
+      "outputEndpointId": "cable-input",
+      "virtualDeviceMode": "vbCable",
+      "virtualCaptureEndpointId": "cable-output",
+      "trustedVirtualAudioPairs": []
+    },
+    "endpoints": [
+      {
+        "platform": "windows",
+        "id": "cable-input",
+        "groupId": null,
+        "friendlyName": "CABLE Input (VB-Audio Virtual Cable)",
+        "flow": "render",
+        "defaultRoles": []
+      },
+      {
+        "platform": "windows",
+        "id": "cable-output",
+        "groupId": null,
+        "friendlyName": "CABLE Output (VB-Audio Virtual Cable)",
+        "flow": "capture",
+        "defaultRoles": []
+      },
+      {
+        "platform": "windows",
+        "id": "spdif",
+        "groupId": null,
+        "friendlyName": "Realtek Digital Output",
+        "flow": "render",
+        "defaultRoles": ["console", "multimedia"]
+      },
+      {
+        "platform": "windows",
+        "id": "microphone",
+        "groupId": "microphone",
+        "friendlyName": "Physical microphone",
+        "flow": "capture",
+        "defaultRoles": []
+      }
+    ],
+    "expected": null
+  },
+  {
+    "name": "the virtual output is still rejected as the default playback device",
+    "why": "The playback reference is what AEC3 cancels. If Windows plays into the virtual cable there is no room sound to cancel and the user hears nothing, so this stays a hard block even though the container check above was loosened.",
+    "settings": {
+      "followDefaultRender": true,
+      "renderEndpointId": null,
+      "captureEndpointId": "microphone",
+      "outputEndpointId": "cable-input",
+      "virtualDeviceMode": "vbCable",
+      "virtualCaptureEndpointId": "cable-output",
+      "trustedVirtualAudioPairs": []
+    },
+    "endpoints": [
+      {
+        "platform": "windows",
+        "id": "cable-input",
+        "groupId": null,
+        "friendlyName": "CABLE Input (VB-Audio Virtual Cable)",
+        "flow": "render",
+        "defaultRoles": ["multimedia"]
+      },
+      {
+        "platform": "windows",
+        "id": "cable-output",
+        "groupId": null,
+        "friendlyName": "CABLE Output (VB-Audio Virtual Cable)",
+        "flow": "capture",
+        "defaultRoles": []
+      },
+      {
+        "platform": "windows",
+        "id": "microphone",
+        "groupId": "microphone",
+        "friendlyName": "Physical microphone",
+        "flow": "capture",
+        "defaultRoles": []
+      }
+    ],
+    "expected": {
+      "type": "virtualRouteConflict",
+      "kind": "defaultRender",
+      "endpointId": "cable-input"
+    }
+  },
+  {
+    "name": "a pinned playback reference cannot be the virtual output either",
+    "why": "Pinning the reference instead of following the Windows default does not change the physics; the message just has to point at the pinned selection rather than at Windows sound settings.",
+    "settings": {
+      "followDefaultRender": false,
+      "renderEndpointId": "cable-input",
+      "captureEndpointId": "microphone",
+      "outputEndpointId": "cable-input",
+      "virtualDeviceMode": "vbCable",
+      "virtualCaptureEndpointId": "cable-output",
+      "trustedVirtualAudioPairs": []
+    },
+    "endpoints": [
+      {
+        "platform": "windows",
+        "id": "cable-input",
+        "groupId": null,
+        "friendlyName": "CABLE Input (VB-Audio Virtual Cable)",
+        "flow": "render",
+        "defaultRoles": []
+      },
+      {
+        "platform": "windows",
+        "id": "cable-output",
+        "groupId": null,
+        "friendlyName": "CABLE Output (VB-Audio Virtual Cable)",
+        "flow": "capture",
+        "defaultRoles": []
+      },
+      {
+        "platform": "windows",
+        "id": "microphone",
+        "groupId": "microphone",
+        "friendlyName": "Physical microphone",
+        "flow": "capture",
+        "defaultRoles": []
+      }
+    ],
+    "expected": {
+      "type": "virtualRouteConflict",
+      "kind": "fixedRender",
+      "endpointId": "cable-input"
+    }
+  },
+  {
+    "name": "a custom virtual output cannot be the default playback device",
+    "why": "The same feedback rule applies to a confirmed custom cable, not only to VB-CABLE.",
+    "settings": {
+      "followDefaultRender": true,
+      "renderEndpointId": null,
+      "captureEndpointId": "microphone",
+      "outputEndpointId": "virtual-render",
+      "virtualDeviceMode": "custom",
+      "virtualCaptureEndpointId": "virtual-capture",
+      "trustedVirtualAudioPairs": [
+        {
+          "renderEndpointId": "virtual-render",
+          "captureEndpointId": "virtual-capture",
+          "renderName": "Custom virtual input",
+          "captureName": "Custom virtual output"
+        }
+      ]
+    },
+    "endpoints": [
+      {
+        "platform": "windows",
+        "id": "virtual-render",
+        "groupId": "virtual-render",
+        "friendlyName": "Custom virtual input",
+        "flow": "render",
+        "defaultRoles": ["multimedia"]
+      },
+      {
+        "platform": "windows",
+        "id": "microphone",
+        "groupId": "microphone",
+        "friendlyName": "Physical microphone",
+        "flow": "capture",
+        "defaultRoles": []
+      }
+    ],
+    "expected": {
+      "type": "virtualRouteConflict",
+      "kind": "defaultRender",
+      "endpointId": "virtual-render"
+    }
+  },
+  {
+    "name": "a custom virtual capture may be the Windows default and live in another container",
+    "why": "Some virtual drivers expose their two ends as unrelated devices. Requiring a shared container would refuse them, and their capture end being the default recording device is the normal setup.",
+    "settings": {
+      "followDefaultRender": true,
+      "renderEndpointId": null,
+      "captureEndpointId": "microphone",
+      "outputEndpointId": "virtual-render",
+      "virtualDeviceMode": "custom",
+      "virtualCaptureEndpointId": "virtual-capture",
+      "trustedVirtualAudioPairs": [
+        {
+          "renderEndpointId": "virtual-render",
+          "captureEndpointId": "virtual-capture",
+          "renderName": "Custom virtual input",
+          "captureName": "Custom virtual output"
+        }
+      ]
+    },
+    "endpoints": [
+      {
+        "platform": "windows",
+        "id": "speakers",
+        "groupId": "speakers",
+        "friendlyName": "Physical speakers",
+        "flow": "render",
+        "defaultRoles": ["multimedia"]
+      },
+      {
+        "platform": "windows",
+        "id": "virtual-render",
+        "groupId": "write-side",
+        "friendlyName": "Custom virtual input",
+        "flow": "render",
+        "defaultRoles": []
+      },
+      {
+        "platform": "windows",
+        "id": "virtual-capture",
+        "groupId": "read-side",
+        "friendlyName": "Custom virtual output",
+        "flow": "capture",
+        "defaultRoles": ["multimedia"]
+      },
+      {
+        "platform": "windows",
+        "id": "microphone",
+        "groupId": "microphone",
+        "friendlyName": "Physical microphone",
+        "flow": "capture",
+        "defaultRoles": []
+      }
+    ],
+    "expected": null
+  },
+  {
+    "name": "a custom virtual capture cannot double as the physical input",
+    "why": "Reading the cable's own output as the microphone feeds processed audio back through the whole chain. The two ends share a container here, so the group check is what catches it.",
+    "settings": {
+      "followDefaultRender": true,
+      "renderEndpointId": null,
+      "captureEndpointId": "virtual-capture",
+      "outputEndpointId": "virtual-render",
+      "virtualDeviceMode": "custom",
+      "virtualCaptureEndpointId": "virtual-capture",
+      "trustedVirtualAudioPairs": [
+        {
+          "renderEndpointId": "virtual-render",
+          "captureEndpointId": "virtual-capture",
+          "renderName": "Custom virtual input",
+          "captureName": "Custom virtual output"
+        }
+      ]
+    },
+    "endpoints": [
+      {
+        "platform": "windows",
+        "id": "virtual-render",
+        "groupId": "virtual",
+        "friendlyName": "Custom virtual input",
+        "flow": "render",
+        "defaultRoles": []
+      },
+      {
+        "platform": "windows",
+        "id": "virtual-capture",
+        "groupId": "virtual",
+        "friendlyName": "Custom virtual output",
+        "flow": "capture",
+        "defaultRoles": []
+      }
+    ],
+    "expected": {
+      "type": "physicalCaptureRequired",
+      "virtualCaptureEndpointId": "virtual-capture"
+    }
+  }
+]

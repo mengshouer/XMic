@@ -438,6 +438,19 @@ svg {
   font-weight: 700;
 }
 
+.app-version {
+  margin-left: 8px;
+  padding: 1px 5px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--text-muted);
+  font-family: var(--mono);
+  font-size: 9px;
+  line-height: 13px;
+  font-weight: 600;
+  vertical-align: 4px;
+}
+
 .page-title-block p {
   max-width: 430px;
   margin: 2px 0 0;

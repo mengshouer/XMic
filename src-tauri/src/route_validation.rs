@@ -71,6 +71,14 @@ pub(crate) fn reconcile_virtual_device_settings(
     *settings != before
 }
 
+/// Decides whether the audio route is usable, and if not, which of the three things the user has to
+/// fix.
+///
+/// **This function's behaviour is defined by `fixtures/route-validation-cases.json`, and
+/// `getConfigurationIssue` in `src/routeValidation.ts` must satisfy the same vectors.** The frontend
+/// keeps its
+/// own copy so it can price an unapplied draft without a round trip; the fixture is what stops the
+/// two from drifting apart. Add a vector for a new rule — do not add an inline test here.
 pub(crate) fn configuration_issue(
     settings: &EngineSettings,
     endpoints: &[EndpointDescriptor],
@@ -241,7 +249,9 @@ fn is_standard_vb_cable_capture(endpoint: &EndpointDescriptor) -> bool {
 fn standard_vb_name(name: &str, endpoint_name: &str) -> bool {
     let name = name.trim().to_lowercase();
     name == endpoint_name
-        || (name.starts_with(&format!("{endpoint_name} ("))
+        || (name
+            .strip_prefix(endpoint_name)
+            .is_some_and(|rest| rest.starts_with(" ("))
             && name.contains("vb-audio virtual cable"))
 }
 
@@ -277,16 +287,6 @@ mod tests {
         }
     }
 
-    fn physical_capture(id: &str, roles: Vec<DeviceRole>) -> EndpointDescriptor {
-        endpoint(
-            id,
-            "Physical microphone",
-            DataFlow::Capture,
-            Some(id),
-            roles,
-        )
-    }
-
     fn cable_pair() -> [EndpointDescriptor; 2] {
         [
             endpoint(
@@ -304,46 +304,6 @@ mod tests {
                 vec![DeviceRole::Multimedia],
             ),
         ]
-    }
-
-    fn trusted_pair(render_id: &str, capture_id: &str) -> TrustedVirtualAudioPair {
-        TrustedVirtualAudioPair {
-            render_endpoint_id: render_id.to_owned(),
-            capture_endpoint_id: capture_id.to_owned(),
-            render_name: render_id.to_owned(),
-            capture_name: capture_id.to_owned(),
-        }
-    }
-
-    #[test]
-    fn complete_standard_vb_cable_is_detected() {
-        let endpoints = cable_pair();
-        let pair = standard_vb_cable_pair(&endpoints).unwrap();
-
-        assert_eq!(pair.render.id, "cable-input");
-        assert_eq!(pair.capture.id, "cable-output");
-    }
-
-    #[test]
-    fn renamed_vb_cable_is_not_guessed() {
-        let endpoints = [
-            endpoint(
-                "custom-in",
-                "Stream Input",
-                DataFlow::Render,
-                Some("cable"),
-                vec![],
-            ),
-            endpoint(
-                "custom-out",
-                "Stream Output",
-                DataFlow::Capture,
-                Some("cable"),
-                vec![],
-            ),
-        ];
-
-        assert!(standard_vb_cable_pair(&endpoints).is_none());
     }
 
     #[test]
@@ -428,189 +388,41 @@ mod tests {
         );
     }
 
-    #[test]
-    fn missing_vb_cable_blocks_configuration() {
-        assert_eq!(
-            configuration_issue(&EngineSettings::default(), &[]),
-            Some(ConfigurationIssue::VirtualDeviceRequired {
-                reason: VirtualDeviceIssueReason::VbCableUnavailable,
-            })
-        );
+    /// The shared specification for `configuration_issue`. Every vector also runs against
+    /// `getConfigurationIssue` in `src/routeValidation.ts` (see `src/routeValidation.test.ts`) —
+    /// that is the
+    /// only thing keeping two implementations of the same safety rules from drifting apart.
+    ///
+    /// The vectors carry settings as they exist *after* `reconcile_virtual_device_settings`, because
+    /// that is what both sides see at runtime: the frontend validates a draft that came from the
+    /// backend, which had already reconciled it. Reconciliation has no frontend counterpart and
+    /// keeps its own tests below.
+    #[derive(serde::Deserialize)]
+    struct RouteValidationCase {
+        name: String,
+        why: String,
+        settings: EngineSettings,
+        endpoints: Vec<EndpointDescriptor>,
+        expected: Option<ConfigurationIssue>,
+    }
+
+    fn shared_cases() -> Vec<RouteValidationCase> {
+        serde_json::from_str(include_str!("../../fixtures/route-validation-cases.json"))
+            .expect("route validation fixture parses")
     }
 
     #[test]
-    fn default_vb_capture_requires_explicit_physical_microphone() {
-        let mut settings = EngineSettings::default();
-        let endpoints = cable_pair();
-        reconcile_virtual_device_settings(&mut settings, &endpoints);
-
-        assert_eq!(
-            configuration_issue(&settings, &endpoints),
-            Some(ConfigurationIssue::PhysicalCaptureRequired {
-                virtual_capture_endpoint_id: Some("cable-output".to_owned()),
-            })
-        );
-    }
-
-    #[test]
-    fn explicit_physical_capture_allows_virtual_system_default() {
-        let mut settings = EngineSettings {
-            capture_endpoint_id: Some("microphone".to_owned()),
-            ..EngineSettings::default()
-        };
-        let mut endpoints = cable_pair().to_vec();
-        endpoints.push(physical_capture("microphone", Vec::new()));
-        reconcile_virtual_device_settings(&mut settings, &endpoints);
-
-        assert_eq!(configuration_issue(&settings, &endpoints), None);
-    }
-
-    #[test]
-    fn custom_mode_requires_explicit_physical_capture() {
-        let settings = EngineSettings {
-            virtual_device_mode: Some(VirtualDeviceMode::Custom),
-            output_endpoint_id: Some("virtual-render".to_owned()),
-            virtual_capture_endpoint_id: Some("virtual-capture".to_owned()),
-            trusted_virtual_audio_pairs: vec![trusted_pair("virtual-render", "virtual-capture")],
-            ..EngineSettings::default()
-        };
-
-        assert!(matches!(
-            configuration_issue(&settings, &[]),
-            Some(ConfigurationIssue::PhysicalCaptureRequired { .. })
-        ));
-    }
-
-    #[test]
-    fn custom_pair_requires_confirmation() {
-        let settings = EngineSettings {
-            virtual_device_mode: Some(VirtualDeviceMode::Custom),
-            capture_endpoint_id: Some("microphone".to_owned()),
-            output_endpoint_id: Some("virtual-render".to_owned()),
-            virtual_capture_endpoint_id: Some("virtual-capture".to_owned()),
-            ..EngineSettings::default()
-        };
-
-        assert_eq!(
-            configuration_issue(&settings, &[]),
-            Some(ConfigurationIssue::VirtualDeviceRequired {
-                reason: VirtualDeviceIssueReason::CustomPairUnconfirmed,
-            })
-        );
-    }
-
-    #[test]
-    fn trusted_custom_pair_may_be_temporarily_offline() {
-        let settings = EngineSettings {
-            virtual_device_mode: Some(VirtualDeviceMode::Custom),
-            capture_endpoint_id: Some("microphone".to_owned()),
-            output_endpoint_id: Some("virtual-render".to_owned()),
-            virtual_capture_endpoint_id: Some("virtual-capture".to_owned()),
-            trusted_virtual_audio_pairs: vec![trusted_pair("virtual-render", "virtual-capture")],
-            ..EngineSettings::default()
-        };
-
-        assert_eq!(configuration_issue(&settings, &[]), None);
-    }
-
-    #[test]
-    fn custom_output_cannot_be_the_default_render() {
-        let settings = EngineSettings {
-            virtual_device_mode: Some(VirtualDeviceMode::Custom),
-            capture_endpoint_id: Some("microphone".to_owned()),
-            output_endpoint_id: Some("virtual-render".to_owned()),
-            virtual_capture_endpoint_id: Some("virtual-capture".to_owned()),
-            trusted_virtual_audio_pairs: vec![trusted_pair("virtual-render", "virtual-capture")],
-            ..EngineSettings::default()
-        };
-        let endpoints = [
-            endpoint(
-                "virtual-render",
-                "Custom virtual input",
-                DataFlow::Render,
-                Some("virtual-render"),
-                vec![DeviceRole::Multimedia],
-            ),
-            physical_capture("microphone", Vec::new()),
-        ];
-
-        assert!(matches!(
-            configuration_issue(&settings, &endpoints),
-            Some(ConfigurationIssue::VirtualRouteConflict {
-                kind: VirtualRouteConflictKind::DefaultRender,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn custom_capture_may_be_default_and_use_a_different_group() {
-        let settings = EngineSettings {
-            virtual_device_mode: Some(VirtualDeviceMode::Custom),
-            capture_endpoint_id: Some("microphone".to_owned()),
-            output_endpoint_id: Some("virtual-render".to_owned()),
-            virtual_capture_endpoint_id: Some("virtual-capture".to_owned()),
-            trusted_virtual_audio_pairs: vec![trusted_pair("virtual-render", "virtual-capture")],
-            ..EngineSettings::default()
-        };
-        let endpoints = [
-            endpoint(
-                "speakers",
-                "Physical speakers",
-                DataFlow::Render,
-                Some("speakers"),
-                vec![DeviceRole::Multimedia],
-            ),
-            endpoint(
-                "virtual-render",
-                "Custom virtual input",
-                DataFlow::Render,
-                Some("write-side"),
-                vec![],
-            ),
-            endpoint(
-                "virtual-capture",
-                "Custom virtual output",
-                DataFlow::Capture,
-                Some("read-side"),
-                vec![DeviceRole::Multimedia],
-            ),
-            physical_capture("microphone", Vec::new()),
-        ];
-
-        assert_eq!(configuration_issue(&settings, &endpoints), None);
-    }
-
-    #[test]
-    fn custom_virtual_capture_cannot_be_the_physical_input() {
-        let settings = EngineSettings {
-            virtual_device_mode: Some(VirtualDeviceMode::Custom),
-            capture_endpoint_id: Some("virtual-capture".to_owned()),
-            output_endpoint_id: Some("virtual-render".to_owned()),
-            virtual_capture_endpoint_id: Some("virtual-capture".to_owned()),
-            trusted_virtual_audio_pairs: vec![trusted_pair("virtual-render", "virtual-capture")],
-            ..EngineSettings::default()
-        };
-        let endpoints = [
-            endpoint(
-                "virtual-render",
-                "Custom virtual input",
-                DataFlow::Render,
-                Some("virtual"),
-                vec![],
-            ),
-            endpoint(
-                "virtual-capture",
-                "Custom virtual output",
-                DataFlow::Capture,
-                Some("virtual"),
-                vec![],
-            ),
-        ];
-
-        assert!(matches!(
-            configuration_issue(&settings, &endpoints),
-            Some(ConfigurationIssue::PhysicalCaptureRequired { .. })
-        ));
+    fn shared_cases_hold_in_rust() {
+        let cases = shared_cases();
+        assert!(!cases.is_empty(), "the fixture must not be empty");
+        for case in cases {
+            assert_eq!(
+                configuration_issue(&case.settings, &case.endpoints),
+                case.expected,
+                "{}\n  {}",
+                case.name,
+                case.why
+            );
+        }
     }
 }

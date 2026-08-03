@@ -2,7 +2,10 @@ use std::{
     collections::VecDeque,
     path::PathBuf,
     process::{Child, Command, Stdio},
-    sync::{Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex, MutexGuard,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -10,7 +13,7 @@ use std::{
 use std::os::windows::process::CommandExt;
 use xmic_engine_protocol::{
     AecPreset, ConfigurationIssue, EngineMode, EngineRequest, EngineResponse, EngineSettings,
-    EngineStatus, PROTOCOL_VERSION,
+    EngineStatus, IdleSessionPermit, UnprocessedOutput, PROTOCOL_VERSION,
 };
 use xmic_platform_api::{AudioPlatform, EndpointDescriptor};
 use xmic_platform_windows::WasapiPlatform;
@@ -35,7 +38,28 @@ pub struct EngineController {
     native_library: PathBuf,
     config_dir: PathBuf,
     pipe_name: String,
+    /// Only this process knows whether Windows is locked, disconnected or asleep and whether the audio
+    /// route is complete, so the helper is told on every status poll.
+    idle_bypass_allowed: AtomicBool,
     state: Mutex<SupervisorState>,
+}
+
+/// What the tray needs in order to draw itself. Built from an `EngineStatus` the caller already
+/// holds, so that refreshing the tray costs no round trip of its own.
+pub(crate) struct TrayState {
+    pub(crate) running: bool,
+    pub(crate) processing: bool,
+    pub(crate) settings: EngineSettings,
+}
+
+impl TrayState {
+    pub(crate) fn from_status(status: &EngineStatus) -> Self {
+        Self {
+            running: status.running,
+            processing: is_processing(status),
+            settings: status.settings.clone(),
+        }
+    }
 }
 
 struct SupervisorState {
@@ -48,6 +72,8 @@ struct SupervisorState {
     crashes: CrashTracker,
     cached_status: EngineStatus,
     supervisor_warning: Option<String>,
+    /// The "nothing is being processed" notice is shown once per application run.
+    speech_notice_shown: bool,
 }
 
 #[derive(Default)]
@@ -81,8 +107,15 @@ impl SupervisorState {
         self.supervisor_warning = None;
     }
 
+    /// Records a route the engine cannot use right now.
+    ///
+    /// The request to run is deliberately kept. An endpoint list that is briefly incomplete — waking
+    /// from sleep re-enumerates every device, a wireless speaker powers itself off and back on — would
+    /// otherwise read as the user giving up on processing, and nothing would restart once the route
+    /// came back. Retries are slowed to the restart backoff instead, because the route may well fix
+    /// itself.
     fn block_for_configuration(&mut self, issue: ConfigurationIssue) {
-        self.cancel_engine_start();
+        self.engine_restart_not_before = Some(Instant::now() + ENGINE_RESTART_BACKOFF);
         self.cached_status.configuration_issue = Some(issue);
     }
 }
@@ -112,6 +145,7 @@ impl EngineController {
             native_library,
             config_dir,
             pipe_name: format!("xmic-engine-{}", std::process::id()),
+            idle_bypass_allowed: AtomicBool::new(false),
             state: Mutex::new(SupervisorState {
                 child: None,
                 requested_running: false,
@@ -122,6 +156,7 @@ impl EngineController {
                 crashes: CrashTracker::default(),
                 cached_status: EngineStatus::bootstrap(Vec::new()),
                 supervisor_warning: None,
+                speech_notice_shown: false,
             }),
         };
         controller.ensure_process()?;
@@ -181,6 +216,10 @@ impl EngineController {
                 status.detail = "audio engine helper is unavailable".to_owned();
                 status.warning = Some(error);
                 apply_supervisor_warning(&mut status, state.supervisor_warning.as_deref());
+                // Tray refreshes read the cache, so it has to carry the same answer the UI just
+                // got. Otherwise the tray keeps reporting a running session after the helper has
+                // stopped answering.
+                state.cached_status = status.clone();
                 status
             }
         }
@@ -236,6 +275,28 @@ impl EngineController {
         lock_unpoisoned(&self.state).requested_running
     }
 
+    /// Records whether the helper may open audio devices while nothing is being processed.
+    pub fn set_idle_bypass_allowed(&self, allowed: bool) {
+        self.idle_bypass_allowed.store(allowed, Ordering::Release);
+    }
+
+    /// The last status the supervisor saw, for tray refreshes that are not already holding one
+    /// (a language change, a lifecycle preference change, startup).
+    ///
+    /// Deliberately does no IPC. `refresh_tray` runs on the main thread, and a helper that has
+    /// stopped answering would freeze the window for `IPC_CONNECT_TIMEOUT` — and every `GetStatus`
+    /// also renews the idle-session permit, so a tray refresh used to drive the helper's idle
+    /// session state machine at twice the rate the UI polls.
+    pub(crate) fn cached_tray_state(&self) -> TrayState {
+        TrayState::from_status(&lock_unpoisoned(&self.state).cached_status)
+    }
+
+    /// Returns what the virtual microphone is carrying, the first and only time the engine reports
+    /// speech while nothing is being processed.
+    pub(crate) fn take_unprocessed_speech_notice(&self) -> Option<UnprocessedOutput> {
+        take_speech_notice(&mut lock_unpoisoned(&self.state))
+    }
+
     pub fn configuration_issue(&self) -> Option<ConfigurationIssue> {
         lock_unpoisoned(&self.state)
             .cached_status
@@ -249,6 +310,12 @@ impl EngineController {
             .get_status_locked(&mut state)
             .map_err(EngineStartError::Runtime)?;
         state.cached_status = status;
+        // The request is recorded before anything can refuse it. Somebody asked for processing, and a
+        // route that cannot be used at this instant — a speaker that is still powering up, endpoints
+        // that Windows has not finished re-enumerating — is a reason to wait, not a reason to forget.
+        // Without this, a start that lands in that window left nothing to retry and the button had to
+        // be pressed again after the devices came back.
+        state.request_engine_start();
         let endpoints = WasapiPlatform::new()
             .active_endpoints()
             .map_err(|error| EngineStartError::Runtime(error.to_string()))?;
@@ -271,7 +338,6 @@ impl EngineController {
             return Err(EngineStartError::ConfigurationRequired(issue));
         }
         state.cached_status.configuration_issue = None;
-        state.request_engine_start();
         self.ensure_process_locked(&mut state)
             .map_err(EngineStartError::Runtime)?;
         match send_request(&self.pipe_name, &EngineRequest::Start, IPC_CONNECT_TIMEOUT) {
@@ -452,13 +518,16 @@ impl EngineController {
         }
     }
 
+    fn idle_permit(&self, state: &SupervisorState) -> IdleSessionPermit {
+        IdleSessionPermit {
+            bypass_allowed: self.idle_bypass_allowed.load(Ordering::Acquire),
+            speech_notice_needed: !state.speech_notice_shown,
+        }
+    }
+
     fn get_status_locked(&self, state: &mut SupervisorState) -> Result<EngineStatus, String> {
-        let mut status = match self.request_locked(
-            state,
-            &EngineRequest::GetStatus {
-                include_endpoints: false,
-            },
-        )? {
+        let permit = self.idle_permit(state);
+        let mut status = match self.request_locked(state, &EngineRequest::GetStatus { permit })? {
             EngineResponse::Status(status) => *status,
             response => return Err(format!("unexpected helper status response: {response:?}")),
         };
@@ -469,26 +538,20 @@ impl EngineController {
         } else if !state.requested_running && !state.safe_mode {
             state.supervisor_warning = None;
         }
-        let retry_due = state
-            .engine_restart_not_before
-            .is_none_or(|not_before| Instant::now() >= not_before);
-        if state.requested_running && !status.running && retry_due {
+        let retry_due = should_retry_engine_start(state, status.running, Instant::now());
+        if retry_due {
             match send_request(&self.pipe_name, &EngineRequest::Start, IPC_CONNECT_TIMEOUT) {
                 Ok(EngineResponse::Ack) => {
                     state.mark_engine_started();
-                    status = match self.request_locked(
-                        state,
-                        &EngineRequest::GetStatus {
-                            include_endpoints: false,
-                        },
-                    )? {
-                        EngineResponse::Status(status) => *status,
-                        response => {
-                            return Err(format!(
-                                "unexpected helper status response after restart: {response:?}"
-                            ));
-                        }
-                    };
+                    status =
+                        match self.request_locked(state, &EngineRequest::GetStatus { permit })? {
+                            EngineResponse::Status(status) => *status,
+                            response => {
+                                return Err(format!(
+                                    "unexpected helper status response after restart: {response:?}"
+                                ));
+                            }
+                        };
                 }
                 Ok(EngineResponse::Error(error)) => {
                     state.defer_engine_restart(&error);
@@ -571,6 +634,34 @@ fn should_use_safe_mode(already_safe: bool, start_requested: bool, crash_count: 
     already_safe || (start_requested && crash_count >= CRASHES_BEFORE_SAFE_MODE)
 }
 
+/// A running session is not the same thing as a processed microphone: safe mode, a DSP failure and
+/// CPU overload protection all keep the session alive while the virtual microphone carries either
+/// silence or the raw microphone. Reporting those as "processing" is what makes people believe they
+/// are covered when they are not.
+fn is_processing(status: &EngineStatus) -> bool {
+    status.running && matches!(status.mode, EngineMode::Active | EngineMode::Converging)
+}
+
+fn take_speech_notice(state: &mut SupervisorState) -> Option<UnprocessedOutput> {
+    if state.speech_notice_shown || !state.cached_status.unprocessed_speech_detected {
+        return None;
+    }
+    state.speech_notice_shown = true;
+    Some(state.cached_status.settings.unprocessed_output)
+}
+
+/// The engine is asked to start again whenever processing is wanted but not happening. This is what
+/// brings processing back on its own after the route was unusable for a while — a speaker that was
+/// switched off, endpoints Windows had not finished re-enumerating after sleep — so it must only be
+/// held back by the retry spacing, never by the reason the last attempt failed.
+fn should_retry_engine_start(state: &SupervisorState, running: bool, now: Instant) -> bool {
+    state.requested_running
+        && !running
+        && state
+            .engine_restart_not_before
+            .is_none_or(|not_before| now >= not_before)
+}
+
 fn apply_supervisor_warning(status: &mut EngineStatus, warning: Option<&str>) {
     let Some(warning) = warning else {
         return;
@@ -637,20 +728,52 @@ mod tests {
     }
 
     #[test]
-    fn configuration_blocker_cancels_pending_restart() {
+    fn a_blocked_route_keeps_the_request_to_run_and_slows_the_retries() {
         let mut state = supervisor_state();
         state.request_engine_start();
-        state.defer_engine_restart("route unavailable");
 
         let issue = ConfigurationIssue::PhysicalCaptureRequired {
             virtual_capture_endpoint_id: Some("cable-output".to_owned()),
         };
         state.block_for_configuration(issue.clone());
 
+        // A route that is unusable for a moment must not read as "stop processing".
+        assert!(state.requested_running);
+        assert!(state.engine_restart_not_before.is_some());
+        assert_eq!(state.cached_status.configuration_issue, Some(issue));
+
+        // Only the user cancelling actually drops the request.
+        state.cancel_engine_start();
         assert!(!state.requested_running);
         assert!(state.engine_restart_not_before.is_none());
-        assert!(state.supervisor_warning.is_none());
-        assert_eq!(state.cached_status.configuration_issue, Some(issue));
+    }
+
+    #[test]
+    fn a_blocked_route_is_retried_until_it_becomes_usable() {
+        let now = Instant::now();
+        let mut state = supervisor_state();
+
+        // Nobody asked for processing: nothing to retry.
+        assert!(!should_retry_engine_start(&state, false, now));
+
+        state.request_engine_start();
+        assert!(should_retry_engine_start(&state, false, now));
+        // A session that is already running needs no retry.
+        assert!(!should_retry_engine_start(&state, true, now));
+
+        // A route XMic cannot use spaces the attempts out but keeps them coming, so processing returns
+        // by itself once the speaker is back.
+        state.block_for_configuration(ConfigurationIssue::VirtualRouteConflict {
+            kind: xmic_engine_protocol::VirtualRouteConflictKind::DefaultRender,
+            endpoint_id: "spdif".to_owned(),
+        });
+        let blocked_at = Instant::now();
+        assert!(!should_retry_engine_start(&state, false, blocked_at));
+        assert!(should_retry_engine_start(
+            &state,
+            false,
+            blocked_at + ENGINE_RESTART_BACKOFF
+        ));
     }
 
     #[test]
@@ -681,6 +804,69 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn a_running_session_that_is_not_processing_is_not_reported_as_processing() {
+        let mut status = EngineStatus::bootstrap(Vec::new());
+        status.running = true;
+
+        for mode in [EngineMode::Active, EngineMode::Converging] {
+            status.mode = mode;
+            assert!(is_processing(&status), "{mode:?}");
+        }
+        for mode in [
+            EngineMode::Muted,
+            EngineMode::RawFallback,
+            EngineMode::SafeMode,
+            EngineMode::Error,
+            EngineMode::Starting,
+        ] {
+            status.mode = mode;
+            assert!(!is_processing(&status), "{mode:?}");
+        }
+
+        status.mode = EngineMode::Active;
+        status.running = false;
+        assert!(!is_processing(&status));
+    }
+
+    #[test]
+    fn the_unprocessed_speech_notice_is_shown_once_per_run() {
+        let mut state = supervisor_state();
+        state.cached_status.settings.unprocessed_output = UnprocessedOutput::RawMicrophone;
+
+        assert_eq!(take_speech_notice(&mut state), None);
+
+        state.cached_status.unprocessed_speech_detected = true;
+        assert_eq!(
+            take_speech_notice(&mut state),
+            Some(UnprocessedOutput::RawMicrophone)
+        );
+
+        // The engine keeps reporting the detection until the permit clears it; the notice must not
+        // repeat, and the permit must stop asking for detection.
+        assert_eq!(take_speech_notice(&mut state), None);
+        assert!(state.speech_notice_shown);
+    }
+
+    #[test]
+    fn the_tray_state_is_derived_from_the_status_the_ui_saw() {
+        // The tray used to fetch its own status, so it could paint a different frame than the one the
+        // window had just been given. Deriving it means the two can no longer disagree.
+        let mut status = EngineStatus::bootstrap(Vec::new());
+        status.running = true;
+        status.mode = EngineMode::RawFallback;
+        status.settings.unprocessed_output = UnprocessedOutput::RawMicrophone;
+
+        let tray = TrayState::from_status(&status);
+
+        assert!(tray.running);
+        assert!(!tray.processing, "a raw fallback session is not processing");
+        assert_eq!(
+            tray.settings.unprocessed_output,
+            UnprocessedOutput::RawMicrophone
+        );
+    }
+
     fn supervisor_state() -> SupervisorState {
         SupervisorState {
             child: None,
@@ -692,6 +878,7 @@ mod tests {
             crashes: CrashTracker::default(),
             cached_status: EngineStatus::bootstrap(Vec::new()),
             supervisor_warning: None,
+            speech_notice_shown: false,
         }
     }
 }

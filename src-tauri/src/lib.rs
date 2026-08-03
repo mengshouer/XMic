@@ -1,7 +1,10 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU8, Ordering},
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Mutex,
+    },
     thread,
 };
 
@@ -9,6 +12,7 @@ use std::{
 use std::{os::windows::process::CommandExt, process::Command};
 
 use tauri::{
+    image::Image,
     menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, RunEvent, State, Wry,
@@ -16,12 +20,14 @@ use tauri::{
 use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
 use tauri_plugin_notification::NotificationExt;
 use xmic_engine_protocol::{
-    AecPreset, ConfigurationIssue, EngineSettings, EngineStatus, VirtualDeviceIssueReason,
+    AecPreset, ConfigurationIssue, EngineSettings, EngineStatus, UnprocessedOutput,
+    VirtualDeviceIssueReason,
 };
-use xmic_platform_api::{AudioPlatform, EndpointDescriptor};
-use xmic_platform_windows::{start_system_lifecycle_monitor, WasapiPlatform};
+use xmic_platform_api::EndpointDescriptor;
+use xmic_platform_windows::start_system_lifecycle_monitor;
 
 mod device_profiles;
+mod endpoint_cache;
 mod engine;
 mod engine_client;
 mod engine_ipc;
@@ -30,8 +36,9 @@ mod lifecycle;
 mod route_validation;
 mod settings_store;
 
+use endpoint_cache::EndpointCache;
 use engine::DspFeature;
-use engine_client::EngineController;
+use engine_client::{EngineController, TrayState};
 use lifecycle::{
     BackgroundLifecycle, LifecycleController, LifecyclePreferences, LifecyclePreferencesStore,
     LifecycleStatus,
@@ -56,6 +63,10 @@ const MENU_PRESET_NATURAL: &str = "preset-natural";
 const MENU_PRESET_BALANCED: &str = "preset-balanced";
 const MENU_PRESET_STRONG: &str = "preset-strong";
 const MENU_QUIT: &str = "quit";
+/// Windows hides the window with `ShowWindow(SW_HIDE)` when it goes to the tray, and WebView2 does
+/// not report that as `document.hidden` — the page keeps running, invisible, and would keep polling
+/// forever. Rust performs both transitions, so it is the one that can say which happened.
+const WINDOW_VISIBILITY_EVENT: &str = "window-visibility";
 const LANGUAGE_ZH_CN: u8 = 0;
 const LANGUAGE_EN: u8 = 1;
 
@@ -98,8 +109,9 @@ struct TrayLabels {
     configure_microphone: &'static str,
     preset: &'static str,
     quit: &'static str,
-    stopped_tooltip: &'static str,
     processing_tooltip: &'static str,
+    unprocessed_raw_tooltip: &'static str,
+    unprocessed_silent_tooltip: &'static str,
     pending_tooltip: &'static str,
     configuration_tooltip: &'static str,
 }
@@ -114,8 +126,9 @@ fn tray_labels(language: UiLanguage) -> TrayLabels {
             configure_microphone: "配置音频设备",
             preset: "处理强度",
             quit: "退出 XMic",
-            stopped_tooltip: "XMic - 已停止",
             processing_tooltip: "XMic - 处理中",
+            unprocessed_raw_tooltip: "XMic - 未处理 · 原始麦克风",
+            unprocessed_silent_tooltip: "XMic - 未处理 · 静音",
             pending_tooltip: "XMic - 等待恢复处理",
             configuration_tooltip: "XMic - 需要配置音频设备",
         },
@@ -127,8 +140,9 @@ fn tray_labels(language: UiLanguage) -> TrayLabels {
             configure_microphone: "Configure audio devices",
             preset: "Processing strength",
             quit: "Quit XMic",
-            stopped_tooltip: "XMic - Stopped",
             processing_tooltip: "XMic - Processing",
+            unprocessed_raw_tooltip: "XMic - Not processing · raw microphone",
+            unprocessed_silent_tooltip: "XMic - Not processing · silent",
             pending_tooltip: "XMic - Waiting to resume",
             configuration_tooltip: "XMic - Audio device setup required",
         },
@@ -137,6 +151,10 @@ fn tray_labels(language: UiLanguage) -> TrayLabels {
 
 struct TrayMenuState {
     language: AtomicU8,
+    /// What the tray was last drawn with. The UI polls about once a second and the tray is almost
+    /// always identical between polls, so this is what stops every poll from rewriting ten menu
+    /// items and cloning the whole RGBA icon on the main thread.
+    rendered: Mutex<Option<RenderedTray>>,
     show: MenuItem<Wry>,
     toggle_processing: MenuItem<Wry>,
     toggle_aec: CheckMenuItem<Wry>,
@@ -149,6 +167,69 @@ struct TrayMenuState {
     quit: MenuItem<Wry>,
 }
 
+/// Every value `refresh_tray` actually paints. The menu labels not listed here are derived from
+/// `language`, so comparing the code covers them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RenderedTray {
+    language: u8,
+    label: &'static str,
+    enabled: bool,
+    tooltip: &'static str,
+    aec_enabled: bool,
+    preset: AecPreset,
+    agc2_enabled: bool,
+    vad_gate_enabled: bool,
+    processing: bool,
+}
+
+/// The green microphone and its grey twin. The icon carries almost all of its meaning in colour, and
+/// the tray renders it around 16 px, where a corner badge would be a handful of muddy pixels — so the
+/// "not processing" variant is the same shape with the colour taken out, computed from the real icon
+/// instead of shipping a second asset that could drift from it.
+struct TrayIcons {
+    processing: Image<'static>,
+    unprocessed: Image<'static>,
+}
+
+impl TrayIcons {
+    fn from_window_icon(icon: &Image<'_>) -> Self {
+        let processing = Image::new_owned(icon.rgba().to_vec(), icon.width(), icon.height());
+        Self {
+            unprocessed: Image::new_owned(
+                desaturate_rgba(icon.rgba()),
+                icon.width(),
+                icon.height(),
+            ),
+            processing,
+        }
+    }
+
+    fn select(&self, processing: bool) -> &Image<'static> {
+        if processing {
+            &self.processing
+        } else {
+            &self.unprocessed
+        }
+    }
+}
+
+/// Rec. 709 luminance, alpha untouched, so the dark background stays dark and the coloured microphone
+/// turns grey.
+fn desaturate_rgba(rgba: &[u8]) -> Vec<u8> {
+    let mut output = rgba.to_vec();
+    for pixel in output.chunks_exact_mut(4) {
+        let luminance = (0.2126 * f32::from(pixel[0])
+            + 0.7152 * f32::from(pixel[1])
+            + 0.0722 * f32::from(pixel[2]))
+        .round()
+        .clamp(0.0, 255.0) as u8;
+        pixel[0] = luminance;
+        pixel[1] = luminance;
+        pixel[2] = luminance;
+    }
+    output
+}
+
 #[tauri::command]
 fn get_bootstrap_status(
     app: AppHandle,
@@ -158,10 +239,12 @@ fn get_bootstrap_status(
 }
 
 #[tauri::command]
-fn list_audio_endpoints() -> Result<Vec<EndpointDescriptor>, String> {
-    WasapiPlatform::new()
-        .active_endpoints()
-        .map_err(|error| error.to_string())
+fn list_audio_endpoints(
+    cache: State<'_, EndpointCache>,
+) -> Result<Vec<EndpointDescriptor>, String> {
+    cache
+        .endpoints()
+        .map(|endpoints| endpoints.as_ref().clone())
 }
 
 #[tauri::command]
@@ -169,10 +252,10 @@ fn get_engine_status(
     app: AppHandle,
     controller: State<'_, EngineController>,
 ) -> Result<EngineStatus, String> {
-    let status = engine_status(&controller)?;
+    let status = engine_status(&app, &controller)?;
     app.state::<LifecycleController>()
         .synchronize_configuration_issue(status.configuration_issue.clone(), false);
-    schedule_tray_refresh(&app);
+    schedule_tray_refresh(&app, TrayState::from_status(&status));
     Ok(status)
 }
 
@@ -192,7 +275,7 @@ fn set_ui_language(app: AppHandle, language: String) -> Result<(), String> {
         .try_state::<TrayMenuState>()
         .ok_or_else(|| "tray menu is unavailable".to_owned())?;
     menu.language.store(language.code(), Ordering::Relaxed);
-    schedule_tray_refresh(&app);
+    schedule_tray_refresh(&app, app.state::<EngineController>().cached_tray_state());
     Ok(())
 }
 
@@ -247,7 +330,7 @@ fn update_lifecycle_preferences(
     let status = current_lifecycle_status(&app, &lifecycle)?;
     app.emit("lifecycle-status", &status)
         .map_err(|error| error.to_string())?;
-    schedule_tray_refresh(&app);
+    schedule_tray_refresh(&app, app.state::<EngineController>().cached_tray_state());
     Ok(status)
 }
 
@@ -321,17 +404,18 @@ fn stop_engine(
     Ok(status)
 }
 
-fn engine_status(controller: &EngineController) -> Result<EngineStatus, String> {
-    list_audio_endpoints().map(|endpoints| controller.status(endpoints))
+fn engine_status(app: &AppHandle, controller: &EngineController) -> Result<EngineStatus, String> {
+    let endpoints = app.state::<EndpointCache>().endpoints()?;
+    Ok(controller.status(endpoints.as_ref().clone()))
 }
 
 fn emit_status(app: &AppHandle, controller: &EngineController) -> Result<EngineStatus, String> {
-    let status = engine_status(controller)?;
+    let status = engine_status(app, controller)?;
     app.state::<LifecycleController>()
         .synchronize_configuration_issue(status.configuration_issue.clone(), false);
     app.emit("engine-status", &status)
         .map_err(|error| error.to_string())?;
-    schedule_tray_refresh(app);
+    schedule_tray_refresh(app, TrayState::from_status(&status));
     Ok(status)
 }
 
@@ -351,7 +435,7 @@ fn emit_lifecycle_status(app: &AppHandle) -> Result<LifecycleStatus, String> {
     let status = current_lifecycle_status(app, &lifecycle)?;
     app.emit("lifecycle-status", &status)
         .map_err(|error| error.to_string())?;
-    schedule_tray_refresh(app);
+    schedule_tray_refresh(app, app.state::<EngineController>().cached_tray_state());
     Ok(status)
 }
 
@@ -407,6 +491,41 @@ fn send_pending_configuration_notice(app: &AppHandle) {
         ),
     };
     let _ = app.notification().builder().title(title).body(body).show();
+}
+
+/// The one notification per application run that says the virtual microphone is not carrying processed
+/// audio. It is triggered by actually hearing speech, so it only arrives when it matters — and it can
+/// never arrive if the microphone is muted or unplugged in Windows, because then there is nothing to
+/// hear.
+pub(crate) fn send_unprocessed_speech_notice(app: &AppHandle) -> bool {
+    let controller = app.state::<EngineController>();
+    let Some(unprocessed_output) = controller.take_unprocessed_speech_notice() else {
+        return false;
+    };
+    let language = app
+        .try_state::<TrayMenuState>()
+        .map(|menu| UiLanguage::from_code(menu.language.load(Ordering::Relaxed)))
+        .unwrap_or(UiLanguage::ZhCn);
+    let (title, body) = match (language, unprocessed_output) {
+        (UiLanguage::ZhCn, UnprocessedOutput::RawMicrophone) => (
+            "XMic 没在处理",
+            "虚拟麦克风正在输出未处理的原始声音，对方可能听到回声和噪声。打开 XMic 启动处理。",
+        ),
+        (UiLanguage::ZhCn, UnprocessedOutput::Silence) => (
+            "XMic 没在处理",
+            "虚拟麦克风当前静音，对方听不到你。打开 XMic 启动处理。",
+        ),
+        (UiLanguage::En, UnprocessedOutput::RawMicrophone) => (
+            "XMic is not processing",
+            "The virtual microphone is carrying your raw audio, so others may hear echo and noise. Open XMic to start processing.",
+        ),
+        (UiLanguage::En, UnprocessedOutput::Silence) => (
+            "XMic is not processing",
+            "The virtual microphone is silent, so others cannot hear you. Open XMic to start processing.",
+        ),
+    };
+    let _ = app.notification().builder().title(title).body(body).show();
+    true
 }
 
 fn native_library_path(app: &tauri::App) -> Result<PathBuf, tauri::Error> {
@@ -522,6 +641,7 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), tauri::Error> {
 
     app.manage(TrayMenuState {
         language: AtomicU8::new(LANGUAGE_ZH_CN),
+        rendered: Mutex::new(None),
         show: show.clone(),
         toggle_processing: toggle_processing.clone(),
         toggle_aec: toggle_aec.clone(),
@@ -563,7 +683,9 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), tauri::Error> {
             }
         });
     if let Some(icon) = app.default_window_icon() {
-        builder = builder.icon(icon.clone());
+        let icons = TrayIcons::from_window_icon(icon);
+        builder = builder.icon(icons.unprocessed.clone());
+        app.manage(icons);
     }
     builder.build(app)?;
     Ok(())
@@ -574,6 +696,7 @@ fn show_main_window(app: &AppHandle) {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
+        emit_window_visibility(app, true);
     }
     if let Some(issue) = app
         .try_state::<LifecycleController>()
@@ -581,6 +704,20 @@ fn show_main_window(app: &AppHandle) {
     {
         let _ = app.emit("navigate-to-configuration", issue);
     }
+}
+
+fn emit_window_visibility(app: &AppHandle, visible: bool) {
+    let _ = app.emit(WINDOW_VISIBILITY_EVENT, visible);
+}
+
+/// Asked once on mount, because the events alone cannot describe the state the window started in:
+/// with `start_in_tray` it is never shown at all, and nothing would have emitted anything.
+#[tauri::command]
+fn is_main_window_visible(app: AppHandle) -> bool {
+    app.get_webview_window("main")
+        .and_then(|window| window.is_visible().ok())
+        // If the window cannot say, keep polling — that is what happened before this existed.
+        .unwrap_or(true)
 }
 
 fn spawn_tray_engine_toggle(app: AppHandle) {
@@ -647,59 +784,92 @@ fn spawn_automatic_start(app: AppHandle) {
         });
 }
 
-fn schedule_tray_refresh(app: &AppHandle) {
+fn schedule_tray_refresh(app: &AppHandle, tray: TrayState) {
     let handle = app.clone();
-    let _ = app.run_on_main_thread(move || refresh_tray(&handle));
+    let _ = app.run_on_main_thread(move || refresh_tray(&handle, tray));
 }
 
-fn refresh_tray(app: &AppHandle) {
+/// Draws the tray from a state the caller already has. Taking it as a parameter is what keeps the
+/// main thread out of IPC: this runs on the main thread, and asking the helper here would freeze the
+/// window for the connect timeout whenever the helper stops answering.
+fn refresh_tray(app: &AppHandle, tray: TrayState) {
     let Some(menu) = app.try_state::<TrayMenuState>() else {
         return;
     };
-    let controller = app.state::<EngineController>();
     let lifecycle = app.state::<LifecycleController>();
-    let running = controller.is_running();
-    let settings = controller.settings();
     let pending = lifecycle.has_pending_start();
     let configuration_required = lifecycle.configuration_issue().is_some();
     let available = lifecycle.is_session_available();
-    let labels = tray_labels(UiLanguage::from_code(menu.language.load(Ordering::Relaxed)));
-    let (label, tooltip, enabled) = if running {
-        (labels.stop_processing, labels.processing_tooltip, true)
+    let language = menu.language.load(Ordering::Relaxed);
+    let labels = tray_labels(UiLanguage::from_code(language));
+    let (label, enabled) = if tray.running {
+        (labels.stop_processing, true)
     } else if configuration_required {
-        (
-            labels.configure_microphone,
-            labels.configuration_tooltip,
-            available,
-        )
+        (labels.configure_microphone, available)
     } else if pending {
-        (labels.cancel_pending, labels.pending_tooltip, true)
+        (labels.cancel_pending, true)
     } else {
-        (labels.start_processing, labels.stopped_tooltip, available)
+        (labels.start_processing, available)
     };
+    // The tooltip answers "what does the other side hear right now", which is not the same question as
+    // "is a session running".
+    let tooltip = if configuration_required {
+        labels.configuration_tooltip
+    } else if tray.processing {
+        labels.processing_tooltip
+    } else if pending {
+        labels.pending_tooltip
+    } else {
+        match tray.settings.unprocessed_output {
+            UnprocessedOutput::RawMicrophone => labels.unprocessed_raw_tooltip,
+            UnprocessedOutput::Silence => labels.unprocessed_silent_tooltip,
+        }
+    };
+    let rendered = RenderedTray {
+        language,
+        label,
+        enabled,
+        tooltip,
+        aec_enabled: tray.settings.dsp.aec.enabled,
+        preset: tray.settings.dsp.aec.preset,
+        agc2_enabled: tray.settings.dsp.agc2.enabled,
+        vad_gate_enabled: tray.settings.dsp.vad_gate.enabled,
+        processing: tray.processing,
+    };
+    {
+        let mut last = menu
+            .rendered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *last == Some(rendered) {
+            return;
+        }
+        *last = Some(rendered);
+    }
 
     let _ = menu.show.set_text(labels.show);
     let _ = menu.toggle_processing.set_text(label);
     let _ = menu.toggle_processing.set_enabled(enabled);
-    let _ = menu.toggle_aec.set_checked(settings.dsp.aec.enabled);
+    let _ = menu.toggle_aec.set_checked(rendered.aec_enabled);
     let _ = menu.preset_menu.set_text(labels.preset);
-    let _ = menu.preset_menu.set_enabled(settings.dsp.aec.enabled);
+    let _ = menu.preset_menu.set_enabled(rendered.aec_enabled);
     let _ = menu
         .preset_natural
-        .set_checked(settings.dsp.aec.preset == AecPreset::Natural);
+        .set_checked(rendered.preset == AecPreset::Natural);
     let _ = menu
         .preset_balanced
-        .set_checked(settings.dsp.aec.preset == AecPreset::Balanced);
+        .set_checked(rendered.preset == AecPreset::Balanced);
     let _ = menu
         .preset_strong
-        .set_checked(settings.dsp.aec.preset == AecPreset::Strong);
-    let _ = menu.toggle_agc2.set_checked(settings.dsp.agc2.enabled);
-    let _ = menu
-        .toggle_vad_gate
-        .set_checked(settings.dsp.vad_gate.enabled);
+        .set_checked(rendered.preset == AecPreset::Strong);
+    let _ = menu.toggle_agc2.set_checked(rendered.agc2_enabled);
+    let _ = menu.toggle_vad_gate.set_checked(rendered.vad_gate_enabled);
     let _ = menu.quit.set_text(labels.quit);
-    if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        let _ = tray.set_tooltip(Some(tooltip));
+    if let Some(tray_icon) = app.tray_by_id(TRAY_ID) {
+        let _ = tray_icon.set_tooltip(Some(tooltip));
+        if let Some(icons) = app.try_state::<TrayIcons>() {
+            let _ = tray_icon.set_icon(Some(icons.select(rendered.processing).clone()));
+        }
     }
 }
 
@@ -722,6 +892,7 @@ pub fn run() {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
                     let _ = window.hide();
+                    emit_window_visibility(window.app_handle(), false);
                 }
             }
         })
@@ -734,10 +905,21 @@ pub fn run() {
             )
             .map_err(std::io::Error::other)?;
             app.manage(controller);
+            // Constructing it registers the endpoint notification client the cache invalidates
+            // against, so it costs a permanent thread and a short wait here rather than on the first
+            // status poll. It enumerates nothing until something asks.
+            app.manage(EndpointCache::new());
             app.manage(LifecycleController::new(LifecyclePreferencesStore::new(
                 config_dir.join("app-preferences.json"),
             )));
             setup_tray(app)?;
+            // Grants the helper permission to drive the virtual microphone while nothing is being
+            // processed; the helper starts nothing until it hears this.
+            {
+                let lifecycle = app.state::<LifecycleController>();
+                let controller = app.state::<EngineController>();
+                lifecycle.refresh_idle_permit(&controller);
+            }
 
             match start_system_lifecycle_monitor() {
                 Ok(monitor) => {
@@ -755,7 +937,10 @@ pub fn run() {
             if !app.state::<LifecycleController>().start_in_tray() {
                 show_main_window(app.handle());
             }
-            refresh_tray(app.handle());
+            refresh_tray(
+                app.handle(),
+                app.state::<EngineController>().cached_tray_state(),
+            );
             if app.state::<LifecycleController>().start_engine_on_launch() {
                 spawn_automatic_start(app.handle().clone());
             }
@@ -767,6 +952,7 @@ pub fn run() {
             get_bootstrap_status,
             get_engine_status,
             get_lifecycle_status,
+            is_main_window_visible,
             set_ui_language,
             open_vb_cable_download,
             list_audio_endpoints,
@@ -790,4 +976,27 @@ pub fn run() {
             controller.shutdown();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_unprocessed_icon_keeps_the_shape_and_drops_the_colour() {
+        // Two pixels of the real icon: the green microphone and the transparent corner.
+        let green = [0x2f, 0xb5, 0x7e, 0xff];
+        let transparent = [0x00, 0x00, 0x00, 0x00];
+        let mut rgba = green.to_vec();
+        rgba.extend_from_slice(&transparent);
+
+        let desaturated = desaturate_rgba(&rgba);
+
+        assert_eq!(desaturated.len(), rgba.len());
+        assert_eq!(desaturated[0], desaturated[1]);
+        assert_eq!(desaturated[1], desaturated[2]);
+        // Alpha decides the shape, so it has to survive untouched.
+        assert_eq!(desaturated[3], 0xff);
+        assert_eq!(desaturated[7], 0x00);
+    }
 }

@@ -10,20 +10,24 @@ use std::{
 
 use xmic_engine_core::{
     DelayCalibrationState as CoreDelayCalibrationState, HostDelayEstimator, HostDelayObservation,
-    RenderFrame, DSP_FRAME_DURATION_MS, DSP_SAMPLES_PER_FRAME, MAX_RENDER_CHANNELS,
+    RenderFrame, SpeechPresenceDetector, DSP_FRAME_DURATION_MS, DSP_SAMPLES_PER_FRAME,
+    MAX_RENDER_CHANNELS,
 };
 use xmic_engine_protocol::{
     ActiveDeviceProfile, ActiveRoute, ConfigurationIssue,
-    DelayCalibrationState as ProtocolDelayCalibrationState, DspFailurePolicy, DspSettings,
-    EngineMetrics, EngineMode, EngineSettings, EngineStatus, ProcessingLoadMode, PROTOCOL_VERSION,
+    DelayCalibrationState as ProtocolDelayCalibrationState, DspSettings, EngineMetrics, EngineMode,
+    EngineSettings, EngineStatus, IdleSessionPermit, ProcessingLoadMode, UnprocessedOutput,
+    PROTOCOL_VERSION,
 };
 use xmic_engine_runtime::{processing_latency_frames, AlignedRawPath, DspProcessor};
-use xmic_platform_api::{AudioPlatform, EndpointDescriptor, PlatformError};
+use xmic_platform_api::{AudioPlatform, PlatformError};
 use xmic_platform_windows::{
-    register_realtime_audio_thread, start_device_change_monitor, start_duplex_source,
-    start_output_sink, DeviceChangeMonitor, DuplexSourceRequest, DuplexSourceStream,
-    OutputCountersSnapshot, OutputSinkRequest, OutputSinkStream, WasapiPlatform,
+    register_realtime_audio_thread, start_capture_source, start_device_change_monitor,
+    start_duplex_source, start_output_sink, CaptureSourceRequest, CaptureSourceStream,
+    DeviceChangeMonitor, DuplexSourceRequest, DuplexSourceStream, OutputCountersSnapshot,
+    OutputSinkRequest, OutputSinkStream, SourceCountersSnapshot, WasapiPlatform,
 };
+use xmic_rnnoise_dsp::{RnnoiseConfig, RnnoiseDsp};
 
 use crate::{
     device_profiles::DeviceProfileStore,
@@ -31,22 +35,32 @@ use crate::{
     settings_store::SettingsStore,
 };
 
+mod load;
+mod topology;
+
+use load::{ProcessingHistogram, ProcessingOverloadController, PROCESSING_BUDGET_US};
+use topology::{validate_capture_output_topology, validate_physical_capture, validate_topology};
+
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const RESTART_BACKOFF: Duration = Duration::from_secs(1);
 const CONVERGENCE_TIME: Duration = Duration::from_secs(2);
 const STATUS_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
-const PROCESSING_DEADLINE_US: u64 = 10_000;
-const PROCESSING_BUDGET_US: u64 = 4_000;
-const PROCESSING_HISTOGRAM_BIN_US: u64 = 50;
-const PROCESSING_HISTOGRAM_BINS: usize = 4_096;
-const OVERLOAD_WINDOW_FRAMES: u32 = 200;
-const OVERLOAD_BUDGET_BLOCKS_PER_WINDOW: u32 = 10;
-const OVERLOAD_DEADLINES_PER_WINDOW: u32 = 2;
-const OVERLOAD_TIMING_FAULTS_PER_WINDOW: u32 = 2;
-const OVERLOAD_WINDOWS_TO_ESCALATE: u32 = 2;
-const STABLE_WINDOWS_TO_RECOVER: u32 = 5;
+/// A discontinuity means the render/capture alignment jumped, so AEC3 has to be rebuilt — but the
+/// rebuild is a full `AudioProcessing::Initialize()` on the realtime thread, and it costs the echo
+/// canceller several seconds of reconvergence. A device that drops packets continuously would spend
+/// all of its time rebuilding, so requests are coalesced into at most one rebuild per interval.
+const ECHO_PATH_RESET_MIN_INTERVAL: Duration = Duration::from_millis(500);
 const QPC_UNITS_PER_MILLISECOND: f32 = 10_000.0;
+/// The frontend stops, applies and restarts the engine around every settings write, and a device
+/// switch rebuilds the session, so an idle session must not chase those gaps: two streams writing to
+/// the virtual device at once would mix processed and unprocessed audio together.
+const IDLE_SESSION_GRACE: Duration = Duration::from_secs(3);
+/// A route XMic cannot open is not worth retrying forever; the count resets when the settings change
+/// or a processing session starts, so a fixed device really can recover.
+const IDLE_SESSION_FAILURES_BEFORE_GIVING_UP: u32 = 3;
+/// Shorter than the processing session's stop timeout: this one is awaited from the IPC loop.
+const IDLE_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct RealtimeEngineController {
     control: Mutex<ControlState>,
@@ -55,6 +69,10 @@ pub struct RealtimeEngineController {
     settings_store: SettingsStore,
     profile_store: Arc<DeviceProfileStore>,
     safe_mode: bool,
+    /// Set by the UI permit: speech detection is only worth running until the notice has been shown.
+    speech_notice_needed: Arc<AtomicBool>,
+    /// Latched by whichever session hears speech while the microphone is not being processed.
+    unprocessed_speech: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
@@ -119,11 +137,32 @@ impl DspFeature {
 struct ControlState {
     settings: EngineSettings,
     worker: Option<EngineWorker>,
+    idle: Option<IdleWorker>,
+    permit: IdleSessionPermit,
+    /// When the engine became idle; the grace period is measured from here.
+    idle_since: Option<Instant>,
+    idle_failures: u32,
 }
 
 struct EngineWorker {
     stop: Arc<AtomicBool>,
     handle: JoinHandle<()>,
+}
+
+/// Runs whenever XMic is not processing: it either forwards the unprocessed microphone to the virtual
+/// device or just listens long enough to warn that nothing is being processed.
+struct IdleWorker {
+    stop: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+    mode: IdleSessionMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdleSessionMode {
+    /// `UnprocessedOutput::RawMicrophone`: capture plus the virtual output, no DSP.
+    Forward,
+    /// `UnprocessedOutput::Silence`: capture only, purely to detect speech nobody is processing.
+    Listen,
 }
 
 #[derive(Clone)]
@@ -153,6 +192,74 @@ impl Default for RuntimeSnapshot {
     }
 }
 
+impl RuntimeSnapshot {
+    /// A processing session changed state.
+    ///
+    /// **Deliberately leaves `device_profile` and `effective_dsp` alone.** Editing the DSP settings of
+    /// the device pair that was last active has to keep working after the engine stops: `status()`
+    /// reports `effective_dsp` as the settings, and `update_settings` writes back into the profile
+    /// `device_profile` names. That feature is nothing more than these two fields surviving `stop()`,
+    /// so a tidy-up that reset everything here would break it silently.
+    fn publish_session(
+        &mut self,
+        mode: EngineMode,
+        detail: &str,
+        active_route: Option<ActiveRoute>,
+        metrics: EngineMetrics,
+        warning: Option<String>,
+    ) {
+        self.mode = mode;
+        self.detail = detail.to_owned();
+        self.active_route = active_route;
+        self.metrics = metrics;
+        self.warning = warning;
+        self.configuration_issue = None;
+    }
+
+    /// Nothing is being processed. Keeps the warning: *why* processing is not running is more useful to
+    /// the user than the fact that the microphone is being forwarded.
+    fn publish_idle(&mut self, mode: IdleSessionMode, metrics: EngineMetrics) {
+        self.mode = idle_engine_mode(mode);
+        self.detail = idle_detail(mode).to_owned();
+        self.active_route = None;
+        self.metrics = metrics;
+        self.configuration_issue = None;
+    }
+
+    /// The session died and the worker will retry. Keeps `metrics`, so the counters accumulated so far
+    /// do not reset to zero in the UI on every reconnect.
+    fn fail(&mut self, message: &str) {
+        self.mode = EngineMode::Error;
+        self.detail = "audio engine is waiting to reconnect".to_owned();
+        self.active_route = None;
+        self.warning = Some(message.to_owned());
+        self.configuration_issue = None;
+    }
+
+    fn warn(&mut self, message: &str) {
+        self.warning = Some(message.to_owned());
+    }
+
+    /// The route cannot be used until the user changes something.
+    ///
+    /// The only place that drops the device profile, and the reason is not tidiness: if the route is
+    /// unusable then the profile resolved for the previous pair no longer describes anything.
+    fn require_configuration(&mut self, issue: ConfigurationIssue) {
+        self.mode = EngineMode::Sleeping;
+        self.detail = "physical microphone selection is required".to_owned();
+        self.active_route = None;
+        self.warning = None;
+        self.configuration_issue = Some(issue);
+        self.device_profile = None;
+        self.effective_dsp = None;
+    }
+
+    fn set_profile(&mut self, device_profile: ActiveDeviceProfile, effective_dsp: DspSettings) {
+        self.device_profile = Some(device_profile);
+        self.effective_dsp = Some(effective_dsp);
+    }
+}
+
 impl RealtimeEngineController {
     pub fn new(
         native_library: PathBuf,
@@ -165,16 +272,22 @@ impl RealtimeEngineController {
             control: Mutex::new(ControlState {
                 settings,
                 worker: None,
+                idle: None,
+                permit: IdleSessionPermit::default(),
+                idle_since: Some(Instant::now()),
+                idle_failures: 0,
             }),
             runtime: Arc::new(Mutex::new(RuntimeSnapshot::default())),
             native_library,
             settings_store,
             profile_store: Arc::new(profile_store),
             safe_mode,
+            speech_notice_needed: Arc::new(AtomicBool::new(false)),
+            unprocessed_speech: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    pub fn status(&self, endpoints: Vec<EndpointDescriptor>) -> EngineStatus {
+    pub fn status(&self, permit: IdleSessionPermit) -> EngineStatus {
         let mut control = lock_unpoisoned(&self.control);
         let worker_stopped = reap_finished_worker(&mut control);
         if worker_stopped {
@@ -185,6 +298,7 @@ impl RealtimeEngineController {
                 runtime.warning = Some("the realtime worker exited unexpectedly".to_owned());
             }
         }
+        self.synchronize_idle_session(&mut control, permit);
         let runtime = lock_unpoisoned(&self.runtime).clone();
         let mut settings = control.settings.clone();
         if let Some(effective_dsp) = runtime.effective_dsp.clone() {
@@ -199,13 +313,16 @@ impl RealtimeEngineController {
             running: control.worker.is_some(),
             mode: runtime.mode,
             detail: runtime.detail,
-            endpoints,
+            // The UI process owns endpoint enumeration and fills this in; enumerating here just to
+            // answer a poll would duplicate a cache that already exists on the other side.
+            endpoints: Vec::new(),
             settings,
             active_route: runtime.active_route,
             active_device_profile,
             configuration_issue: runtime.configuration_issue,
             metrics: runtime.metrics,
             warning: runtime.warning,
+            unprocessed_speech_detected: self.unprocessed_speech.load(Ordering::Acquire),
         }
     }
 
@@ -222,8 +339,17 @@ impl RealtimeEngineController {
         }
         drop(runtime);
         self.settings_store.save(&settings)?;
+        // The idle session was built from the previous settings, and the route it holds may be the one
+        // that just changed; a fixed route also deserves a fresh attempt.
+        let _ = stop_idle_worker(&mut control);
+        control.idle_failures = 0;
         control.settings = settings;
-        lock_unpoisoned(&self.runtime).configuration_issue = None;
+        {
+            let mut runtime = lock_unpoisoned(&self.runtime);
+            runtime.configuration_issue = None;
+            // Whatever the previous route failed with no longer describes the one about to be tried.
+            runtime.warning = None;
+        }
         Ok(())
     }
 
@@ -233,6 +359,13 @@ impl RealtimeEngineController {
         if control.worker.is_some() {
             return Err(EngineStartError::Runtime(
                 "audio engine is already running".to_owned(),
+            ));
+        }
+        // Two streams writing to the virtual device would mix unprocessed audio into the processed
+        // signal, so the idle session has to be gone before the processing session opens the output.
+        if !stop_idle_worker(&mut control) {
+            return Err(EngineStartError::Runtime(
+                "the unprocessed microphone path is still releasing the virtual device".to_owned(),
             ));
         }
         let endpoints = WasapiPlatform::new()
@@ -248,7 +381,7 @@ impl RealtimeEngineController {
             .validate()
             .map_err(|error| EngineStartError::Runtime(error.to_string()))?;
         if let Some(issue) = configuration_issue(&control.settings, &endpoints) {
-            set_configuration_issue(&self.runtime, issue.clone());
+            lock_unpoisoned(&self.runtime).require_configuration(issue.clone());
             return Err(EngineStartError::ConfigurationRequired(issue));
         }
         if control.settings.output_endpoint_id.is_none() {
@@ -257,8 +390,7 @@ impl RealtimeEngineController {
             ));
         }
 
-        replace_runtime(
-            &self.runtime,
+        lock_unpoisoned(&self.runtime).publish_session(
             EngineMode::Starting,
             "starting realtime audio session",
             None,
@@ -272,6 +404,8 @@ impl RealtimeEngineController {
         let profile_store = Arc::clone(&self.profile_store);
         let safe_mode = self.safe_mode;
         let runtime = Arc::clone(&self.runtime);
+        let speech_notice_needed = Arc::clone(&self.speech_notice_needed);
+        let unprocessed_speech = Arc::clone(&self.unprocessed_speech);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let handle = thread::Builder::new()
             .name("xmic-dsp".to_owned())
@@ -283,26 +417,32 @@ impl RealtimeEngineController {
                     safe_mode,
                     worker_stop,
                     runtime,
+                    SpeechPresenceReport {
+                        needed: speech_notice_needed,
+                        detected: unprocessed_speech,
+                    },
                     ready_tx,
                 )
             })
             .map_err(|error| {
                 let message = format!("start audio engine worker: {error}");
-                set_worker_error(&self.runtime, &message);
+                lock_unpoisoned(&self.runtime).fail(&message);
                 EngineStartError::Runtime(message)
             })?;
         control.worker = Some(EngineWorker { stop, handle });
 
         match ready_rx.recv_timeout(START_TIMEOUT) {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => {
+                control.idle_failures = 0;
+                Ok(())
+            }
             Ok(Err(error)) => {
                 request_stop_without_join(control.worker.take());
                 Err(error)
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 request_stop_without_join(control.worker.take());
-                replace_runtime(
-                    &self.runtime,
+                lock_unpoisoned(&self.runtime).publish_session(
                     EngineMode::Error,
                     "audio engine startup timed out",
                     None,
@@ -324,9 +464,9 @@ impl RealtimeEngineController {
 
     pub fn stop(&self) -> Result<(), String> {
         let mut control = lock_unpoisoned(&self.control);
+        control.idle_since = Some(Instant::now());
         let Some(worker) = control.worker.take() else {
-            replace_runtime(
-                &self.runtime,
+            lock_unpoisoned(&self.runtime).publish_session(
                 EngineMode::Sleeping,
                 "audio engine is stopped",
                 None,
@@ -336,8 +476,7 @@ impl RealtimeEngineController {
             return Ok(());
         };
         if let Err(error) = stop_worker_with_timeout(worker) {
-            replace_runtime(
-                &self.runtime,
+            lock_unpoisoned(&self.runtime).publish_session(
                 EngineMode::Error,
                 "audio engine stop timed out",
                 None,
@@ -346,8 +485,7 @@ impl RealtimeEngineController {
             );
             return Err(error);
         }
-        replace_runtime(
-            &self.runtime,
+        lock_unpoisoned(&self.runtime).publish_session(
             EngineMode::Sleeping,
             "audio engine is stopped",
             None,
@@ -356,6 +494,132 @@ impl RealtimeEngineController {
         );
         Ok(())
     }
+
+    /// Stops both sessions so the microphone and the virtual device are released before the helper
+    /// process exits.
+    pub fn shutdown(&self) -> Result<(), String> {
+        {
+            let mut control = lock_unpoisoned(&self.control);
+            let _ = stop_idle_worker(&mut control);
+        }
+        self.stop()
+    }
+
+    /// Evaluated on every status poll, which is the one call the UI makes about once a second. Only
+    /// the decision happens here; opening WASAPI streams is left to the worker thread so a slow device
+    /// cannot stall the IPC loop.
+    fn synchronize_idle_session(&self, control: &mut ControlState, permit: IdleSessionPermit) {
+        control.permit = permit;
+        self.speech_notice_needed
+            .store(permit.speech_notice_needed, Ordering::Release);
+        if !permit.speech_notice_needed {
+            self.unprocessed_speech.store(false, Ordering::Release);
+        }
+        self.reap_idle_worker(control);
+
+        let desired = desired_idle_mode(control);
+        match (control.idle.as_ref().map(|worker| worker.mode), desired) {
+            (Some(current), Some(wanted)) if current == wanted => {}
+            (Some(_), _) => {
+                let _ = stop_idle_worker(control);
+            }
+            (None, Some(wanted)) if idle_grace_elapsed(control) => {
+                self.start_idle_worker(control, wanted);
+            }
+            (None, _) => {}
+        }
+    }
+
+    fn reap_idle_worker(&self, control: &mut ControlState) {
+        let finished = control
+            .idle
+            .as_ref()
+            .is_some_and(|worker| worker.handle.is_finished());
+        if !finished {
+            return;
+        }
+        if let Some(worker) = control.idle.take() {
+            let _ = worker.handle.join();
+        }
+        control.idle_failures = control.idle_failures.saturating_add(1);
+        control.idle_since = Some(Instant::now());
+        if control.idle_failures >= IDLE_SESSION_FAILURES_BEFORE_GIVING_UP {
+            lock_unpoisoned(&self.runtime).warn(
+                "gave up on the unprocessed microphone path after repeated failures; change the audio settings or start processing to try again",
+            );
+        }
+    }
+
+    fn start_idle_worker(&self, control: &mut ControlState, mode: IdleSessionMode) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let settings = control.settings.clone();
+        let runtime = Arc::clone(&self.runtime);
+        let report = SpeechPresenceReport {
+            needed: Arc::clone(&self.speech_notice_needed),
+            detected: Arc::clone(&self.unprocessed_speech),
+        };
+        match thread::Builder::new()
+            .name("xmic-idle".to_owned())
+            .spawn(move || run_idle_worker(settings, mode, worker_stop, runtime, report))
+        {
+            Ok(handle) => {
+                control.idle = Some(IdleWorker { stop, handle, mode });
+                control.idle_since = None;
+            }
+            Err(error) => {
+                control.idle_failures = control.idle_failures.saturating_add(1);
+                control.idle_since = Some(Instant::now());
+                lock_unpoisoned(&self.runtime)
+                    .warn(&format!("start the unprocessed microphone path: {error}"));
+            }
+        }
+    }
+}
+
+fn desired_idle_mode(control: &ControlState) -> Option<IdleSessionMode> {
+    if control.worker.is_some()
+        || !control.permit.bypass_allowed
+        || control.idle_failures >= IDLE_SESSION_FAILURES_BEFORE_GIVING_UP
+    {
+        return None;
+    }
+    match control.settings.unprocessed_output {
+        UnprocessedOutput::RawMicrophone => Some(IdleSessionMode::Forward),
+        // Silence needs no session of its own. The only reason to open the microphone is the one-shot
+        // notice, so it closes again as soon as that notice has been shown.
+        UnprocessedOutput::Silence if control.permit.speech_notice_needed => {
+            Some(IdleSessionMode::Listen)
+        }
+        UnprocessedOutput::Silence => None,
+    }
+}
+
+fn idle_grace_elapsed(control: &ControlState) -> bool {
+    control
+        .idle_since
+        .is_none_or(|since| since.elapsed() >= IDLE_SESSION_GRACE)
+}
+
+/// Returns false when the worker is still alive after the timeout. It stays tracked in that case: an
+/// untracked thread would keep holding the virtual device and mix its audio into whatever opens the
+/// output next, which is the one thing the idle session must never do.
+fn stop_idle_worker(control: &mut ControlState) -> bool {
+    control.idle_since = Some(Instant::now());
+    let Some(worker) = control.idle.take() else {
+        return true;
+    };
+    worker.stop.store(true, Ordering::Release);
+    let deadline = Instant::now() + IDLE_STOP_TIMEOUT;
+    while !worker.handle.is_finished() {
+        if Instant::now() >= deadline {
+            control.idle = Some(worker);
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let _ = worker.handle.join();
+    true
 }
 
 fn reap_finished_worker(control: &mut ControlState) -> bool {
@@ -367,6 +631,9 @@ fn reap_finished_worker(control: &mut ControlState) -> bool {
         if let Some(worker) = control.worker.take() {
             let _ = worker.handle.join();
         }
+        // The supervisor restarts a processing session that died on its own, so the idle session waits
+        // out the same grace period it does after a deliberate stop.
+        control.idle_since = Some(Instant::now());
     }
     finished
 }
@@ -394,6 +661,292 @@ fn stop_worker_with_timeout(worker: EngineWorker) -> Result<(), String> {
         .map_err(|_| "audio engine worker panicked".to_owned())
 }
 
+/// Shared with whichever session is running: the UI decides how long detection is worth doing, the
+/// session reports what it heard.
+struct SpeechPresenceReport {
+    needed: Arc<AtomicBool>,
+    detected: Arc<AtomicBool>,
+}
+
+impl SpeechPresenceReport {
+    fn wanted(&self) -> bool {
+        self.needed.load(Ordering::Acquire)
+    }
+
+    fn report(&self) {
+        self.detected.store(true, Ordering::Release);
+    }
+}
+
+/// RNNoise runs here purely as a side chain: its denoised output is thrown away, only the speech
+/// probability is used. It is safe Rust with no native dependency, so it still works when the missing
+/// `xmic_webrtc_dsp.dll` is the very reason nothing is being processed.
+struct SpeechProbe {
+    rnnoise: Option<RnnoiseDsp>,
+    presence: SpeechPresenceDetector,
+    discarded: [f32; DSP_SAMPLES_PER_FRAME],
+    unavailable: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct SpeechProbeFrame {
+    probability: Option<f32>,
+    confirmed: bool,
+}
+
+impl Default for SpeechProbe {
+    fn default() -> Self {
+        Self {
+            rnnoise: None,
+            presence: SpeechPresenceDetector::default(),
+            discarded: [0.0; DSP_SAMPLES_PER_FRAME],
+            unavailable: false,
+        }
+    }
+}
+
+impl SpeechProbe {
+    fn observe(
+        &mut self,
+        samples: &[f32; DSP_SAMPLES_PER_FRAME],
+        peak_dbfs: f32,
+    ) -> SpeechProbeFrame {
+        if self.unavailable || self.presence.fired() {
+            return SpeechProbeFrame::default();
+        }
+        if self.rnnoise.is_none() {
+            match RnnoiseDsp::new(RnnoiseConfig { mix: 1.0 }) {
+                Ok(rnnoise) => self.rnnoise = Some(rnnoise),
+                Err(_) => {
+                    self.unavailable = true;
+                    return SpeechProbeFrame::default();
+                }
+            }
+        }
+        let Some(rnnoise) = self.rnnoise.as_mut() else {
+            return SpeechProbeFrame::default();
+        };
+        match rnnoise.process_frame(samples, &mut self.discarded) {
+            Ok(metrics) => SpeechProbeFrame {
+                probability: Some(metrics.vad_probability),
+                confirmed: self.presence.observe(metrics.vad_probability, peak_dbfs),
+            },
+            Err(_) => {
+                self.unavailable = true;
+                SpeechProbeFrame::default()
+            }
+        }
+    }
+}
+
+fn run_idle_worker(
+    settings: EngineSettings,
+    mode: IdleSessionMode,
+    stop: Arc<AtomicBool>,
+    runtime: Arc<Mutex<RuntimeSnapshot>>,
+    report: SpeechPresenceReport,
+) {
+    // Forwarding audio is realtime work even without DSP; losing MMCSS is not worth refusing over.
+    let _realtime_thread = register_realtime_audio_thread().ok();
+    let monitor = match start_device_change_monitor() {
+        Ok(monitor) => monitor,
+        Err(error) => {
+            lock_unpoisoned(&runtime).warn(&format!(
+                "start device change monitor while not processing: {error}"
+            ));
+            return;
+        }
+    };
+    let mut probe = SpeechProbe::default();
+
+    while !stop.load(Ordering::Acquire) {
+        let generation = monitor.generation();
+        let mut session = match IdleSession::start(&settings, mode) {
+            Ok(session) => session,
+            Err(error) => {
+                lock_unpoisoned(&runtime).warn(&format!("{}：{error}", idle_failure_context(mode)));
+                break;
+            }
+        };
+        lock_unpoisoned(&runtime).publish_idle(mode, EngineMetrics::default());
+        let exit = session.run(&stop, &monitor, generation, &runtime, &mut probe, &report);
+        let _ = session.stop();
+        match exit {
+            IdleExit::DeviceChanged => continue,
+            IdleExit::Failed(error) => {
+                if !stop.load(Ordering::Acquire) {
+                    lock_unpoisoned(&runtime)
+                        .warn(&format!("{}：{error}", idle_failure_context(mode)));
+                }
+                break;
+            }
+            IdleExit::Stopped => break,
+        }
+    }
+    let _ = monitor.stop();
+}
+
+enum IdleExit {
+    DeviceChanged,
+    Failed(String),
+    Stopped,
+}
+
+struct IdleSession {
+    source: CaptureSourceStream,
+    output: Option<OutputSinkStream>,
+    mode: IdleSessionMode,
+}
+
+impl IdleSession {
+    fn start(settings: &EngineSettings, mode: IdleSessionMode) -> Result<Self, String> {
+        let source = start_capture_source(CaptureSourceRequest {
+            capture_endpoint_id: settings.capture_endpoint_id.clone(),
+            capture_channel: settings.capture_channel,
+        })
+        .map_err(|error| error.to_string())?;
+        let output = match mode {
+            IdleSessionMode::Listen => {
+                validate_physical_capture(&source.info().capture_endpoint)?;
+                None
+            }
+            IdleSessionMode::Forward => {
+                let endpoint_id = settings
+                    .output_endpoint_id
+                    .clone()
+                    .ok_or_else(|| "virtual microphone output endpoint is missing".to_owned())?;
+                let output = start_output_sink(OutputSinkRequest { endpoint_id })
+                    .map_err(|error| error.to_string())?;
+                validate_capture_output_topology(
+                    &source.info().capture_endpoint,
+                    &output.info().endpoint,
+                )?;
+                Some(output)
+            }
+        };
+        Ok(Self {
+            source,
+            output,
+            mode,
+        })
+    }
+
+    fn run(
+        &mut self,
+        stop: &AtomicBool,
+        monitor: &DeviceChangeMonitor,
+        generation: u64,
+        runtime: &Mutex<RuntimeSnapshot>,
+        probe: &mut SpeechProbe,
+        report: &SpeechPresenceReport,
+    ) -> IdleExit {
+        let mut metrics = EngineMetrics::default();
+        let mut window = StatusWindow::new(Instant::now());
+        let mut vad_probability = None;
+
+        loop {
+            if stop.load(Ordering::Acquire) {
+                return IdleExit::Stopped;
+            }
+            if monitor.worker_finished() {
+                return IdleExit::Failed("device change monitor stopped".to_owned());
+            }
+            if monitor.generation() != generation {
+                return IdleExit::DeviceChanged;
+            }
+            if self.source.worker_finished()
+                || self
+                    .output
+                    .as_ref()
+                    .is_some_and(OutputSinkStream::worker_finished)
+            {
+                return IdleExit::Failed("a WASAPI worker stopped unexpectedly".to_owned());
+            }
+
+            window.observe_backlog(self.source.capture_queue_blocks());
+            let Some(capture) = self.source.pop_capture() else {
+                thread::park_timeout(Duration::from_millis(20));
+                continue;
+            };
+            let peak_dbfs = peak_dbfs(&capture.samples);
+            window.observe_input_peak(peak_dbfs);
+            metrics.input_clipped_samples = metrics
+                .input_clipped_samples
+                .saturating_add(clipped_sample_count(&capture.samples));
+            if report.wanted() {
+                let frame = probe.observe(&capture.samples, peak_dbfs);
+                if let Some(probability) = frame.probability {
+                    vad_probability = Some(probability);
+                }
+                if frame.confirmed {
+                    report.report();
+                }
+            }
+            if let Some(output) = &mut self.output {
+                // Forwarding copies the capture frame verbatim, so the output's peak is the input's.
+                window.observe_output_peak(peak_dbfs);
+                if !output.push_block(capture.samples) {
+                    metrics.output_queue_overflows = output.counters().queue_overflows;
+                }
+            }
+            metrics.processed_blocks = metrics.processed_blocks.saturating_add(1);
+
+            if window.due(Instant::now()) {
+                let output_counters = self
+                    .output
+                    .as_ref()
+                    .map(OutputSinkStream::counters)
+                    .unwrap_or_default();
+                let output_stream_latency_100ns = self
+                    .output
+                    .as_ref()
+                    .map_or(0, |output| output.info().stream_latency_100ns);
+                // No DSP means no look-ahead: the only latency left is what the devices impose.
+                apply_device_metrics(
+                    &mut metrics,
+                    &self.source.counters(),
+                    &output_counters,
+                    output_stream_latency_100ns,
+                    0,
+                    &mut window,
+                );
+                metrics.input_peak_dbfs = window.take_input_peak();
+                metrics.output_peak_dbfs = window.take_output_peak();
+                metrics.vad_probability = vad_probability.take();
+                lock_unpoisoned(runtime).publish_idle(self.mode, metrics.clone());
+            }
+        }
+    }
+
+    fn stop(self) -> Result<(), PlatformError> {
+        let source_result = self.source.stop();
+        let output_result = self.output.map_or(Ok(()), OutputSinkStream::stop);
+        source_result.and(output_result)
+    }
+}
+
+fn idle_engine_mode(mode: IdleSessionMode) -> EngineMode {
+    match mode {
+        IdleSessionMode::Forward => EngineMode::RawFallback,
+        IdleSessionMode::Listen => EngineMode::Sleeping,
+    }
+}
+
+fn idle_detail(mode: IdleSessionMode) -> &'static str {
+    match mode {
+        IdleSessionMode::Forward => "not processing; sending the unprocessed microphone",
+        IdleSessionMode::Listen => "not processing; the virtual microphone is silent",
+    }
+}
+
+fn idle_failure_context(mode: IdleSessionMode) -> &'static str {
+    match mode {
+        IdleSessionMode::Forward => "无法输出未处理的麦克风声音",
+        IdleSessionMode::Listen => "无法检测未处理的语音",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_worker(
     settings: EngineSettings,
     native_library: PathBuf,
@@ -401,13 +954,14 @@ fn run_worker(
     safe_mode: bool,
     stop: Arc<AtomicBool>,
     runtime: Arc<Mutex<RuntimeSnapshot>>,
+    speech: SpeechPresenceReport,
     ready: mpsc::SyncSender<Result<(), EngineStartError>>,
 ) {
     let _realtime_thread = match register_realtime_audio_thread() {
         Ok(registration) => registration,
         Err(error) => {
             let message = format!("register DSP thread with MMCSS: {error}");
-            set_worker_error(&runtime, &message);
+            lock_unpoisoned(&runtime).fail(&message);
             let _ = ready.send(Err(EngineStartError::Runtime(message)));
             return;
         }
@@ -416,7 +970,7 @@ fn run_worker(
         Ok(monitor) => monitor,
         Err(error) => {
             let message = format!("start device change monitor: {error}");
-            set_worker_error(&runtime, &message);
+            lock_unpoisoned(&runtime).fail(&message);
             let _ = ready.send(Err(EngineStartError::Runtime(message)));
             return;
         }
@@ -428,7 +982,7 @@ fn run_worker(
         match WasapiPlatform::new().active_endpoints() {
             Ok(endpoints) => {
                 if let Some(issue) = configuration_issue(&settings, &endpoints) {
-                    set_configuration_issue(&runtime, issue.clone());
+                    lock_unpoisoned(&runtime).require_configuration(issue.clone());
                     if first_session {
                         let _ = ready.send(Err(EngineStartError::ConfigurationRequired(issue)));
                     }
@@ -437,7 +991,7 @@ fn run_worker(
             }
             Err(error) => {
                 let message = format!("read active audio endpoints: {error}");
-                set_worker_error(&runtime, &message);
+                lock_unpoisoned(&runtime).fail(&message);
                 if first_session {
                     let _ = ready.send(Err(EngineStartError::Runtime(message)));
                     break;
@@ -448,8 +1002,7 @@ fn run_worker(
                 continue;
             }
         }
-        replace_runtime(
-            &runtime,
+        lock_unpoisoned(&runtime).publish_session(
             EngineMode::Starting,
             if first_session {
                 "starting realtime audio session"
@@ -474,7 +1027,7 @@ fn run_worker(
                     break;
                 }
                 let message = format!("启动实时音频会话失败：{error}");
-                set_worker_error(&runtime, &message);
+                lock_unpoisoned(&runtime).fail(&message);
                 if first_session {
                     let _ = ready.send(Err(EngineStartError::Runtime(message)));
                     return;
@@ -490,14 +1043,12 @@ fn run_worker(
             break;
         }
 
-        set_runtime_profile(
-            &runtime,
+        lock_unpoisoned(&runtime).set_profile(
             session.device_profile.clone(),
             session.effective_settings.dsp.clone(),
         );
         let (initial_mode, warning) = session.initial_state();
-        replace_runtime(
-            &runtime,
+        lock_unpoisoned(&runtime).publish_session(
             initial_mode,
             initial_detail(initial_mode),
             Some(session.active_route()),
@@ -517,19 +1068,19 @@ fn run_worker(
             generation,
             &runtime,
             &mut metrics,
+            &speech,
         );
         let stop_result = session.stop();
         if stop.load(Ordering::Acquire) {
             break;
         }
         if let Err(error) = stop_result {
-            set_worker_error(&runtime, &format!("stop realtime session: {error}"));
+            lock_unpoisoned(&runtime).fail(&format!("stop realtime session: {error}"));
         }
         metrics.device_restarts = metrics.device_restarts.saturating_add(1);
         match exit {
             SessionExit::DeviceChanged => {
-                replace_runtime(
-                    &runtime,
+                lock_unpoisoned(&runtime).publish_session(
                     EngineMode::Starting,
                     "audio endpoint changed; rebuilding the session",
                     None,
@@ -538,7 +1089,7 @@ fn run_worker(
                 );
             }
             SessionExit::Failed(error) => {
-                set_worker_error(&runtime, &error);
+                lock_unpoisoned(&runtime).fail(&error);
                 if wait_for_stop(&stop, RESTART_BACKOFF) {
                     break;
                 }
@@ -654,10 +1205,7 @@ impl RealtimeSession {
         match (&self.processor, &self.initial_warning) {
             (Some(_), _) => (EngineMode::Converging, None),
             (None, warning) => (
-                match self.effective_settings.failure_policy {
-                    DspFailurePolicy::RawPassthrough => EngineMode::RawFallback,
-                    DspFailurePolicy::Mute => EngineMode::Muted,
-                },
+                unprocessed_engine_mode(self.effective_settings.unprocessed_output),
                 warning
                     .clone()
                     .or_else(|| Some("DSP is unavailable".to_owned())),
@@ -674,26 +1222,30 @@ impl RealtimeSession {
         generation: u64,
         runtime: &Mutex<RuntimeSnapshot>,
         metrics: &mut EngineMetrics,
+        speech: &SpeechPresenceReport,
     ) -> SessionExit {
         let started = Instant::now();
-        let mut last_status_update = Instant::now();
         let mut interleaved_render = [0.0; DSP_SAMPLES_PER_FRAME * MAX_RENDER_CHANNELS];
         let mut processed = [0.0; DSP_SAMPLES_PER_FRAME];
         let mut aligned_raw = [0.0; DSP_SAMPLES_PER_FRAME];
-        let mut dsp_warning = self.initial_warning.clone();
-        let mut dsp_failed = self.processor.is_none();
+        let mut health = DspHealth {
+            failed: self.processor.is_none(),
+            warning: self.initial_warning.clone(),
+            recovery_mute_until: None,
+        };
         let mut gate_was_open = false;
         let mut echo_guard_was_active = false;
         let mut nearend_candidate_was_active = false;
         let mut host_delay_estimator = HostDelayEstimator::default();
         let mut last_data_discontinuities = self.source.counters().data_discontinuities;
-        let mut window_input_peak_dbfs = None;
-        let mut window_output_peak_dbfs = None;
-        let mut window_capture_backlog_blocks = 0usize;
+        let mut window = StatusWindow::new(Instant::now());
+        let mut probe = SpeechProbe::default();
         let mut overload = ProcessingOverloadController::new(settings.dsp.agc2.enabled);
         metrics.processing_load_mode = ProcessingLoadMode::Full;
-        let mut recovery_mute_until = None;
-        let mut last_timing_faults = realtime_timing_faults(&self.source, &self.output);
+        let mut echo_path_reset = EchoPathResetLimiter::default();
+        let mut last_backlog_events = dsp_backlog_events(&self.source);
+        let mut reported_discontinuities = self.source.counters().data_discontinuities;
+        let mut reported_output_underruns = self.output.counters().underrun_events;
 
         loop {
             if stop.load(Ordering::Acquire) {
@@ -709,13 +1261,16 @@ impl RealtimeSession {
                 return SessionExit::Failed("a WASAPI worker stopped unexpectedly".to_owned());
             }
 
-            window_capture_backlog_blocks =
-                window_capture_backlog_blocks.max(self.source.capture_queue_blocks());
+            window.observe_backlog(self.source.capture_queue_blocks());
             let Some(capture) = self.source.pop_capture() else {
                 thread::park_timeout(Duration::from_millis(20));
                 continue;
             };
             let processing_started = Instant::now();
+            // This frame's load mode. `overload.observe` at the end of the iteration may move it, and
+            // the new value must only reach the next frame: a decision about audio that has already
+            // been sent cannot be revised by a mode that arrived after it.
+            let frame_load = overload.mode();
             let source_counters = self.source.counters();
             if counter_changed(
                 &mut last_data_discontinuities,
@@ -723,17 +1278,10 @@ impl RealtimeSession {
             ) {
                 host_delay_estimator.reset();
                 metrics.host_delay_reset_events = metrics.host_delay_reset_events.saturating_add(1);
-                if !dsp_failed && overload.mode() != ProcessingLoadMode::Protection {
-                    if let Err(error) = reset_processor_echo_path(&mut self.processor) {
-                        dsp_warning = Some(format!(
-                            "DSP reset after a WASAPI discontinuity failed; using failure policy: {error}"
-                        ));
-                        dsp_failed = true;
-                        metrics.dsp_failures = metrics.dsp_failures.saturating_add(1);
-                    }
-                }
+                echo_path_reset.request();
             }
-            window_input_peak_dbfs = max_level(window_input_peak_dbfs, peak_dbfs(&capture.samples));
+            let input_peak_dbfs = peak_dbfs(&capture.samples);
+            window.observe_input_peak(input_peak_dbfs);
             metrics.input_clipped_samples = metrics
                 .input_clipped_samples
                 .saturating_add(clipped_sample_count(&capture.samples));
@@ -742,7 +1290,7 @@ impl RealtimeSession {
             let mut latest_render_sample_count = 0usize;
             while let Some(render) = self.source.pop_render() {
                 render_blocks += 1;
-                if !dsp_failed && overload.mode() != ProcessingLoadMode::Protection {
+                if !health.failed && frame_load != ProcessingLoadMode::Protection {
                     interleave_render(&render, &mut interleaved_render);
                     let sample_count = DSP_SAMPLES_PER_FRAME * render.channels;
                     if let Some(processor) = &mut self.processor {
@@ -752,13 +1300,12 @@ impl RealtimeSession {
                                     Some(render.timestamp.qpc_position_100ns);
                                 latest_render_sample_count = sample_count;
                             }
-                            Err(error) => {
-                                dsp_warning = Some(format!(
+                            Err(error) => health.fail(
+                                metrics,
+                                format!(
                                     "DSP render processing failed; using failure policy: {error}"
-                                ));
-                                dsp_failed = true;
-                                metrics.dsp_failures = metrics.dsp_failures.saturating_add(1);
-                            }
+                                ),
+                            ),
                         }
                     }
                 }
@@ -768,7 +1315,7 @@ impl RealtimeSession {
             }
 
             let mut host_delay_observation = host_delay_estimator.current();
-            if !dsp_failed && overload.mode() != ProcessingLoadMode::Protection {
+            if !health.failed && frame_load != ProcessingLoadMode::Protection {
                 if let Some(render_qpc_position_100ns) = latest_render_qpc_position_100ns {
                     host_delay_observation = host_delay_estimator.observe(
                         capture.timestamp.qpc_position_100ns,
@@ -777,29 +1324,34 @@ impl RealtimeSession {
                     if host_delay_observation.reset_required {
                         metrics.host_delay_reset_events =
                             metrics.host_delay_reset_events.saturating_add(1);
-                        match reset_processor_echo_path(&mut self.processor) {
-                            Ok(()) => {
+                        echo_path_reset.request();
+                    }
+                }
+                // Both reset reasons rebuild the same echo canceller, so they share one rate limit.
+                if echo_path_reset.take_due(Instant::now()) {
+                    match reset_processor_echo_path(&mut self.processor) {
+                        Ok(()) => {
+                            if latest_render_sample_count > 0 {
                                 if let Some(processor) = &mut self.processor {
                                     if let Err(error) = processor.process_render(
                                         &interleaved_render[..latest_render_sample_count],
                                     ) {
-                                        dsp_warning = Some(format!(
-                                            "DSP render processing after a timing reset failed; using failure policy: {error}"
-                                        ));
-                                        dsp_failed = true;
-                                        metrics.dsp_failures =
-                                            metrics.dsp_failures.saturating_add(1);
+                                        health.fail(
+                                            metrics,
+                                            format!(
+                                                "DSP render processing after an echo path rebuild failed; sending the configured unprocessed output: {error}"
+                                            ),
+                                        );
                                     }
                                 }
                             }
-                            Err(error) => {
-                                dsp_warning = Some(format!(
-                                    "DSP timing reset failed; using failure policy: {error}"
-                                ));
-                                dsp_failed = true;
-                                metrics.dsp_failures = metrics.dsp_failures.saturating_add(1);
-                            }
                         }
+                        Err(error) => health.fail(
+                            metrics,
+                            format!(
+                                "DSP echo path rebuild failed; sending the configured unprocessed output: {error}"
+                            ),
+                        ),
                     }
                 }
             }
@@ -808,22 +1360,19 @@ impl RealtimeSession {
             self.raw_path
                 .process_frame(&capture.samples, &mut aligned_raw);
             let mut dsp_frame_metrics = None;
-            if !dsp_failed && overload.mode() != ProcessingLoadMode::Protection {
+            if !health.failed && frame_load != ProcessingLoadMode::Protection {
                 if let Some(processor) = &mut self.processor {
                     match processor.process_capture_with_options(
                         &capture.samples,
                         &mut processed,
                         host_delay_observation.stream_delay_ms,
-                        overload.mode() == ProcessingLoadMode::Reduced,
+                        frame_load == ProcessingLoadMode::Reduced,
                     ) {
                         Ok(frame_metrics) => dsp_frame_metrics = Some(frame_metrics),
-                        Err(error) => {
-                            dsp_warning = Some(format!(
-                                "DSP capture processing failed; using failure policy: {error}"
-                            ));
-                            dsp_failed = true;
-                            metrics.dsp_failures = metrics.dsp_failures.saturating_add(1);
-                        }
+                        Err(error) => health.fail(
+                            metrics,
+                            format!("DSP capture processing failed; using failure policy: {error}"),
+                        ),
                     }
                 }
             }
@@ -863,43 +1412,50 @@ impl RealtimeSession {
                     nearend_candidate_was_active = false;
                 }
             }
-            let recovery_muted = recovery_mute_until.is_some_and(|until| Instant::now() < until);
-            // Safe mode follows repeated crashes and the recovery window covers an AEC that has not
-            // reconverged yet, so both stay hard muted. CPU overload protection is a timing problem
-            // rather than a signal problem, so it follows the configured failure policy.
-            let output = if self.safe_mode || recovery_muted {
-                [0.0; DSP_SAMPLES_PER_FRAME]
-            } else if dsp_failed || overload.mode() == ProcessingLoadMode::Protection {
-                match settings.failure_policy {
-                    DspFailurePolicy::RawPassthrough => aligned_raw,
-                    DspFailurePolicy::Mute => [0.0; DSP_SAMPLES_PER_FRAME],
+            let decision = decide(
+                self.safe_mode,
+                &health,
+                frame_load,
+                started.elapsed(),
+                Instant::now(),
+                settings.unprocessed_output,
+            );
+            if decision.unprocessed && speech.wanted() {
+                let frame = probe.observe(&capture.samples, input_peak_dbfs);
+                if let Some(probability) = frame.probability {
+                    metrics.vad_probability = Some(probability);
                 }
-            } else {
-                processed
+                if frame.confirmed {
+                    speech.report();
+                }
+            }
+            let output = match decision.source {
+                OutputSource::Processed => processed,
+                OutputSource::AlignedRaw => aligned_raw,
+                OutputSource::Silence => [0.0; DSP_SAMPLES_PER_FRAME],
             };
-            window_output_peak_dbfs = max_level(window_output_peak_dbfs, peak_dbfs(&output));
+            window.observe_output_peak(peak_dbfs(&output));
             if !self.output.push_block(output) {
                 metrics.output_queue_overflows = self.output.counters().queue_overflows;
-                dsp_warning = Some(
+                health.warn(
                     "virtual output queue overflowed; clock controller is recovering".to_owned(),
                 );
             }
             metrics.processed_blocks = metrics.processed_blocks.saturating_add(1);
             let processing_elapsed = processing_started.elapsed();
             self.processing_histogram.observe(processing_elapsed);
-            let current_timing_faults = realtime_timing_faults(&self.source, &self.output);
-            let timing_fault =
-                current_timing_faults > last_timing_faults && started.elapsed() >= CONVERGENCE_TIME;
-            last_timing_faults = current_timing_faults;
+            let current_backlog_events = dsp_backlog_events(&self.source);
+            let backlog_fault = current_backlog_events > last_backlog_events
+                && started.elapsed() >= CONVERGENCE_TIME;
+            last_backlog_events = current_backlog_events;
             if processing_elapsed.as_micros() > u128::from(PROCESSING_BUDGET_US) {
                 metrics.processing_budget_exceeded_blocks =
                     metrics.processing_budget_exceeded_blocks.saturating_add(1);
             }
-            let overload_transition = (!self.safe_mode && !dsp_failed)
-                .then(|| overload.observe(processing_elapsed, timing_fault))
+            let overload_transition = (!self.safe_mode && !health.failed)
+                .then(|| overload.observe(processing_elapsed, backlog_fault))
                 .flatten();
             if let Some(transition) = overload_transition {
-                metrics.processing_load_mode = transition.current;
                 if transition.current > transition.previous {
                     metrics.processing_overload_events =
                         metrics.processing_overload_events.saturating_add(1);
@@ -912,17 +1468,16 @@ impl RealtimeSession {
                 {
                     match self.reload_processor() {
                         Ok(()) => {
-                            dsp_failed = false;
+                            health.failed = false;
                             host_delay_estimator.reset();
-                            recovery_mute_until = Some(Instant::now() + CONVERGENCE_TIME);
+                            health.recovery_mute_until = Some(Instant::now() + CONVERGENCE_TIME);
                         }
-                        Err(error) => {
-                            dsp_warning = Some(format!(
+                        Err(error) => health.fail(
+                            metrics,
+                            format!(
                                 "DSP recovery after CPU overload failed; using failure policy: {error}"
-                            ));
-                            dsp_failed = true;
-                            metrics.dsp_failures = metrics.dsp_failures.saturating_add(1);
-                        }
+                            ),
+                        ),
                     }
                 } else if transition.current == ProcessingLoadMode::Protection {
                     clear_dsp_metrics(metrics);
@@ -931,38 +1486,31 @@ impl RealtimeSession {
                 {
                     if let Some(processor) = &mut self.processor {
                         if let Err(error) = processor.reset_agc2() {
-                            dsp_warning = Some(format!(
-                                "reset AGC2 after CPU recovery failed; using failure policy: {error}"
-                            ));
-                            dsp_failed = true;
-                            metrics.dsp_failures = metrics.dsp_failures.saturating_add(1);
+                            health.fail(
+                                metrics,
+                                format!(
+                                    "reset AGC2 after CPU recovery failed; using failure policy: {error}"
+                                ),
+                            );
                         }
                     }
                 }
             }
             metrics.processing_load_mode = overload.mode();
 
-            if last_status_update.elapsed() >= STATUS_UPDATE_INTERVAL {
+            if window.due(Instant::now()) {
                 let source_counters = self.source.counters();
                 let output_counters = self.output.counters();
-                metrics.render_overflows = source_counters.render_overflows;
-                metrics.capture_overflows = source_counters.capture_overflows;
-                metrics.output_underruns = output_counters.underrun_events;
-                metrics.output_queue_overflows = output_counters.queue_overflows;
-                metrics.output_queue_depth_ms = output_counters.queue_depth_frames as f32 * 1_000.0
-                    / xmic_engine_core::DSP_SAMPLE_RATE_HZ as f32;
-                metrics.output_rate_adjustment_ppm = output_counters.rate_adjustment_ppm as f32;
-                latency_breakdown(
-                    self.processing_latency_frames,
-                    source_counters.capture_packet_lag_100ns,
-                    window_capture_backlog_blocks,
+                apply_device_metrics(
+                    metrics,
+                    &source_counters,
                     &output_counters,
                     self.output.info().stream_latency_100ns,
-                )
-                .apply(metrics);
-                window_capture_backlog_blocks = 0;
-                metrics.input_peak_dbfs = window_input_peak_dbfs.take();
-                metrics.output_peak_dbfs = window_output_peak_dbfs.take();
+                    self.processing_latency_frames,
+                    &mut window,
+                );
+                metrics.input_peak_dbfs = window.take_input_peak();
+                metrics.output_peak_dbfs = window.take_output_peak();
                 metrics.processing_time_p99_us = self.processing_histogram.p99_us();
                 metrics.processing_time_max_us = self.processing_histogram.max_us();
                 metrics.processing_deadline_misses = self.processing_histogram.deadline_misses();
@@ -983,38 +1531,26 @@ impl RealtimeSession {
                             metrics.aec_echo_return_loss_enhancement_db = None;
                             metrics.aec_residual_echo_likelihood = None;
                         }
-                        Err(error) => {
-                            dsp_warning = Some(format!("read AEC metrics failed: {error}"));
-                        }
+                        Err(error) => health.warn(format!("read AEC metrics failed: {error}")),
                     }
                 }
-                let mode = if self.safe_mode {
-                    EngineMode::SafeMode
-                } else if dsp_failed {
-                    match settings.failure_policy {
-                        DspFailurePolicy::RawPassthrough => EngineMode::RawFallback,
-                        DspFailurePolicy::Mute => EngineMode::Muted,
-                    }
-                } else if started.elapsed() < CONVERGENCE_TIME
-                    || recovery_mute_until.is_some_and(|until| Instant::now() < until)
-                {
-                    EngineMode::Converging
-                } else {
-                    EngineMode::Active
-                };
-                replace_runtime(
-                    runtime,
-                    mode,
-                    initial_detail(mode),
+                lock_unpoisoned(runtime).publish_session(
+                    decision.mode,
+                    initial_detail(decision.mode),
                     Some(self.active_route()),
                     metrics.clone(),
                     combine_runtime_warnings(
-                        dsp_warning.clone(),
+                        health.warning.clone(),
                         overload.mode(),
-                        settings.failure_policy,
+                        settings.unprocessed_output,
+                        DeviceInstability::since(
+                            &mut reported_discontinuities,
+                            source_counters.data_discontinuities,
+                            &mut reported_output_underruns,
+                            output_counters.underrun_events,
+                        ),
                     ),
                 );
-                last_status_update = Instant::now();
             }
         }
     }
@@ -1044,58 +1580,102 @@ enum SessionExit {
     Stopped,
 }
 
-fn validate_topology(
-    source: &DuplexSourceStream,
-    output_endpoint: &EndpointDescriptor,
-    follow_default_render: bool,
-) -> Result<(), String> {
-    if let Some(message) = render_output_conflict_message(
-        &source.info().render_endpoint,
-        output_endpoint,
-        follow_default_render,
-    ) {
-        return Err(message);
-    }
-    if same_device_group(&source.info().capture_endpoint, output_endpoint) {
-        return Err(
-            "the virtual output belongs to the same device group as the physical microphone"
-                .to_owned(),
-        );
-    }
-    let capture_name = source.info().capture_endpoint.friendly_name.to_lowercase();
-    if capture_name.contains("cable output") || capture_name.contains("vb-audio virtual cable") {
-        return Err("virtual cable capture cannot be used as the physical microphone".to_owned());
-    }
-    Ok(())
+/// The DSP's health as one value, because reporting a failure is three coupled writes: the flag that
+/// diverts the output, the message the UI shows, and the counter. Six call sites used to perform all
+/// three by hand, and any one of them could have performed two.
+struct DspHealth {
+    failed: bool,
+    warning: Option<String>,
+    /// Set while a rebuilt echo canceller has not reconverged. Distinct from `failed`: the DSP works,
+    /// its output just cannot be trusted yet.
+    recovery_mute_until: Option<Instant>,
 }
 
-fn render_output_conflict_message(
-    render_endpoint: &EndpointDescriptor,
-    output_endpoint: &EndpointDescriptor,
-    follow_default_render: bool,
-) -> Option<String> {
-    if render_endpoint.id != output_endpoint.id
-        && !same_device_group(render_endpoint, output_endpoint)
-    {
-        return None;
+impl DspHealth {
+    fn fail(&mut self, metrics: &mut EngineMetrics, message: String) {
+        self.warning = Some(message);
+        self.failed = true;
+        metrics.dsp_failures = metrics.dsp_failures.saturating_add(1);
     }
-    if follow_default_render {
-        return Some(format!(
-            "Windows 默认播放设备“{}”同时被选为虚拟麦克风输出。请先将音响或耳机设为 Windows 默认播放设备，然后重试。",
-            render_endpoint.friendly_name
-        ));
+
+    /// Something worth telling the user about that has not stopped the DSP.
+    fn warn(&mut self, message: String) {
+        self.warning = Some(message);
     }
-    Some(format!(
-        "播放参考“{}”不能同时作为虚拟麦克风输出。请为播放参考选择实际发声的音响或耳机。",
-        render_endpoint.friendly_name
-    ))
+
+    fn recovering(&self, now: Instant) -> bool {
+        self.recovery_mute_until.is_some_and(|until| now < until)
+    }
 }
 
-fn same_device_group(left: &EndpointDescriptor, right: &EndpointDescriptor) -> bool {
-    left.group_id
-        .as_ref()
-        .zip(right.group_id.as_ref())
-        .is_some_and(|(left, right)| !left.is_empty() && left == right)
+/// What the virtual microphone carries for one frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputSource {
+    Processed,
+    AlignedRaw,
+    Silence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OutputDecision {
+    source: OutputSource,
+    mode: EngineMode,
+    /// Nothing is being processed at all — safe mode, a DSP failure, or overload protection.
+    ///
+    /// Deliberately not the same question as `source != Processed`, which the recovery window also
+    /// answers yes to. The speech probe listens only when there is nothing to process; it must stay
+    /// quiet while a rebuilt canceller is warming up, because that is processing, just not yet
+    /// trustworthy.
+    unprocessed: bool,
+}
+
+/// The one place that answers "what does the other side hear, and what do we call it".
+///
+/// Both used to be derived independently, 130 lines apart, from the same conditions. That
+/// arrangement allowed the tray to report processing while a DSP failure kept
+/// the output muted. Deriving them together makes disagreement unrepresentable.
+///
+/// The asymmetry between the two convergence windows is deliberate. The initial one reports
+/// `Converging` while still sending processed audio, because AEC3 converges *on* real audio. The
+/// post-recovery one reports `Converging` and sends silence, because that canceller was just rebuilt
+/// and unprocessed audio really would leak echo.
+///
+/// `load` must be the frame's snapshot, taken before `ProcessingOverloadController::observe` may move
+/// it — a decision about audio that has already been emitted cannot use a mode that arrived after it.
+fn decide(
+    safe_mode: bool,
+    health: &DspHealth,
+    load: ProcessingLoadMode,
+    session_elapsed: Duration,
+    now: Instant,
+    unprocessed_output: UnprocessedOutput,
+) -> OutputDecision {
+    let unprocessed = safe_mode || health.failed || load == ProcessingLoadMode::Protection;
+    let recovering = health.recovering(now);
+    let source = if recovering {
+        OutputSource::Silence
+    } else if unprocessed {
+        match unprocessed_output {
+            UnprocessedOutput::RawMicrophone => OutputSource::AlignedRaw,
+            UnprocessedOutput::Silence => OutputSource::Silence,
+        }
+    } else {
+        OutputSource::Processed
+    };
+    let mode = if safe_mode {
+        EngineMode::SafeMode
+    } else if unprocessed {
+        unprocessed_engine_mode(unprocessed_output)
+    } else if session_elapsed < CONVERGENCE_TIME || recovering {
+        EngineMode::Converging
+    } else {
+        EngineMode::Active
+    };
+    OutputDecision {
+        source,
+        mode,
+        unprocessed,
+    }
 }
 
 fn interleave_render(
@@ -1166,62 +1746,22 @@ fn clipped_sample_count(samples: &[f32]) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+fn unprocessed_engine_mode(unprocessed_output: UnprocessedOutput) -> EngineMode {
+    match unprocessed_output {
+        UnprocessedOutput::RawMicrophone => EngineMode::RawFallback,
+        UnprocessedOutput::Silence => EngineMode::Muted,
+    }
+}
+
 fn initial_detail(mode: EngineMode) -> &'static str {
     match mode {
         EngineMode::Converging => "AEC3 is converging",
         EngineMode::Active => "realtime microphone processing is active",
-        EngineMode::RawFallback => "raw microphone fallback is active",
-        EngineMode::SafeMode => "engine safe mode is active; microphone output is muted",
-        EngineMode::Muted => "microphone output is muted after a DSP failure",
+        EngineMode::RawFallback => "not processing; sending the unprocessed microphone",
+        EngineMode::SafeMode => "engine safe mode is active; nothing is being processed",
+        EngineMode::Muted => "not processing; the virtual microphone is silent",
         _ => "audio engine state changed",
     }
-}
-
-fn set_worker_error(runtime: &Mutex<RuntimeSnapshot>, message: &str) {
-    let mut state = lock_unpoisoned(runtime);
-    state.mode = EngineMode::Error;
-    state.detail = "audio engine is waiting to reconnect".to_owned();
-    state.active_route = None;
-    state.warning = Some(message.to_owned());
-    state.configuration_issue = None;
-}
-
-fn set_configuration_issue(runtime: &Mutex<RuntimeSnapshot>, issue: ConfigurationIssue) {
-    let mut state = lock_unpoisoned(runtime);
-    state.mode = EngineMode::Sleeping;
-    state.detail = "physical microphone selection is required".to_owned();
-    state.active_route = None;
-    state.warning = None;
-    state.configuration_issue = Some(issue);
-    state.device_profile = None;
-    state.effective_dsp = None;
-}
-
-fn replace_runtime(
-    runtime: &Mutex<RuntimeSnapshot>,
-    mode: EngineMode,
-    detail: &str,
-    active_route: Option<ActiveRoute>,
-    metrics: EngineMetrics,
-    warning: Option<String>,
-) {
-    let mut state = lock_unpoisoned(runtime);
-    state.mode = mode;
-    state.detail = detail.to_owned();
-    state.active_route = active_route;
-    state.metrics = metrics;
-    state.warning = warning;
-    state.configuration_issue = None;
-}
-
-fn set_runtime_profile(
-    runtime: &Mutex<RuntimeSnapshot>,
-    device_profile: ActiveDeviceProfile,
-    effective_dsp: DspSettings,
-) {
-    let mut state = lock_unpoisoned(runtime);
-    state.device_profile = Some(device_profile);
-    state.effective_dsp = Some(effective_dsp);
 }
 
 fn wait_for_stop(stop: &AtomicBool, duration: Duration) -> bool {
@@ -1241,40 +1781,196 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn realtime_timing_faults(source: &DuplexSourceStream, output: &OutputSinkStream) -> u64 {
+/// Evidence that the DSP thread itself is falling behind: the source rings only overflow when nothing
+/// drains them in time.
+///
+/// Device-side events are deliberately excluded. Dropped driver packets, output interruptions and
+/// output queue overflows say something about the device or its wireless link, not about how fast this
+/// process is — a Bluetooth headset that stalls its microphone starves the output no matter how much
+/// DSP is bypassed, so feeding those events into the degradation ladder both misdiagnoses the cause
+/// and makes the result worse (it drops echo cancellation on exactly the link that needs it). They are
+/// reported as device instability instead.
+fn dsp_backlog_events(source: &DuplexSourceStream) -> u64 {
     let source = source.counters();
-    let output = output.counters();
     source
         .render_overflows
         .saturating_add(source.capture_overflows)
-        .saturating_add(source.data_discontinuities)
-        .saturating_add(output.underrun_events)
-        .saturating_add(output.queue_overflows)
+}
+
+/// Device-side events counted over one status window. They are reported instead of being treated as
+/// CPU overload, because no amount of bypassed DSP makes a stalling device deliver audio on time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DeviceInstability {
+    dropped_packets: u64,
+    output_interruptions: u64,
+}
+
+impl DeviceInstability {
+    fn since(
+        reported_discontinuities: &mut u64,
+        discontinuities: u64,
+        reported_output_underruns: &mut u64,
+        output_underruns: u64,
+    ) -> Self {
+        let instability = Self {
+            dropped_packets: discontinuities.saturating_sub(*reported_discontinuities),
+            output_interruptions: output_underruns.saturating_sub(*reported_output_underruns),
+        };
+        *reported_discontinuities = discontinuities;
+        *reported_output_underruns = output_underruns;
+        instability
+    }
+
+    fn detected(&self) -> bool {
+        self.dropped_packets > 0 || self.output_interruptions > 0
+    }
 }
 
 fn combine_runtime_warnings(
     dsp_warning: Option<String>,
     load_mode: ProcessingLoadMode,
-    failure_policy: DspFailurePolicy,
+    unprocessed_output: UnprocessedOutput,
+    instability: DeviceInstability,
 ) -> Option<String> {
-    let overload_warning = match (load_mode, failure_policy) {
+    let overload_warning = match (load_mode, unprocessed_output) {
         (ProcessingLoadMode::Full, _) => None,
         (ProcessingLoadMode::Reduced, _) => {
-            Some("CPU overload: AGC2 is temporarily bypassed while AEC and noise removal continue")
+            Some("CPU overload: AGC2 is temporarily bypassed while AEC and noise removal continue".to_owned())
         }
-        (ProcessingLoadMode::Protection, DspFailurePolicy::RawPassthrough) => Some(
-            "CPU overload protection: sending the unprocessed microphone until realtime scheduling stabilizes",
+        (ProcessingLoadMode::Protection, UnprocessedOutput::RawMicrophone) => Some(
+            "CPU overload protection: sending the unprocessed microphone until realtime scheduling stabilizes".to_owned(),
         ),
-        (ProcessingLoadMode::Protection, DspFailurePolicy::Mute) => Some(
-            "CPU overload protection: microphone output is muted until realtime scheduling stabilizes",
+        (ProcessingLoadMode::Protection, UnprocessedOutput::Silence) => Some(
+            "CPU overload protection: microphone output is silent until realtime scheduling stabilizes".to_owned(),
         ),
     };
-    match (dsp_warning, overload_warning) {
-        (Some(dsp), Some(overload)) => Some(format!("{dsp}; {overload}")),
-        (Some(dsp), None) => Some(dsp),
-        (None, Some(overload)) => Some(overload.to_owned()),
-        (None, None) => None,
+    let device_warning = instability.detected().then(|| {
+        format!(
+            "audio device instability: the driver dropped {} packet(s) and the virtual microphone was interrupted {} time(s) in the last second; this is the device or its wireless link, not CPU load",
+            instability.dropped_packets, instability.output_interruptions
+        )
+    });
+    let mut warnings = [dsp_warning, overload_warning, device_warning]
+        .into_iter()
+        .flatten();
+    let first = warnings.next()?;
+    Some(warnings.fold(first, |combined, warning| format!("{combined}; {warning}")))
+}
+
+/// Coalesces echo path rebuild requests. Every request is honoured within one interval, and a device
+/// that drops packets continuously cannot make AEC3 spend the session reinitializing.
+#[derive(Debug, Default)]
+struct EchoPathResetLimiter {
+    pending: bool,
+    last_reset: Option<Instant>,
+}
+
+impl EchoPathResetLimiter {
+    fn request(&mut self) {
+        self.pending = true;
     }
+
+    fn take_due(&mut self, now: Instant) -> bool {
+        if !self.pending {
+            return false;
+        }
+        if self
+            .last_reset
+            .is_some_and(|last| now.duration_since(last) < ECHO_PATH_RESET_MIN_INTERVAL)
+        {
+            return false;
+        }
+        self.pending = false;
+        self.last_reset = Some(now);
+        true
+    }
+}
+
+/// The one-second publishing window both session loops keep: when to publish next, plus the peaks and
+/// the backlog high-water mark accumulated since the last publish.
+#[derive(Debug)]
+struct StatusWindow {
+    last_update: Instant,
+    input_peak_dbfs: Option<f32>,
+    output_peak_dbfs: Option<f32>,
+    backlog_blocks: usize,
+}
+
+impl StatusWindow {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_update: now,
+            input_peak_dbfs: None,
+            output_peak_dbfs: None,
+            backlog_blocks: 0,
+        }
+    }
+
+    fn observe_input_peak(&mut self, peak_dbfs: f32) {
+        self.input_peak_dbfs = max_level(self.input_peak_dbfs, peak_dbfs);
+    }
+
+    fn observe_output_peak(&mut self, peak_dbfs: f32) {
+        self.output_peak_dbfs = max_level(self.output_peak_dbfs, peak_dbfs);
+    }
+
+    fn observe_backlog(&mut self, blocks: usize) {
+        self.backlog_blocks = self.backlog_blocks.max(blocks);
+    }
+
+    /// True once per interval, and starts the next window. The timestamp comes from the caller so this
+    /// is testable without sleeping; starting the next window here rather than after the publish keeps
+    /// the cadence from drifting by however long publishing took.
+    fn due(&mut self, now: Instant) -> bool {
+        if now.duration_since(self.last_update) < STATUS_UPDATE_INTERVAL {
+            return false;
+        }
+        self.last_update = now;
+        true
+    }
+
+    fn take_input_peak(&mut self) -> Option<f32> {
+        self.input_peak_dbfs.take()
+    }
+
+    /// `None` when nothing was ever observed, which is how a session with no output at all reports
+    /// that it has no output peak rather than echoing the input's.
+    fn take_output_peak(&mut self) -> Option<f32> {
+        self.output_peak_dbfs.take()
+    }
+
+    fn take_backlog_blocks(&mut self) -> usize {
+        std::mem::take(&mut self.backlog_blocks)
+    }
+}
+
+/// The part of the one-second publish that is identical in both session loops: device counters and the
+/// latency breakdown. Peaks stay with the callers — what an output peak means differs between them.
+fn apply_device_metrics(
+    metrics: &mut EngineMetrics,
+    source: &SourceCountersSnapshot,
+    output: &OutputCountersSnapshot,
+    output_stream_latency_100ns: u64,
+    processing_latency_frames: usize,
+    window: &mut StatusWindow,
+) {
+    // A capture-only source never increments the render counters, so this stays 0 for an idle session.
+    metrics.render_overflows = source.render_overflows;
+    metrics.capture_overflows = source.capture_overflows;
+    metrics.device_discontinuities = source.data_discontinuities;
+    metrics.output_underruns = output.underrun_events;
+    metrics.output_queue_overflows = output.queue_overflows;
+    metrics.output_queue_depth_ms =
+        output.queue_depth_frames as f32 * 1_000.0 / xmic_engine_core::DSP_SAMPLE_RATE_HZ as f32;
+    metrics.output_rate_adjustment_ppm = output.rate_adjustment_ppm as f32;
+    latency_breakdown(
+        processing_latency_frames,
+        source.capture_packet_lag_100ns,
+        window.take_backlog_blocks(),
+        output,
+        output_stream_latency_100ns,
+    )
+    .apply(metrics);
 }
 
 /// Added microphone latency the user can act on, split into the segment that is measured on the way
@@ -1338,287 +2034,9 @@ fn clear_dsp_metrics(metrics: &mut EngineMetrics) {
     metrics.echo_guard_active = None;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ProcessingLoadTransition {
-    previous: ProcessingLoadMode,
-    current: ProcessingLoadMode,
-}
-
-struct ProcessingOverloadController {
-    mode: ProcessingLoadMode,
-    reduced_stage_available: bool,
-    window_frames: u32,
-    budget_exceeded: u32,
-    deadline_misses: u32,
-    timing_faults: u32,
-    overloaded_windows: u32,
-    stable_windows: u32,
-}
-
-impl ProcessingOverloadController {
-    fn new(reduced_stage_available: bool) -> Self {
-        Self {
-            mode: ProcessingLoadMode::Full,
-            reduced_stage_available,
-            window_frames: 0,
-            budget_exceeded: 0,
-            deadline_misses: 0,
-            timing_faults: 0,
-            overloaded_windows: 0,
-            stable_windows: 0,
-        }
-    }
-
-    fn mode(&self) -> ProcessingLoadMode {
-        self.mode
-    }
-
-    fn observe(
-        &mut self,
-        processing_time: Duration,
-        timing_fault: bool,
-    ) -> Option<ProcessingLoadTransition> {
-        let processing_us = u64::try_from(processing_time.as_micros()).unwrap_or(u64::MAX);
-        self.window_frames = self.window_frames.saturating_add(1);
-        if processing_us > PROCESSING_BUDGET_US {
-            self.budget_exceeded = self.budget_exceeded.saturating_add(1);
-        }
-        if processing_us > PROCESSING_DEADLINE_US {
-            self.deadline_misses = self.deadline_misses.saturating_add(1);
-        }
-        if timing_fault {
-            self.timing_faults = self.timing_faults.saturating_add(1);
-        }
-        if self.window_frames < OVERLOAD_WINDOW_FRAMES {
-            return None;
-        }
-
-        let overloaded = self.budget_exceeded >= OVERLOAD_BUDGET_BLOCKS_PER_WINDOW
-            || self.deadline_misses >= OVERLOAD_DEADLINES_PER_WINDOW
-            || self.timing_faults >= OVERLOAD_TIMING_FAULTS_PER_WINDOW;
-        let stable =
-            self.budget_exceeded == 0 && self.deadline_misses == 0 && self.timing_faults == 0;
-        self.window_frames = 0;
-        self.budget_exceeded = 0;
-        self.deadline_misses = 0;
-        self.timing_faults = 0;
-
-        if overloaded {
-            self.overloaded_windows = self.overloaded_windows.saturating_add(1);
-            self.stable_windows = 0;
-        } else if stable {
-            self.stable_windows = self.stable_windows.saturating_add(1);
-            self.overloaded_windows = 0;
-        } else {
-            self.overloaded_windows = 0;
-            self.stable_windows = 0;
-        }
-
-        let previous = self.mode;
-        if self.overloaded_windows >= OVERLOAD_WINDOWS_TO_ESCALATE {
-            self.mode = match self.mode {
-                ProcessingLoadMode::Full if self.reduced_stage_available => {
-                    ProcessingLoadMode::Reduced
-                }
-                ProcessingLoadMode::Full => ProcessingLoadMode::Protection,
-                ProcessingLoadMode::Reduced | ProcessingLoadMode::Protection => {
-                    ProcessingLoadMode::Protection
-                }
-            };
-            self.overloaded_windows = 0;
-        } else if self.stable_windows >= STABLE_WINDOWS_TO_RECOVER {
-            self.mode = match self.mode {
-                ProcessingLoadMode::Protection if self.reduced_stage_available => {
-                    ProcessingLoadMode::Reduced
-                }
-                ProcessingLoadMode::Protection => ProcessingLoadMode::Full,
-                ProcessingLoadMode::Reduced | ProcessingLoadMode::Full => ProcessingLoadMode::Full,
-            };
-            self.stable_windows = 0;
-        }
-
-        (self.mode != previous).then_some(ProcessingLoadTransition {
-            previous,
-            current: self.mode,
-        })
-    }
-}
-
-struct ProcessingHistogram {
-    bins: [u64; PROCESSING_HISTOGRAM_BINS],
-    total: u64,
-    max_us: u64,
-    deadline_misses: u64,
-}
-
-impl Default for ProcessingHistogram {
-    fn default() -> Self {
-        Self {
-            bins: [0; PROCESSING_HISTOGRAM_BINS],
-            total: 0,
-            max_us: 0,
-            deadline_misses: 0,
-        }
-    }
-}
-
-impl ProcessingHistogram {
-    fn observe(&mut self, duration: Duration) {
-        let microseconds = duration.as_micros().min(u128::from(u64::MAX)) as u64;
-        let bin = (microseconds.saturating_sub(1) / PROCESSING_HISTOGRAM_BIN_US)
-            .min((PROCESSING_HISTOGRAM_BINS - 1) as u64) as usize;
-        self.bins[bin] = self.bins[bin].saturating_add(1);
-        self.total = self.total.saturating_add(1);
-        self.max_us = self.max_us.max(microseconds);
-        if microseconds > PROCESSING_DEADLINE_US {
-            self.deadline_misses = self.deadline_misses.saturating_add(1);
-        }
-    }
-
-    fn p99_us(&self) -> f64 {
-        if self.total == 0 {
-            return 0.0;
-        }
-        let target = self.total.saturating_mul(99).div_ceil(100);
-        let mut cumulative = 0u64;
-        for (index, count) in self.bins.iter().copied().enumerate() {
-            cumulative = cumulative.saturating_add(count);
-            if cumulative >= target {
-                return ((index as u64 + 1) * PROCESSING_HISTOGRAM_BIN_US) as f64;
-            }
-        }
-        (PROCESSING_HISTOGRAM_BINS as u64 * PROCESSING_HISTOGRAM_BIN_US) as f64
-    }
-
-    fn max_us(&self) -> u64 {
-        self.max_us
-    }
-
-    fn deadline_misses(&self) -> u64 {
-        self.deadline_misses
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xmic_platform_api::DataFlow;
-
-    fn endpoint(id: &str, group_id: Option<&str>) -> EndpointDescriptor {
-        EndpointDescriptor {
-            platform: "windows".to_owned(),
-            id: id.to_owned(),
-            group_id: group_id.map(str::to_owned),
-            friendly_name: "CABLE Input (VB-Audio Virtual Cable)".to_owned(),
-            flow: DataFlow::Render,
-            default_roles: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn default_render_conflict_explains_how_to_fix_windows_routing() {
-        let render = endpoint("cable-input", Some("cable-group"));
-        let output = endpoint("cable-input", Some("cable-group"));
-        let message = render_output_conflict_message(&render, &output, true)
-            .expect("matching endpoint should be rejected");
-
-        assert!(message.contains("Windows 默认播放设备"));
-        assert!(message.contains("CABLE Input"));
-        assert!(message.contains("音响或耳机"));
-    }
-
-    #[test]
-    fn distinct_render_and_output_endpoints_do_not_conflict() {
-        let render = endpoint("speakers", Some("speaker-group"));
-        let output = endpoint("cable-input", Some("cable-group"));
-        assert_eq!(render_output_conflict_message(&render, &output, true), None);
-    }
-
-    #[test]
-    fn endpoints_in_the_same_device_group_conflict_even_with_different_ids() {
-        let render = endpoint("speaker-output-a", Some("physical-device"));
-        let output = endpoint("speaker-output-b", Some("physical-device"));
-
-        assert!(render_output_conflict_message(&render, &output, false).is_some());
-    }
-
-    #[test]
-    fn processing_histogram_reports_tail_without_allocations() {
-        let mut histogram = ProcessingHistogram::default();
-        for _ in 0..99 {
-            histogram.observe(Duration::from_micros(100));
-        }
-        histogram.observe(Duration::from_micros(500));
-
-        assert_eq!(histogram.p99_us(), 100.0);
-        assert_eq!(histogram.max_us(), 500);
-        assert_eq!(histogram.deadline_misses(), 0);
-    }
-
-    #[test]
-    fn processing_histogram_reports_deadline_misses_beyond_ten_ms() {
-        let mut histogram = ProcessingHistogram::default();
-        histogram.observe(Duration::from_micros(18_750));
-
-        assert_eq!(histogram.p99_us(), 18_750.0);
-        assert_eq!(histogram.max_us(), 18_750);
-        assert_eq!(histogram.deadline_misses(), 1);
-    }
-
-    #[test]
-    fn sustained_overload_escalates_and_stable_windows_recover() {
-        let mut controller = ProcessingOverloadController::new(true);
-
-        for _ in 0..(OVERLOAD_WINDOW_FRAMES * OVERLOAD_WINDOWS_TO_ESCALATE) {
-            controller.observe(Duration::from_millis(5), false);
-        }
-        assert_eq!(controller.mode(), ProcessingLoadMode::Reduced);
-
-        for _ in 0..(OVERLOAD_WINDOW_FRAMES * OVERLOAD_WINDOWS_TO_ESCALATE) {
-            controller.observe(Duration::from_millis(5), false);
-        }
-        assert_eq!(controller.mode(), ProcessingLoadMode::Protection);
-
-        for _ in 0..(OVERLOAD_WINDOW_FRAMES * STABLE_WINDOWS_TO_RECOVER) {
-            controller.observe(Duration::from_micros(200), false);
-        }
-        assert_eq!(controller.mode(), ProcessingLoadMode::Reduced);
-
-        for _ in 0..(OVERLOAD_WINDOW_FRAMES * STABLE_WINDOWS_TO_RECOVER) {
-            controller.observe(Duration::from_micros(200), false);
-        }
-        assert_eq!(controller.mode(), ProcessingLoadMode::Full);
-    }
-
-    #[test]
-    fn isolated_slow_frames_do_not_trigger_degradation() {
-        let mut controller = ProcessingOverloadController::new(true);
-        for frame in 0..(OVERLOAD_WINDOW_FRAMES * 4) {
-            let duration = if frame % OVERLOAD_WINDOW_FRAMES == 0 {
-                Duration::from_millis(5)
-            } else {
-                Duration::from_micros(200)
-            };
-            controller.observe(duration, false);
-        }
-
-        assert_eq!(controller.mode(), ProcessingLoadMode::Full);
-    }
-
-    #[test]
-    fn overload_skips_the_reduced_stage_when_agc2_is_disabled() {
-        let mut controller = ProcessingOverloadController::new(false);
-
-        for _ in 0..(OVERLOAD_WINDOW_FRAMES * OVERLOAD_WINDOWS_TO_ESCALATE) {
-            controller.observe(Duration::from_millis(5), false);
-        }
-        assert_eq!(controller.mode(), ProcessingLoadMode::Protection);
-
-        for _ in 0..(OVERLOAD_WINDOW_FRAMES * STABLE_WINDOWS_TO_RECOVER) {
-            controller.observe(Duration::from_micros(200), false);
-        }
-        assert_eq!(controller.mode(), ProcessingLoadMode::Full);
-    }
 
     #[test]
     fn render_interleave_preserves_stereo_order() {
@@ -1718,23 +2136,419 @@ mod tests {
     }
 
     #[test]
-    fn overload_protection_warning_follows_the_failure_policy() {
-        let muted =
-            combine_runtime_warnings(None, ProcessingLoadMode::Protection, DspFailurePolicy::Mute)
-                .unwrap();
+    fn overload_protection_warning_follows_the_configured_unprocessed_output() {
+        let silent = combine_runtime_warnings(
+            None,
+            ProcessingLoadMode::Protection,
+            UnprocessedOutput::Silence,
+            DeviceInstability::default(),
+        )
+        .unwrap();
         let raw = combine_runtime_warnings(
             None,
             ProcessingLoadMode::Protection,
-            DspFailurePolicy::RawPassthrough,
+            UnprocessedOutput::RawMicrophone,
+            DeviceInstability::default(),
         )
         .unwrap();
 
-        assert!(muted.contains("muted"));
+        assert!(silent.contains("silent"));
         assert!(raw.contains("unprocessed"));
         assert_eq!(
-            combine_runtime_warnings(None, ProcessingLoadMode::Full, DspFailurePolicy::Mute),
+            combine_runtime_warnings(
+                None,
+                ProcessingLoadMode::Full,
+                UnprocessedOutput::Silence,
+                DeviceInstability::default()
+            ),
             None
         );
+    }
+
+    #[test]
+    fn device_instability_is_reported_as_the_device_rather_than_cpu_load() {
+        let mut discontinuities = 40;
+        let mut output_underruns = 7;
+
+        let instability =
+            DeviceInstability::since(&mut discontinuities, 43, &mut output_underruns, 9);
+
+        assert_eq!(instability.dropped_packets, 3);
+        assert_eq!(instability.output_interruptions, 2);
+        assert_eq!(discontinuities, 43);
+        assert_eq!(output_underruns, 9);
+
+        let warning = combine_runtime_warnings(
+            None,
+            ProcessingLoadMode::Full,
+            UnprocessedOutput::RawMicrophone,
+            instability,
+        )
+        .unwrap();
+        assert!(warning.contains("audio device instability"));
+        assert!(warning.contains("not CPU load"));
+
+        // A quiet window says nothing at all.
+        assert!(
+            !DeviceInstability::since(&mut discontinuities, 43, &mut output_underruns, 9)
+                .detected()
+        );
+    }
+
+    #[test]
+    fn echo_path_rebuilds_are_coalesced_but_never_dropped() {
+        let start = Instant::now();
+        let mut limiter = EchoPathResetLimiter::default();
+
+        assert!(!limiter.take_due(start));
+
+        // The first request is honoured immediately.
+        limiter.request();
+        assert!(limiter.take_due(start));
+        assert!(!limiter.take_due(start));
+
+        // A storm of requests inside the interval collapses into one rebuild, and that rebuild still
+        // happens — a discontinuity is never silently ignored.
+        for _ in 0..50 {
+            limiter.request();
+            assert!(!limiter.take_due(start + Duration::from_millis(100)));
+        }
+        assert!(limiter.take_due(start + ECHO_PATH_RESET_MIN_INTERVAL));
+        assert!(!limiter.take_due(start + ECHO_PATH_RESET_MIN_INTERVAL * 4));
+    }
+
+    #[test]
+    fn an_idle_session_only_runs_while_the_permit_allows_it() {
+        let mut control = control_state(UnprocessedOutput::RawMicrophone);
+
+        assert_eq!(desired_idle_mode(&control), None);
+
+        control.permit.bypass_allowed = true;
+        assert_eq!(desired_idle_mode(&control), Some(IdleSessionMode::Forward));
+
+        control.settings.unprocessed_output = UnprocessedOutput::Silence;
+        assert_eq!(desired_idle_mode(&control), None);
+
+        // Silence opens the microphone for one reason only: the notice that has not been shown yet.
+        control.permit.speech_notice_needed = true;
+        assert_eq!(desired_idle_mode(&control), Some(IdleSessionMode::Listen));
+    }
+
+    #[test]
+    fn a_route_that_keeps_failing_stops_being_retried() {
+        let mut control = control_state(UnprocessedOutput::RawMicrophone);
+        control.permit.bypass_allowed = true;
+
+        control.idle_failures = IDLE_SESSION_FAILURES_BEFORE_GIVING_UP - 1;
+        assert_eq!(desired_idle_mode(&control), Some(IdleSessionMode::Forward));
+
+        control.idle_failures = IDLE_SESSION_FAILURES_BEFORE_GIVING_UP;
+        assert_eq!(desired_idle_mode(&control), None);
+    }
+
+    #[test]
+    fn the_grace_period_covers_the_stop_apply_restart_cycle() {
+        let mut control = control_state(UnprocessedOutput::RawMicrophone);
+
+        control.idle_since = Some(Instant::now());
+        assert!(!idle_grace_elapsed(&control));
+
+        control.idle_since = Some(Instant::now() - IDLE_SESSION_GRACE);
+        assert!(idle_grace_elapsed(&control));
+    }
+
+    #[test]
+    fn safe_mode_and_protection_report_the_configured_unprocessed_output() {
+        assert_eq!(
+            unprocessed_engine_mode(UnprocessedOutput::RawMicrophone),
+            EngineMode::RawFallback
+        );
+        assert_eq!(
+            unprocessed_engine_mode(UnprocessedOutput::Silence),
+            EngineMode::Muted
+        );
+    }
+
+    #[test]
+    fn a_session_with_no_output_reports_no_output_peak() {
+        // Listen mode opens the microphone only to hear speech nobody is processing. There is no
+        // output, so reporting the input's peak as the output's would be a lie — and the idle loop used
+        // to keep that distinction in an `Option::and` at the publish site rather than in the window.
+        let now = Instant::now();
+        let mut listening = StatusWindow::new(now);
+        listening.observe_input_peak(-12.0);
+
+        assert_eq!(listening.take_input_peak(), Some(-12.0));
+        assert_eq!(listening.take_output_peak(), None);
+
+        let mut forwarding = StatusWindow::new(now);
+        forwarding.observe_input_peak(-12.0);
+        forwarding.observe_output_peak(-12.0);
+
+        assert_eq!(forwarding.take_output_peak(), Some(-12.0));
+    }
+
+    #[test]
+    fn the_window_keeps_high_water_marks_and_empties_on_publish() {
+        let mut window = StatusWindow::new(Instant::now());
+        for peak in [-30.0, -6.0, -20.0] {
+            window.observe_input_peak(peak);
+        }
+        for blocks in [2, 5, 1] {
+            window.observe_backlog(blocks);
+        }
+
+        assert_eq!(window.take_input_peak(), Some(-6.0));
+        assert_eq!(window.take_backlog_blocks(), 5);
+
+        // The next window starts empty, or a quiet second would report the previous one's peak.
+        assert_eq!(window.take_input_peak(), None);
+        assert_eq!(window.take_backlog_blocks(), 0);
+    }
+
+    #[test]
+    fn the_window_publishes_once_per_interval() {
+        let start = Instant::now();
+        let mut window = StatusWindow::new(start);
+
+        assert!(!window.due(start));
+        assert!(!window.due(start + STATUS_UPDATE_INTERVAL - Duration::from_millis(1)));
+        assert!(window.due(start + STATUS_UPDATE_INTERVAL));
+        // Publishing restarts the window instead of letting the next one fall due immediately.
+        assert!(!window.due(start + STATUS_UPDATE_INTERVAL));
+        assert!(window.due(start + STATUS_UPDATE_INTERVAL * 2));
+    }
+
+    fn snapshot_with_profile() -> RuntimeSnapshot {
+        let mut snapshot = RuntimeSnapshot::default();
+        snapshot.set_profile(
+            ActiveDeviceProfile {
+                render_endpoint_id: "cable-input".to_owned(),
+                capture_endpoint_id: "microphone".to_owned(),
+                customized: true,
+            },
+            DspSettings::default(),
+        );
+        snapshot
+    }
+
+    /// Editing the DSP settings of the pair that was last active has to keep working after the engine
+    /// stops: `status()` reports `effective_dsp` as the settings and `update_settings` writes back into
+    /// the profile `device_profile` names. That feature is nothing more than these two fields surviving
+    /// the publish calls below, which is not obvious from reading them — it is the absence of two
+    /// assignments.
+    #[test]
+    fn stopping_a_session_keeps_the_device_profile_editable() {
+        let mut snapshot = snapshot_with_profile();
+
+        snapshot.publish_session(
+            EngineMode::Sleeping,
+            "audio engine is stopped",
+            None,
+            EngineMetrics::default(),
+            None,
+        );
+
+        assert!(snapshot.device_profile.is_some());
+        assert!(snapshot.effective_dsp.is_some());
+
+        // And while the worker is between retries.
+        snapshot.fail("the realtime worker exited unexpectedly");
+
+        assert!(snapshot.device_profile.is_some());
+        assert!(snapshot.effective_dsp.is_some());
+    }
+
+    #[test]
+    fn an_unusable_route_drops_the_device_profile() {
+        let mut snapshot = snapshot_with_profile();
+
+        snapshot.require_configuration(ConfigurationIssue::PhysicalCaptureRequired {
+            virtual_capture_endpoint_id: Some("cable-output".to_owned()),
+        });
+
+        // The profile was resolved for a pair this route can no longer use.
+        assert!(snapshot.device_profile.is_none());
+        assert!(snapshot.effective_dsp.is_none());
+    }
+
+    /// A reconnect must not reset the counters the UI has been showing.
+    #[test]
+    fn a_failed_session_keeps_the_metrics_it_had() {
+        let mut snapshot = RuntimeSnapshot::default();
+        snapshot.publish_session(
+            EngineMode::Active,
+            "realtime microphone processing is active",
+            None,
+            EngineMetrics {
+                processed_blocks: 4_242,
+                ..EngineMetrics::default()
+            },
+            None,
+        );
+
+        snapshot.fail("a WASAPI worker stopped unexpectedly");
+
+        assert_eq!(snapshot.metrics.processed_blocks, 4_242);
+    }
+
+    fn health(failed: bool, recovery_mute_until: Option<Instant>) -> DspHealth {
+        DspHealth {
+            failed,
+            warning: None,
+            recovery_mute_until,
+        }
+    }
+
+    /// Exhausts every state `decide` can be asked about and asserts the relationships that have to
+    /// hold, rather than a table of expected answers.
+    ///
+    /// The first invariant is the one that matters: earlier builds could leave the tray
+    /// reporting processing while a DSP failure kept the output muted. Nothing at the time could have
+    /// caught that, because the two answers were derived independently 130 lines apart.
+    #[test]
+    fn the_reported_mode_never_lies_about_what_goes_out() {
+        let now = Instant::now();
+        let mut combinations = 0;
+        for safe_mode in [false, true] {
+            for failed in [false, true] {
+                for load in [
+                    ProcessingLoadMode::Full,
+                    ProcessingLoadMode::Reduced,
+                    ProcessingLoadMode::Protection,
+                ] {
+                    for recovery_mute_until in [None, Some(now + Duration::from_secs(1))] {
+                        for session_elapsed in [Duration::from_millis(500), CONVERGENCE_TIME * 3] {
+                            for unprocessed_output in
+                                [UnprocessedOutput::RawMicrophone, UnprocessedOutput::Silence]
+                            {
+                                combinations += 1;
+                                let decision = decide(
+                                    safe_mode,
+                                    &health(failed, recovery_mute_until),
+                                    load,
+                                    session_elapsed,
+                                    now,
+                                    unprocessed_output,
+                                );
+                                let context = format!(
+                                    "safe_mode={safe_mode} failed={failed} load={load:?} recovering={} elapsed={session_elapsed:?} unprocessed_output={unprocessed_output:?}",
+                                    recovery_mute_until.is_some()
+                                );
+
+                                // Reporting "active" has to mean the processed signal is what left.
+                                if decision.mode == EngineMode::Active {
+                                    assert_eq!(
+                                        decision.source,
+                                        OutputSource::Processed,
+                                        "{context}"
+                                    );
+                                }
+                                // A rebuilt canceller has not reconverged, so nothing goes out at all.
+                                if recovery_mute_until.is_some() {
+                                    assert_eq!(decision.source, OutputSource::Silence, "{context}");
+                                }
+                                // Not processing and not warming up: the configured output decides.
+                                if decision.unprocessed && recovery_mute_until.is_none() {
+                                    let expected = match unprocessed_output {
+                                        UnprocessedOutput::RawMicrophone => {
+                                            OutputSource::AlignedRaw
+                                        }
+                                        UnprocessedOutput::Silence => OutputSource::Silence,
+                                    };
+                                    assert_eq!(decision.source, expected, "{context}");
+                                }
+                                // Safe mode outranks every other explanation.
+                                if safe_mode {
+                                    assert_eq!(decision.mode, EngineMode::SafeMode, "{context}");
+                                }
+                                // The flag the speech probe reads and the mode the UI shows have to
+                                // tell the same story about whether anything is being processed.
+                                assert_eq!(
+                                    decision.unprocessed,
+                                    matches!(
+                                        decision.mode,
+                                        EngineMode::SafeMode
+                                            | EngineMode::RawFallback
+                                            | EngineMode::Muted
+                                    ),
+                                    "{context}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(combinations, 96);
+    }
+
+    /// The one place the two convergence windows deliberately disagree. Both report `Converging`, but
+    /// the initial one keeps sending processed audio because AEC3 converges *on* real audio, while the
+    /// post-recovery one mutes because the canceller it just rebuilt would leak echo.
+    #[test]
+    fn only_the_post_recovery_window_mutes_while_converging() {
+        let now = Instant::now();
+
+        let initial = decide(
+            false,
+            &health(false, None),
+            ProcessingLoadMode::Full,
+            Duration::from_millis(500),
+            now,
+            UnprocessedOutput::Silence,
+        );
+        let after_recovery = decide(
+            false,
+            &health(false, Some(now + Duration::from_secs(1))),
+            ProcessingLoadMode::Full,
+            CONVERGENCE_TIME * 3,
+            now,
+            UnprocessedOutput::Silence,
+        );
+
+        assert_eq!(
+            (initial.source, initial.mode),
+            (OutputSource::Processed, EngineMode::Converging)
+        );
+        assert_eq!(
+            (after_recovery.source, after_recovery.mode),
+            (OutputSource::Silence, EngineMode::Converging)
+        );
+    }
+
+    #[test]
+    fn a_dsp_failure_is_always_reported_three_ways() {
+        let mut metrics = EngineMetrics::default();
+        let mut state = health(false, None);
+
+        state.fail(&mut metrics, "boom".to_owned());
+
+        assert!(state.failed);
+        assert_eq!(state.warning.as_deref(), Some("boom"));
+        assert_eq!(metrics.dsp_failures, 1);
+
+        // A warning is not a failure: it replaces the message and touches nothing else.
+        state.warn("still noisy".to_owned());
+
+        assert_eq!(state.warning.as_deref(), Some("still noisy"));
+        assert!(state.failed);
+        assert_eq!(metrics.dsp_failures, 1);
+    }
+
+    fn control_state(unprocessed_output: UnprocessedOutput) -> ControlState {
+        ControlState {
+            settings: EngineSettings {
+                unprocessed_output,
+                output_endpoint_id: Some("cable-input".to_owned()),
+                ..EngineSettings::default()
+            },
+            worker: None,
+            idle: None,
+            permit: IdleSessionPermit::default(),
+            idle_since: Some(Instant::now() - IDLE_SESSION_GRACE),
+            idle_failures: 0,
+        }
     }
 
     #[test]

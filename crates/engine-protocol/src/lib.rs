@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use xmic_platform_api::EndpointDescriptor;
 
-pub const PROTOCOL_VERSION: u16 = 13;
+pub const PROTOCOL_VERSION: u16 = 17;
 pub const MAX_CAPTURE_CHANNEL_INDEX: usize = 31;
 pub const MAX_TRUSTED_VIRTUAL_AUDIO_PAIRS: usize = 32;
 
@@ -34,12 +34,17 @@ pub enum AecPreset {
     Strong,
 }
 
+/// What the virtual microphone carries whenever XMic is not processing: a DSP failure, CPU overload
+/// protection, safe mode, or simply no processing session at all. The `serde` aliases keep settings
+/// files written by builds that called this the "DSP failure policy" loadable.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum DspFailurePolicy {
-    RawPassthrough,
+pub enum UnprocessedOutput {
+    #[serde(alias = "rawPassthrough")]
+    RawMicrophone,
     #[default]
-    Mute,
+    #[serde(alias = "mute")]
+    Silence,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,7 +253,8 @@ pub struct EngineSettings {
     pub virtual_device_mode: Option<VirtualDeviceMode>,
     pub virtual_capture_endpoint_id: Option<String>,
     pub trusted_virtual_audio_pairs: Vec<TrustedVirtualAudioPair>,
-    pub failure_policy: DspFailurePolicy,
+    #[serde(alias = "failurePolicy")]
+    pub unprocessed_output: UnprocessedOutput,
     pub dsp: DspSettings,
 }
 
@@ -263,7 +269,7 @@ impl Default for EngineSettings {
             virtual_device_mode: None,
             virtual_capture_endpoint_id: None,
             trusted_virtual_audio_pairs: Vec::new(),
-            failure_policy: DspFailurePolicy::Mute,
+            unprocessed_output: UnprocessedOutput::Silence,
             dsp: DspSettings::default(),
         }
     }
@@ -421,7 +427,11 @@ pub enum VirtualRouteConflictKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum ConfigurationIssue {
     PhysicalCaptureRequired {
         virtual_capture_endpoint_id: Option<String>,
@@ -442,6 +452,10 @@ pub struct EngineMetrics {
     pub render_underruns: u64,
     pub render_overflows: u64,
     pub capture_overflows: u64,
+    /// Packets the audio driver reported as discontinuous — data it dropped before XMic ever saw it.
+    /// A wireless link that keeps dropping packets shows up here and nowhere else, which is why this
+    /// is published rather than folded into the overload signal.
+    pub device_discontinuities: u64,
     pub output_underruns: u64,
     pub output_queue_overflows: u64,
     pub output_queue_depth_ms: f32,
@@ -496,6 +510,8 @@ pub struct EngineStatus {
     pub running: bool,
     pub mode: EngineMode,
     pub detail: String,
+    /// Filled in by the UI process, which owns the endpoint enumeration and its cache. The helper
+    /// leaves this empty — it has no reason to enumerate devices just to answer a status poll.
     pub endpoints: Vec<EndpointDescriptor>,
     pub settings: EngineSettings,
     pub active_route: Option<ActiveRoute>,
@@ -503,6 +519,9 @@ pub struct EngineStatus {
     pub configuration_issue: Option<ConfigurationIssue>,
     pub metrics: EngineMetrics,
     pub warning: Option<String>,
+    /// Latched once the engine hears speech while the virtual microphone is not carrying processed
+    /// audio. The UI turns this into a single notification per application run.
+    pub unprocessed_speech_detected: bool,
 }
 
 impl EngineStatus {
@@ -519,16 +538,38 @@ impl EngineStatus {
             configuration_issue: None,
             metrics: EngineMetrics::default(),
             warning: None,
+            unprocessed_speech_detected: false,
         }
     }
+}
+
+/// Renewed by the UI on every status poll. Only the UI process knows whether the Windows session is
+/// usable, whether the app is exiting, and whether the one-shot "not processing" notice has already
+/// been shown, so the helper never starts an idle session on its own guesswork. A helper that has not
+/// heard from the UI yet holds the default: nothing runs, the microphone stays closed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct IdleSessionPermit {
+    /// The idle session may open audio devices; false while Windows is locked, disconnected, asleep,
+    /// or while XMic is exiting.
+    pub bypass_allowed: bool,
+    /// Speech detection is still worth running because the notice has not been shown yet.
+    pub speech_notice_needed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum EngineRequest {
-    Hello { protocol_version: u16 },
-    GetStatus { include_endpoints: bool },
-    UpdateSettings { settings: Box<EngineSettings> },
+    Hello {
+        protocol_version: u16,
+    },
+    GetStatus {
+        #[serde(default)]
+        permit: IdleSessionPermit,
+    },
+    UpdateSettings {
+        settings: Box<EngineSettings>,
+    },
     Start,
     Stop,
     Shutdown,
@@ -563,8 +604,92 @@ mod tests {
         assert_eq!(settings.dsp.vad_gate.confirmation_ms, 40);
         assert_eq!(settings.dsp.vad_gate.floor_db, -20.0);
         assert_eq!(settings.dsp.limiter.ceiling_dbfs, -1.0);
-        assert_eq!(settings.failure_policy, DspFailurePolicy::Mute);
+        assert_eq!(settings.unprocessed_output, UnprocessedOutput::Silence);
         assert_eq!(settings.capture_channel, None);
+    }
+
+    #[test]
+    fn settings_written_as_a_dsp_failure_policy_still_load() {
+        let mut value = serde_json::to_value(EngineSettings::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("unprocessedOutput");
+        object.insert("failurePolicy".to_owned(), "rawPassthrough".into());
+
+        let settings: EngineSettings = serde_json::from_value(value).unwrap();
+
+        assert_eq!(
+            settings.unprocessed_output,
+            UnprocessedOutput::RawMicrophone
+        );
+    }
+
+    #[test]
+    fn the_legacy_mute_value_maps_to_silence() {
+        let settings: EngineSettings = serde_json::from_str(r#"{"failurePolicy":"mute"}"#).unwrap();
+
+        assert_eq!(settings.unprocessed_output, UnprocessedOutput::Silence);
+    }
+
+    #[test]
+    fn unprocessed_output_writes_the_current_names() {
+        let settings = EngineSettings {
+            unprocessed_output: UnprocessedOutput::RawMicrophone,
+            ..EngineSettings::default()
+        };
+
+        let encoded = serde_json::to_string(&settings).unwrap();
+
+        assert!(encoded.contains("\"unprocessedOutput\":\"rawMicrophone\""));
+        assert!(!encoded.contains("failurePolicy"));
+    }
+
+    #[test]
+    fn a_helper_without_a_permit_keeps_the_microphone_closed() {
+        // `permit` carries a `serde` default, so a request that predates it still parses — and has to
+        // parse as "nothing is allowed to run" rather than as the permissive all-false-is-false trap.
+        let request: EngineRequest = serde_json::from_str(r#"{"type":"getStatus"}"#).unwrap();
+
+        let EngineRequest::GetStatus { permit, .. } = request else {
+            panic!("expected a status request");
+        };
+        assert!(!permit.bypass_allowed);
+        assert!(!permit.speech_notice_needed);
+    }
+
+    /// `ConfigurationIssue` is the only tagged enum in this protocol whose struct-variant fields
+    /// cross into TypeScript, and `rename_all` on an enum renames variants only — the fields need
+    /// `rename_all_fields`. Without it the wire carried `virtual_capture_endpoint_id` while
+    /// `App.tsx` read `virtualCaptureEndpointId`, so an issue produced by the helper rendered its
+    /// device name as "-". The frontend recomputes the same issue from the draft and wins almost
+    /// every time, which is why that stayed invisible; this test makes sure it cannot come back.
+    #[test]
+    fn configuration_issue_fields_reach_typescript_in_camel_case() {
+        let capture = serde_json::to_string(&ConfigurationIssue::PhysicalCaptureRequired {
+            virtual_capture_endpoint_id: Some("cable-output".to_owned()),
+        })
+        .unwrap();
+        let device = serde_json::to_string(&ConfigurationIssue::VirtualDeviceRequired {
+            reason: VirtualDeviceIssueReason::CustomPairUnconfirmed,
+        })
+        .unwrap();
+        let conflict = serde_json::to_string(&ConfigurationIssue::VirtualRouteConflict {
+            kind: VirtualRouteConflictKind::DefaultRender,
+            endpoint_id: "cable-input".to_owned(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            capture,
+            r#"{"type":"physicalCaptureRequired","virtualCaptureEndpointId":"cable-output"}"#
+        );
+        assert_eq!(
+            device,
+            r#"{"type":"virtualDeviceRequired","reason":"customPairUnconfirmed"}"#
+        );
+        assert_eq!(
+            conflict,
+            r#"{"type":"virtualRouteConflict","kind":"defaultRender","endpointId":"cable-input"}"#
+        );
     }
 
     #[test]
@@ -696,5 +821,6 @@ mod tests {
         assert!(!status.running);
         assert_eq!(status.mode, EngineMode::Sleeping);
         assert_eq!(status.settings, EngineSettings::default());
+        assert!(!status.unprocessed_speech_detected);
     }
 }

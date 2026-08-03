@@ -256,6 +256,128 @@ pub fn start_duplex_source(
     })
 }
 
+#[derive(Debug, Clone)]
+pub struct CaptureSourceRequest {
+    pub capture_endpoint_id: Option<String>,
+    pub capture_channel: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CaptureSourceInfo {
+    pub capture_endpoint: EndpointDescriptor,
+    pub capture_format: AudioFormatDescriptor,
+}
+
+/// Capture without the loopback render stream. Forwarding the unprocessed microphone has no echo
+/// canceller to feed, so opening the render endpoint would cost a WASAPI thread and a resampler for
+/// audio nobody reads.
+pub struct CaptureSourceStream {
+    info: CaptureSourceInfo,
+    capture_consumer: Consumer<CaptureFrame>,
+    stop: Arc<AtomicBool>,
+    counters: Arc<SourceCounters>,
+    worker: Option<JoinHandle<Result<(), PlatformError>>>,
+}
+
+impl CaptureSourceStream {
+    pub fn info(&self) -> &CaptureSourceInfo {
+        &self.info
+    }
+
+    pub fn pop_capture(&mut self) -> Option<CaptureFrame> {
+        self.capture_consumer.pop().ok()
+    }
+
+    /// Capture frames already normalized and waiting for the reader, including the next one.
+    pub fn capture_queue_blocks(&self) -> usize {
+        self.capture_consumer.slots()
+    }
+
+    pub fn counters(&self) -> SourceCountersSnapshot {
+        self.counters.snapshot()
+    }
+
+    pub fn worker_finished(&self) -> bool {
+        self.worker.as_ref().is_some_and(JoinHandle::is_finished)
+    }
+
+    pub fn stop(mut self) -> Result<(), PlatformError> {
+        self.request_stop();
+        self.join_worker()
+    }
+
+    fn request_stop(&self) {
+        self.stop.store(true, Ordering::Release);
+    }
+
+    fn join_worker(&mut self) -> Result<(), PlatformError> {
+        let Some(worker) = self.worker.take() else {
+            return Ok(());
+        };
+        join_worker_with_timeout(worker, "WASAPI capture source worker")?
+    }
+}
+
+impl Drop for CaptureSourceStream {
+    fn drop(&mut self) {
+        self.request_stop();
+        let _ = self.join_worker();
+    }
+}
+
+pub fn start_capture_source(
+    request: CaptureSourceRequest,
+) -> Result<CaptureSourceStream, PlatformError> {
+    let (capture_producer, capture_consumer) = RingBuffer::new(SOURCE_RING_BLOCKS);
+    let stop = Arc::new(AtomicBool::new(false));
+    let counters = Arc::new(SourceCounters::default());
+
+    let capture_worker = spawn_source_worker(
+        SourceWorkerRequest {
+            flow: DataFlow::Capture,
+            endpoint_id: request.capture_endpoint_id,
+            capture_channel: request.capture_channel,
+        },
+        FrameProducer::Capture(capture_producer),
+        Arc::clone(&stop),
+        Arc::clone(&counters),
+        thread::current(),
+    );
+
+    let ready = receive_source_ready(
+        &capture_worker.ready,
+        Instant::now() + WORKER_START_TIMEOUT,
+        "capture",
+    );
+    let prepared = match ready {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            stop.store(true, Ordering::Release);
+            drop(capture_worker.handle);
+            return Err(error);
+        }
+    };
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            stop.store(true, Ordering::Release);
+            drop(capture_worker.handle);
+            return Err(PlatformError::Operation(error));
+        }
+    };
+
+    Ok(CaptureSourceStream {
+        info: CaptureSourceInfo {
+            capture_endpoint: prepared.endpoint,
+            capture_format: prepared.format,
+        },
+        capture_consumer,
+        stop,
+        counters,
+        worker: Some(capture_worker.handle),
+    })
+}
+
 fn receive_source_ready(
     receiver: &mpsc::Receiver<Result<PreparedSourceInfo, String>>,
     deadline: Instant,

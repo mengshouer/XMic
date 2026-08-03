@@ -1003,11 +1003,10 @@ dependencies = [
 
 [[package]]
 name = "event-listener"
-version = "5.4.1"
+version = "5.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e13b66accf52311f30a0db42147dadea9850cb48cd070028831ae5f5d4b856ab"
+checksum = "5a23add41df1562121a9393cb065eab5146a1242410f23a644851e90cfd669d2"
 dependencies = [
- "concurrent-queue",
  "parking",
  "pin-project-lite",
 ]
@@ -5105,7 +5104,7 @@ dependencies = [
 
 [[package]]
 name = "xmic"
-version = "0.2.0"
+version = "0.3.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -5119,11 +5118,12 @@ dependencies = [
  "xmic-engine-runtime",
  "xmic-platform-api",
  "xmic-platform-windows",
+ "xmic-rnnoise-dsp",
 ]
 
 [[package]]
 name = "xmic-audio-spike"
-version = "0.2.0"
+version = "0.3.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -5136,7 +5136,7 @@ dependencies = [
 
 [[package]]
 name = "xmic-engine-core"
-version = "0.2.0"
+version = "0.3.3"
 dependencies = [
  "audioadapter-buffers",
  "rubato",
@@ -5146,7 +5146,7 @@ dependencies = [
 
 [[package]]
 name = "xmic-engine-protocol"
-version = "0.2.0"
+version = "0.3.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -5156,7 +5156,7 @@ dependencies = [
 
 [[package]]
 name = "xmic-engine-runtime"
-version = "0.2.0"
+version = "0.3.3"
 dependencies = [
  "thiserror 2.0.19",
  "xmic-engine-core",
@@ -5167,7 +5167,7 @@ dependencies = [
 
 [[package]]
 name = "xmic-platform-api"
-version = "0.2.0"
+version = "0.3.3"
 dependencies = [
  "serde",
  "thiserror 2.0.19",
@@ -5175,7 +5175,7 @@ dependencies = [
 
 [[package]]
 name = "xmic-platform-windows"
-version = "0.2.0"
+version = "0.3.3"
 dependencies = [
  "rtrb",
  "serde",
@@ -5187,7 +5187,7 @@ dependencies = [
 
 [[package]]
 name = "xmic-rnnoise-dsp"
-version = "0.2.0"
+version = "0.3.3"
 dependencies = [
  "nnnoiseless",
  "thiserror 2.0.19",
@@ -5195,7 +5195,7 @@ dependencies = [
 
 [[package]]
 name = "xmic-webrtc-dsp"
-version = "0.2.0"
+version = "0.3.3"
 dependencies = [
  "libloading 0.8.9",
  "thiserror 2.0.19",

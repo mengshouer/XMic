@@ -35,6 +35,12 @@ const WORKER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const QPC_UNITS_PER_SECOND: i64 = 10_000_000;
 const LATENCY_SMOOTHING_SHIFT: u32 = 3;
+/// Windows hands out this well-known container ID for endpoints that belong to no device container,
+/// and GUID_NULL for drivers that leave the property unset.
+const CONTAINERLESS_DEVICE_IDS: [&str; 2] = [
+    "{00000000-0000-0000-FFFF-FFFFFFFFFFFF}",
+    "{00000000-0000-0000-0000-000000000000}",
+];
 
 /// WASAPI reports packet timestamps as performance-counter values already converted to 100 ns
 /// units, so measuring how stale a packet is when the worker sees it needs "now" in the same unit.
@@ -105,7 +111,8 @@ pub use output::{
     OutputStreamInfo,
 };
 pub use stream::{
-    start_duplex_source, DuplexSourceRequest, DuplexSourceStream, SourceCountersSnapshot,
+    start_capture_source, start_duplex_source, CaptureSourceInfo, CaptureSourceRequest,
+    CaptureSourceStream, DuplexSourceRequest, DuplexSourceStream, SourceCountersSnapshot,
     SourceStreamInfo,
 };
 pub use system_lifecycle::{start_system_lifecycle_monitor, SystemLifecycleMonitor};
@@ -218,7 +225,7 @@ fn enumerate_flow(
         output.push(EndpointDescriptor {
             platform: "windows".to_owned(),
             friendly_name: friendly_name(&device)?,
-            group_id: device_group_id(&device).ok(),
+            group_id: container_group_id(&device),
             default_roles: defaults.get(&id).cloned().unwrap_or_default(),
             id,
             flow,
@@ -245,6 +252,28 @@ fn friendly_name(device: &IMMDevice) -> Result<String, PlatformError> {
 
 fn device_group_id(device: &IMMDevice) -> Result<String, PlatformError> {
     string_property(device, &PKEY_Device_ContainerId, "container ID")
+}
+
+/// The container ID is only reported when it actually identifies a physical device.
+///
+/// Callers use a shared group to decide that two endpoints are the same piece of hardware — that is
+/// how the virtual cable's write and read ends are recognised as one device, and how a playback
+/// reference is rejected for being the virtual microphone. Windows returns a placeholder for every
+/// endpoint without a container, so passing it on made unrelated devices look identical: a virtual
+/// cable, a second virtual cable and the onboard S/PDIF output all carry the same placeholder, which
+/// turned an ordinary default-device change into a phantom feedback-route conflict.
+fn container_group_id(device: &IMMDevice) -> Option<String> {
+    device_group_id(device)
+        .ok()
+        .filter(|id| !is_placeholder_container(id))
+}
+
+fn is_placeholder_container(id: &str) -> bool {
+    let id = id.trim();
+    id.is_empty()
+        || CONTAINERLESS_DEVICE_IDS
+            .iter()
+            .any(|placeholder| id.eq_ignore_ascii_case(placeholder))
 }
 
 fn string_property(
@@ -335,5 +364,27 @@ mod tests {
 
         assert!(first > 0);
         assert!(second >= first);
+    }
+
+    #[test]
+    fn containerless_endpoints_do_not_share_a_group() {
+        // The placeholder Windows reports for endpoints without a device container, in both the casing
+        // it uses and the one a driver might, plus GUID_NULL.
+        assert!(is_placeholder_container(
+            "{00000000-0000-0000-FFFF-FFFFFFFFFFFF}"
+        ));
+        assert!(is_placeholder_container(
+            "{00000000-0000-0000-ffff-ffffffffffff}"
+        ));
+        assert!(is_placeholder_container(
+            "{00000000-0000-0000-0000-000000000000}"
+        ));
+        assert!(is_placeholder_container("  "));
+
+        // A real container has to keep grouping its endpoints, or a headset's speaker and microphone
+        // stop being recognised as one device.
+        assert!(!is_placeholder_container(
+            "{D94D4918-B1FD-5811-B71B-231CD8315B15}"
+        ));
     }
 }

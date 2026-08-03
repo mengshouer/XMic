@@ -28,3 +28,4 @@ xmic-engine-protocol = { path = "../crates/engine-protocol" }
 xmic-engine-runtime = { path = "../crates/engine-runtime" }
 xmic-platform-api = { path = "../crates/platform-api" }
 xmic-platform-windows = { path = "../crates/platform-windows" }
+xmic-rnnoise-dsp = { path = "../crates/rnnoise-dsp" }
