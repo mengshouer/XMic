@@ -1,0 +1,58 @@
+{
+  "schemaVersion": 1,
+  "subject": {
+    "name": "xmic_webrtc_dsp.dll",
+    "sha256": "e3be87704e21f62a8e55a5951151c75695f890204be4fa3c0373928878572e4d"
+  },
+  "notices": {
+    "name": "WEBRTC_THIRD_PARTY_NOTICES.txt",
+    "sha256": "7b0c1de859e7587d0f4aab411b041eb32e651cd10d99c8be25628ead0639a91d"
+  },
+  "materials": {
+    "webrtc": {
+      "repository": "https://webrtc.googlesource.com/src.git",
+      "revision": "69dfe169014664ef156db5a2599586b994b54ec7",
+      "depsBlob": "acaebfe804ce4a32825f6b5128d644bb5f1bea9a"
+    },
+    "depotTools": {
+      "repository": "https://chromium.googlesource.com/chromium/tools/depot_tools.git",
+      "revision": "1709e20d5ca2afe97bfa726168719c3b77eb9883"
+    },
+    "declaredOverlayInputs": [
+      {
+        "path": "native/webrtc-audio-processing/BUILD.gn",
+        "sha256": "bb5347759723cb13ba641e51dfc041d888fadec7a07c6621aa8701164bdba7a8"
+      },
+      {
+        "path": "native/webrtc-audio-processing/include/xmic_webrtc_dsp.h",
+        "sha256": "96615b00d78e7fa60f11a670fc48764861ac2f1c790ae0b58dec1405d0b8e0ff"
+      },
+      {
+        "path": "native/webrtc-audio-processing/src/xmic_webrtc_dsp.cc",
+        "sha256": "3db2a9d929ce35ef2eb13c135f1dc286c8115737b116db63a2468ba8ac7c2c1e"
+      }
+    ]
+  },
+  "build": {
+    "capture": "generated",
+    "platform": "windows-x64",
+    "target": "//xmic_webrtc_dsp:xmic_webrtc_dsp",
+    "gnArgs": [
+      "is_debug=false",
+      "is_component_build=false",
+      "rtc_include_tests=false",
+      "rtc_build_examples=false",
+      "rtc_build_tools=false",
+      "rtc_enable_protobuf=false",
+      "use_remoteexec=false",
+      "use_siso=false",
+      "symbol_level=0"
+    ],
+    "windowsSdkVersion": "10.0.26100.0",
+    "builder": {
+      "visualStudioVersion": "17.14.37502.11",
+      "gnVersion": "2459 (8d35b83847d1)",
+      "ninjaVersion": "1.12.1"
+    }
+  }
+}

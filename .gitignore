@@ -14,7 +14,14 @@ target
 **/target
 .tmp
 .webrtc
-artifacts
+/artifacts/*
+!/artifacts/webrtc
+/artifacts/webrtc/*
+!/artifacts/webrtc/win-x64
+/artifacts/webrtc/win-x64/*
+!/artifacts/webrtc/win-x64/xmic_webrtc_dsp.dll
+!/artifacts/webrtc/win-x64/WEBRTC_THIRD_PARTY_NOTICES.txt
+!/artifacts/webrtc/win-x64/PROVENANCE.json
 diagnostics
 *.wav
 *.local

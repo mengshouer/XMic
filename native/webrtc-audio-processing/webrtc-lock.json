@@ -1,7 +1,24 @@
 {
+  "schemaVersion": 1,
   "sourceUrl": "https://webrtc.googlesource.com/src.git",
   "sourceRevision": "69dfe169014664ef156db5a2599586b994b54ec7",
   "depsBlob": "acaebfe804ce4a32825f6b5128d644bb5f1bea9a",
   "depotToolsUrl": "https://chromium.googlesource.com/chromium/tools/depot_tools.git",
-  "depotToolsRevision": "1709e20d5ca2afe97bfa726168719c3b77eb9883"
+  "depotToolsRevision": "1709e20d5ca2afe97bfa726168719c3b77eb9883",
+  "gnTarget": "//xmic_webrtc_dsp:xmic_webrtc_dsp",
+  "gnArgs": [
+    "is_debug=false",
+    "is_component_build=false",
+    "rtc_include_tests=false",
+    "rtc_build_examples=false",
+    "rtc_build_tools=false",
+    "rtc_enable_protobuf=false",
+    "use_remoteexec=false",
+    "use_siso=false",
+    "symbol_level=0"
+  ],
+  "windowsSdkVersion": "10.0.26100.0",
+  "dllSha256": "e3be87704e21f62a8e55a5951151c75695f890204be4fa3c0373928878572e4d",
+  "noticesSha256": "7b0c1de859e7587d0f4aab411b041eb32e651cd10d99c8be25628ead0639a91d",
+  "provenanceSha256": "2daa1055431661c1f7f8951d9bc0d3b3f929a90c5be879ad5deb3a1d79f9ee5b"
 }

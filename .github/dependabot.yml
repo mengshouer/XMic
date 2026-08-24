@@ -1,0 +1,23 @@
+version: 2
+
+multi-ecosystem-groups:
+  weekly-dependencies:
+    schedule:
+      interval: weekly
+      day: monday
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    patterns: ["*"]
+    multi-ecosystem-group: weekly-dependencies
+
+  - package-ecosystem: npm
+    directory: /
+    patterns: ["*"]
+    multi-ecosystem-group: weekly-dependencies
+
+  - package-ecosystem: cargo
+    directory: /
+    patterns: ["*"]
+    multi-ecosystem-group: weekly-dependencies

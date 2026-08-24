@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check and package
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        shell: pwsh
+        run: |
+          rustup toolchain install
+          $active = (& rustup show active-toolchain) -join "`n"
+          if ($LASTEXITCODE -ne 0 -or -not $active) {
+            throw "Failed to activate the repository Rust toolchain"
+          }
+          Write-Output $active
+          rustc --version
+          cargo --version
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Install pinned Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Check Rust formatting
+        run: cargo fmt --check
+
+      - name: Lint Rust
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test Rust
+        run: cargo test --workspace --locked
+
+      - name: Test frontend and release tooling
+        run: npm test
+
+      - name: Build NSIS installer
+        run: npm run bundle
+
+      - name: Smoke-check NSIS installer
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          ./scripts/prepare-release-assets.ps1 -Version $version -OutputDirectory artifacts/ci-smoke

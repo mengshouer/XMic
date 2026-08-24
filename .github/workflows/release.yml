@@ -1,0 +1,162 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version without the v prefix (for example, 0.3.5)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Audit and build release
+    runs-on: windows-2025
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      RELEASE_TAG: v${{ inputs.version }}
+    steps:
+      - name: Validate release request
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          if ($env:GITHUB_REF -ne "refs/heads/main") {
+            throw "Release workflow must run from the main branch"
+          }
+          if ($env:RELEASE_VERSION -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Version must use MAJOR.MINOR.PATCH without a v prefix"
+          }
+
+      - name: Check out release commit
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        shell: pwsh
+        run: |
+          rustup toolchain install
+          $active = (& rustup show active-toolchain) -join "`n"
+          if ($LASTEXITCODE -ne 0 -or -not $active) {
+            throw "Failed to activate the repository Rust toolchain"
+          }
+          Write-Output $active
+          rustc --version
+          cargo --version
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Install pinned Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Audit all npm dependencies
+        run: npm audit --audit-level=high
+
+      - name: Install pinned cargo-audit
+        uses: taiki-e/install-action@c6e5a961001f7be56eec4766ed45de261826a205 # cargo-audit
+        with:
+          tool: cargo-audit@0.22.2
+
+      - name: Audit Cargo dependencies
+        run: cargo audit
+
+      - name: Build NSIS installer
+        run: npm run bundle
+
+      - name: Prepare installer and checksum
+        shell: pwsh
+        run: ./scripts/prepare-release-assets.ps1 -Version "${{ inputs.version }}"
+
+      - name: Attest installer provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: artifacts/release/*.exe
+
+      - name: Upload validated release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-assets
+          path: artifacts/release/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-draft:
+    name: Create draft release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: v${{ inputs.version }}
+      RELEASE_SHA: ${{ github.sha }}
+    steps:
+      - name: Download validated release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-assets
+          path: artifacts/release
+
+      - name: Verify downloaded installer checksum
+        working-directory: artifacts/release
+        run: sha256sum --check SHA256SUMS.txt
+
+      - name: Create tag and draft release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" > /dev/null 2>&1; then
+            echo "::error::Tag $RELEASE_TAG already exists"
+            exit 1
+          fi
+          if gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" > /dev/null 2>&1; then
+            echo "::error::Release $RELEASE_TAG already exists"
+            exit 1
+          fi
+
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          generated_notes=$(gh api \
+            --method POST \
+            "repos/$GH_REPO/releases/generate-notes" \
+            --raw-field tag_name="$RELEASE_TAG" \
+            --raw-field target_commitish="$RELEASE_SHA" \
+            --jq '.body // ""')
+          {
+            echo "> [!WARNING]"
+            echo "> The Windows installer is unsigned. Verify it with SHA256SUMS.txt before running; Windows SmartScreen may show an unknown publisher warning."
+            echo
+            printf '%s\n' "$generated_notes"
+          } > "$notes_file"
+
+          gh api --method POST "repos/$GH_REPO/git/refs" \
+            --raw-field ref="refs/tags/$RELEASE_TAG" \
+            --raw-field sha="$RELEASE_SHA" > /dev/null
+
+          gh release create "$RELEASE_TAG" artifacts/release/* \
+            --draft \
+            --notes-file "$notes_file" \
+            --title "XMic $RELEASE_TAG" \
+            --verify-tag

@@ -1,0 +1,39 @@
+# Normalize line endings
+* text=auto
+
+# Rust sources
+*.rs text eol=lf
+*.toml text eol=lf
+
+# Web sources
+*.ts text eol=lf
+*.tsx text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.json text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Native source overlays are hashed for WebRTC provenance
+*.gn text eol=lf
+*.gni text eol=lf
+*.c text eol=lf
+*.cc text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.hpp text eol=lf
+
+# Scripts
+*.ps1 text eol=crlf
+*.sh text eol=lf
+
+# Binary
+*.dll binary
+*.exe binary
+*.ico binary
+*.icns binary
+*.png binary

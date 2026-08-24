@@ -1,14 +1,29 @@
 {
   "name": "xmic",
   "private": true,
-  "version": "0.3.3",
+  "version": "0.3.5",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mengshouer/XMic.git"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "bundle": "npm run version:check && npm run licenses:generate && npm run artifacts:check && tauri build --ci --config src-tauri/tauri.bundle.conf.json -- --locked",
+    "artifacts:check": "node scripts/check-webrtc-artifacts.mjs",
+    "licenses:generate": "node scripts/generate-third-party-notices.mjs",
+    "licenses:check": "node scripts/generate-third-party-notices.mjs --check",
     "preview": "vite preview",
-    "test": "vitest run",
+    "test": "npm run test:web && npm run test:licenses",
+    "test:web": "vitest run",
+    "test:licenses": "node --test scripts/license-utils.test.mjs",
+    "version:check": "node scripts/check-release-version.mjs",
     "tauri": "tauri"
+  },
+  "engines": {
+    "node": ">=24 <25"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
@@ -21,6 +36,7 @@
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",
+    "spdx-expression-parse": "^5.0.0",
     "typescript": "~5.8.3",
     "vite": "^7.0.4",
     "vitest": "^4.1.10"
