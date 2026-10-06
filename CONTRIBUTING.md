@@ -26,17 +26,19 @@ npm test
 npm run bundle
 ```
 
-`npm run bundle` checks version consistency, generates license resources, verifies the checked-in WebRTC artifact, and builds the NSIS installer. Generated license resources are written under the ignored `artifacts/licenses/` directory; do not copy them into the repository manually. Release and scheduled Security workflows audit all npm and Cargo dependencies.
+`npm run bundle` checks version consistency, generates license resources, verifies the checked-in WebRTC artifact, builds the NSIS installer, verifies that every license notice is embedded as a lazy frontend chunk, and then prepares and validates the NSIS installer, the standalone `XMic.exe`, the portable archive, the MPL-2.0 source archive, and `SHA256SUMS.txt` under `artifacts/release/`. Generated license resources are written under the ignored `artifacts/licenses/` directory; do not copy them into the repository manually. Release and scheduled Security workflows audit all npm and Cargo dependencies. A bare `npm run build` does not generate them, so run `npm run licenses:generate` first when working on the About page; otherwise the three generated notice chunks are silently missing from the frontend build.
 
 ## Licenses and Dependencies
 
 XMic-authored code is licensed under MIT. When adding or upgrading a dependency, review its SPDX expression, distributable license text, and whether its license requires Source Code Form to accompany the executable. Commit lockfile updates together with dependency changes. `scripts/generate-third-party-notices.mjs` generates the license notices; do not edit generated output manually.
 
+The release delivers licenses in two places. The complete dependency notices are embedded in the application and shown in the About page, which loads each notice on demand. The MPL-2.0 Source Code Form is published separately as `XMic_<version>_MPL-2.0-source.zip`, containing `MPL_SOURCE_CODE.txt`, `LICENSE-MPL-2.0.txt`, and the `sources/` tree; keep the generated manifest paths consistent with that archive layout. The NSIS installer no longer installs notice files or a second copy of the WebRTC DLL, because both are embedded in the executable.
+
 The WebRTC DLL is distributed as a checked-in Windows artifact. After changing `native/webrtc-audio-processing/`, the WebRTC build recipe, or the pinned revision, rerun `scripts/build-webrtc.ps1` and commit a matching `webrtc-lock.json`, notice, `PROVENANCE.json`, and DLL. Provenance must record the source revisions, GN arguments, SDK version, tool versions, and overlay hashes, and `npm run artifacts:check` must pass.
 
 ## Pull Requests
 
-Describe behavioral changes, validation commands, and any Windows-only validation limitations in the pull request. Keep commits small and focused. If a change affects release packaging, dependencies, or licensing, state the affected scope explicitly. CI performs a complete NSIS packaging smoke test on Windows; merge only after it passes.
+Describe behavioral changes, validation commands, and any Windows-only validation limitations in the pull request. Keep commits small and focused. If a change affects release packaging, dependencies, or licensing, state the affected scope explicitly. CI performs a complete packaging build plus standalone and portable runtime smoke tests on Windows; merge only after it passes.
 
 ## Privacy and Vulnerabilities
 

@@ -11,15 +11,13 @@ import {
   ChevronRight,
   CircleCheck,
   CircleGauge,
-  Clock3,
   Copy,
-  Cpu,
   ExternalLink,
   Gauge,
   GitMerge,
+  Info,
   Languages,
   LayoutDashboard,
-  LoaderCircle,
   LockKeyhole,
   Mic2,
   Network,
@@ -27,6 +25,7 @@ import {
   Power,
   Radio,
   RefreshCw,
+  RotateCcw,
   Route,
   Save,
   ShieldCheck,
@@ -35,6 +34,7 @@ import {
   Square,
   Trash2,
   Waves,
+  X,
 } from "lucide-react";
 import {
   type ReactNode,
@@ -45,6 +45,7 @@ import {
   useState,
 } from "react";
 import "./App.css";
+import { AboutView } from "./components/AboutView";
 import {
   ControlLabel,
   NumberControl,
@@ -54,46 +55,45 @@ import {
 } from "./components/Controls";
 import { TelemetryCanvas } from "./components/TelemetryCanvas";
 import {
+  type EngineOutput,
+  type EngineState,
+  isEngineSessionActive,
+  isOptionalDspBypass,
+  type PrimaryReasonCode,
+  resolveActiveCapture,
+} from "./engineStatus";
+import {
+  type Language,
   readStoredLanguage,
   storeLanguage,
-  translations,
-  type Language,
   type Translation,
+  translations,
 } from "./i18n";
 import {
   activeCustomPairIsTrusted,
+  type ConfigurationIssue,
+  type EndpointDescriptor,
   findStandardVbCablePair,
   getConfigurationIssue,
   inferPairedCapture,
   isConfiguredVirtualCapture,
+  type KnownVbCablePair,
   sameEndpointGroup,
-  type ConfigurationIssue,
-  type EndpointDescriptor,
   type TrustedVirtualAudioPair,
   type VirtualDeviceMode,
 } from "./routeValidation";
+import { activeViewAt, markerOffset, VIEWS, type ViewId } from "./scrollSpy";
 import {
-  activeViewAt,
-  markerOffset,
-  VIEWS,
-  type ViewId,
-} from "./scrollSpy";
+  acceptDraftSettings,
+  createSettingsDraft,
+  editSettingsDraft,
+} from "./settingsDraft";
 
-type EngineMode =
-  | "sleeping"
-  | "starting"
-  | "converging"
-  | "active"
-  | "rawFallback"
-  | "safeMode"
-  | "muted"
-  | "error";
 type AecPreset = "natural" | "balanced" | "strong";
-type UnprocessedOutput = "rawMicrophone" | "silence";
+type DegradedOutput = "raw" | "silence";
 type DelayCalibrationState = "uncalibrated" | "warmingUp" | "calibrated";
-type ProcessingLoadMode = "full" | "reduced" | "protection";
+type ProcessingLoadMode = "full" | "protection";
 type DspStageId = "aec" | "rnnoise" | "agc2" | "vad" | "limiter";
-type DspFeatureId = "aec" | "rnnoise" | "agc2" | "vadGate";
 
 interface AecSettings {
   enabled: boolean;
@@ -149,20 +149,23 @@ interface EngineSettings {
   virtualDeviceMode: VirtualDeviceMode | null;
   virtualCaptureEndpointId: string | null;
   trustedVirtualAudioPairs: TrustedVirtualAudioPair[];
-  unprocessedOutput: UnprocessedOutput;
+  knownVbCablePair: KnownVbCablePair | null;
+  degradedOutput: DegradedOutput;
   dsp: DspSettings;
 }
 
 interface ActiveRoute {
-  renderEndpointId: string;
-  captureEndpointId: string;
+  renderEndpointId: string | null;
+  captureEndpointId: string | null;
   outputEndpointId: string;
 }
 
-interface ActiveDeviceProfile {
-  renderEndpointId: string;
-  captureEndpointId: string;
-  customized: boolean;
+interface PrimaryReason {
+  code: PrimaryReasonCode;
+  detail: string | null;
+  endpointId: string | null;
+  retryAfterMs: number | null;
+  configurationIssue: ConfigurationIssue | null;
 }
 
 interface EngineMetrics {
@@ -188,44 +191,41 @@ interface EngineMetrics {
   dspLatencyMs: number;
   outputLatencyMs: number;
   pipelineLatencyMs: number;
-  hostDelayMs?: number | null;
-  hostDelayRawSkewMs?: number | null;
-  hostDelayJitterMs?: number | null;
+  hostDelayMs: number | null;
+  hostDelayRawSkewMs: number | null;
+  hostDelayJitterMs: number | null;
   hostDelayCalibrationState: DelayCalibrationState;
   hostDelayResetEvents: number;
-  aecEstimatedDelayMs?: number | null;
-  aecEchoReturnLossDb?: number | null;
-  aecEchoReturnLossEnhancementDb?: number | null;
-  aecResidualEchoLikelihood?: number | null;
-  aecAttenuationDb?: number | null;
-  inputPeakDbfs?: number | null;
-  outputPeakDbfs?: number | null;
-  inputClippedSamples?: number;
-  limiterLimitedSamples?: number;
-  vadProbability?: number | null;
-  speechVadActive?: boolean | null;
-  vadGateOpen?: boolean | null;
-  vadGateOpenEvents?: number;
-  echoGuardActive?: boolean | null;
-  echoGuardActiveEvents?: number;
-  echoGuardNearendCandidateEvents?: number;
-  echoGuardReleaseEvents?: number;
+  aecEstimatedDelayMs: number | null;
+  aecEchoReturnLossDb: number | null;
+  aecEchoReturnLossEnhancementDb: number | null;
+  aecResidualEchoLikelihood: number | null;
+  aecAttenuationDb: number | null;
+  inputPeakDbfs: number | null;
+  outputPeakDbfs: number | null;
+  inputClippedSamples: number;
+  limiterLimitedSamples: number;
+  vadProbability: number | null;
+  speechVadActive: boolean | null;
+  vadGateOpen: boolean | null;
+  vadGateOpenEvents: number;
+  echoGuardActive: boolean | null;
+  echoGuardActiveEvents: number;
+  echoGuardNearendCandidateEvents: number;
+  echoGuardReleaseEvents: number;
 }
 
 interface EngineStatus {
   protocolVersion: number;
-  running: boolean;
-  mode: EngineMode;
-  detail: string;
+  desiredEnabled: boolean;
+  state: EngineState;
+  output: EngineOutput;
+  primaryReason: PrimaryReason | null;
   endpoints: EndpointDescriptor[];
   settings: EngineSettings;
   activeRoute: ActiveRoute | null;
-  activeDeviceProfile: ActiveDeviceProfile | null;
-  configurationIssue: ConfigurationIssue | null;
   metrics: EngineMetrics;
-  warning: string | null;
-  /** Mirrored from `EngineStatus`; the one-shot notification for it is sent from the Rust side. */
-  unprocessedSpeechDetected: boolean;
+  notificationProbeSpeechDetected: boolean;
 }
 
 interface LifecyclePreferences {
@@ -236,7 +236,6 @@ interface LifecyclePreferences {
 
 interface LifecycleStatus extends LifecyclePreferences {
   sessionAvailable: boolean;
-  resumePending: boolean;
   lastError: string | null;
 }
 
@@ -255,9 +254,15 @@ const FRAME_DURATION_MS = 10;
 const GATE_SPEECH_ONSET_PRE_ROLL_FRAMES = 4;
 const ECHO_GUARD_NEAREND_CONFIRMATION_FRAMES = 6;
 const ECHO_GUARD_SMOOTHING_PRE_ROLL_FRAMES = 2;
+const CAPTURE_CHANNEL_OPTIONS = Array.from(
+  { length: 16 },
+  (_, channel) => channel,
+);
 
 function estimatedDspLatencyMs(dsp: DspSettings) {
-  const confirmationFrames = Math.ceil(dsp.vadGate.confirmationMs / FRAME_DURATION_MS);
+  const confirmationFrames = Math.ceil(
+    dsp.vadGate.confirmationMs / FRAME_DURATION_MS,
+  );
   const echoGuardEnabled =
     dsp.aec.enabled && dsp.vadGate.enabled && dsp.aec.preset === "strong";
   const gateFrames = dsp.vadGate.enabled
@@ -275,19 +280,19 @@ function estimatedDspLatencyMs(dsp: DspSettings) {
 function App() {
   const [language, setLanguage] = useState<Language>(readStoredLanguage);
   const [activeView, setActiveView] = useState<ViewId>("monitor");
-  const [activeDspStage, setActiveDspStage] =
-    useState<DspStageId>("aec");
+  const [activeDspStage, setActiveDspStage] = useState<DspStageId>("aec");
   const [status, setStatus] = useState<EngineStatus | null>(null);
   const [lifecycleStatus, setLifecycleStatus] =
     useState<LifecycleStatus | null>(null);
   const [appVersion, setAppVersion] = useState<string | null>(null);
-  const [draft, setDraft] = useState<EngineSettings | null>(null);
-  const [dirty, setDirty] = useState(false);
+  const [{ settings: draft, dirty }, setSettingsDraft] = useState(
+    createSettingsDraft<EngineSettings>,
+  );
   const [busy, setBusy] = useState(false);
-  const [quickDspBusy, setQuickDspBusy] = useState<DspFeatureId | null>(null);
   const [lifecycleBusy, setLifecycleBusy] = useState(false);
   const [pageVisible, setPageVisible] = useState(!document.hidden);
   const [error, setError] = useState<string | null>(null);
+  const [dspOverrideWarning, setDspOverrideWarning] = useState(false);
   const [diagnosticsCopied, setDiagnosticsCopied] = useState(false);
   const captureSelectRef = useRef<HTMLSelectElement>(null);
   const virtualOutputSelectRef = useRef<HTMLSelectElement>(null);
@@ -362,9 +367,11 @@ function App() {
   const acceptStatus = useCallback(
     (next: EngineStatus, forceSettings = false) => {
       setStatus(next);
-      if (forceSettings || !dirty) setDraft(next.settings);
+      setSettingsDraft((current) =>
+        acceptDraftSettings(current, next.settings, forceSettings),
+      );
     },
-    [dirty],
+    [],
   );
 
   const refresh = useCallback(async () => {
@@ -388,7 +395,9 @@ function App() {
   }, []);
 
   useEffect(() => {
-    getVersion().then(setAppVersion).catch(() => setAppVersion(null));
+    getVersion()
+      .then(setAppVersion)
+      .catch(() => setAppVersion(null));
   }, []);
 
   useEffect(() => {
@@ -436,6 +445,29 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    listen<void>("dsp-override-not-applied", () => {
+      if (!disposed) setDspOverrideWarning(true);
+    }).then((stopListening) => {
+      if (disposed) {
+        stopListening();
+        return;
+      }
+      unlisten = stopListening;
+      invoke<boolean>("take_pending_dsp_override_warning")
+        .then((pending) => {
+          if (!disposed && pending) setDspOverrideWarning(true);
+        })
+        .catch(() => undefined);
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
   // Two mechanisms, because neither covers the other's case.
   //
   // Going to the tray hides the window with ShowWindow(SW_HIDE), and WebView2 does not report that
@@ -474,14 +506,15 @@ function App() {
       if (visible) refresh();
     };
     document.addEventListener("visibilitychange", updateVisibility);
-    return () => document.removeEventListener("visibilitychange", updateVisibility);
+    return () =>
+      document.removeEventListener("visibilitychange", updateVisibility);
   }, [refresh]);
 
   useEffect(() => {
-    if (!status?.running || !pageVisible) return;
+    if (!pageVisible) return;
     const timer = window.setInterval(refresh, 1000);
     return () => window.clearInterval(timer);
-  }, [pageVisible, refresh, status?.running]);
+  }, [pageVisible, refresh]);
 
   // `offsetTop` and `clientHeight` both force a synchronous layout, and the scroll handler read four
   // of them per event — events that arrive at frame rate. Neither changes while scrolling: they change
@@ -493,7 +526,9 @@ function App() {
     if (!contentReady) return;
     const container = document.querySelector<HTMLElement>(".page-content");
     if (!container) return;
-    const sections = VIEWS.map((view) => document.getElementById(`view-${view}`));
+    const sections = VIEWS.map((view) =>
+      document.getElementById(`view-${view}`),
+    );
     const measure = () => {
       scrollSpy.current = {
         markerOffset: markerOffset(container.clientHeight),
@@ -513,21 +548,36 @@ function App() {
   }, [contentReady]);
 
   const renderEndpoints = useMemo(
-    () => status?.endpoints.filter((endpoint) => endpoint.flow === "render") ?? [],
+    () =>
+      status?.endpoints.filter((endpoint) => endpoint.flow === "render") ?? [],
     [status],
   );
   const allCaptureEndpoints = useMemo(
-    () => status?.endpoints.filter((endpoint) => endpoint.flow === "capture") ?? [],
+    () =>
+      status?.endpoints.filter((endpoint) => endpoint.flow === "capture") ?? [],
     [status],
   );
   const vbCablePair = useMemo(
     () => findStandardVbCablePair(status?.endpoints ?? []),
     [status],
   );
+  const knownVbCableOffline = Boolean(
+    draft?.virtualDeviceMode === "vbCable" &&
+      !vbCablePair &&
+      draft.knownVbCablePair &&
+      draft.outputEndpointId === draft.knownVbCablePair.renderEndpointId &&
+      draft.virtualCaptureEndpointId ===
+        draft.knownVbCablePair.captureEndpointId,
+  );
   const effectiveVirtualMode: VirtualDeviceMode =
-    draft?.virtualDeviceMode === "custom" || !vbCablePair
+    draft?.virtualDeviceMode === "custom"
       ? "custom"
-      : "vbCable";
+      : draft?.virtualDeviceMode === "vbCable" &&
+          (Boolean(vbCablePair) || knownVbCableOffline)
+        ? "vbCable"
+        : vbCablePair
+          ? "vbCable"
+          : "custom";
   const captureEndpoints = useMemo(
     () =>
       status?.endpoints.filter(
@@ -577,16 +627,13 @@ function App() {
       ),
     [allCaptureEndpoints, customPairTrusted, draft, renderEndpoints],
   );
-  const configurationIssue = useMemo(
-    () => {
-      if (!draft || !status) return null;
-      return (
-        getConfigurationIssue(draft, status.endpoints) ??
-        (dirty ? null : status.configurationIssue)
-      );
-    },
-    [dirty, draft, status],
-  );
+  const configurationIssue = useMemo(() => {
+    if (!draft || !status) return null;
+    return (
+      getConfigurationIssue(draft, status.endpoints) ??
+      (dirty ? null : (status.primaryReason?.configurationIssue ?? null))
+    );
+  }, [dirty, draft, status]);
   const captureConfigurationIssue =
     configurationIssue?.type === "physicalCaptureRequired"
       ? configurationIssue
@@ -609,25 +656,24 @@ function App() {
   const followDefaultCaptureBlocked = useMemo(
     () =>
       draft && status
-        ? effectiveVirtualMode === "custom" ||
-          getConfigurationIssue(
+        ? getConfigurationIssue(
             { ...draft, captureEndpointId: null },
             status.endpoints,
           )?.type === "physicalCaptureRequired"
         : false,
-    [draft, effectiveVirtualMode, status],
+    [draft, status],
   );
-  const running = status?.running ?? false;
-  // A pending resume means XMic will start processing again by itself. A configuration issue takes
-  // precedence: while the route is unusable the button has to lead to the fix, not to a cancellation.
-  const resumePending =
-    (lifecycleStatus?.resumePending ?? false) && !configurationIssue;
-  const engineRequested = running || resumePending;
-  const controlsDisabled = running || busy || quickDspBusy !== null;
+  const engineDesiredOn = status?.desiredEnabled ?? false;
+  const engineSessionActive = status ? isEngineSessionActive(status) : false;
+  const settingsResetPending = status?.primaryReason?.code === "settingsReset";
+  // All settings are drafts. Apply performs the single stop/update/recovery transaction, so controls
+  // remain editable while Processing or Degraded; only an in-flight command locks them.
+  const controlsDisabled = busy;
 
-  const changeSettings = (update: (current: EngineSettings) => EngineSettings) => {
-    setDraft((current) => (current ? update(current) : current));
-    setDirty(true);
+  const changeSettings = (
+    update: (current: EngineSettings) => EngineSettings,
+  ) => {
+    setSettingsDraft((current) => editSettingsDraft(current, update));
   };
 
   const selectVirtualMode = (mode: VirtualDeviceMode) => {
@@ -683,38 +729,25 @@ function App() {
     }));
   };
 
-  const revokeTrustedPair = async (pair: TrustedVirtualAudioPair) => {
-    if (!draft) return;
-    const settings = {
-      ...draft,
-      trustedVirtualAudioPairs: draft.trustedVirtualAudioPairs.filter(
+  const revokeTrustedPair = (pair: TrustedVirtualAudioPair) => {
+    changeSettings((current) => ({
+      ...current,
+      trustedVirtualAudioPairs: current.trustedVirtualAudioPairs.filter(
         (candidate) =>
           candidate.renderEndpointId !== pair.renderEndpointId ||
           candidate.captureEndpointId !== pair.captureEndpointId,
       ),
-    };
-    setBusy(true);
-    setError(null);
-    try {
-      if (engineRequested) await invoke<EngineStatus>("stop_engine");
-      const next = await invoke<EngineStatus>("update_engine_settings", {
-        settings,
-      });
-      setDirty(false);
-      acceptStatus(next, true);
-    } catch (reason) {
-      setError(String(reason));
-    } finally {
-      setBusy(false);
-    }
+    }));
   };
 
   const copyDeviceDiagnostics = async () => {
     if (!status) return;
     const text = buildDeviceDiagnostics(
-      status.endpoints,
+      status,
       draft ?? status.settings,
       configurationIssue,
+      error,
+      lifecycleStatus?.lastError ?? null,
     );
     try {
       await navigator.clipboard.writeText(text);
@@ -733,6 +766,12 @@ function App() {
     }
   };
 
+  const discardSettings = () => {
+    if (!status || busy) return;
+    setSettingsDraft(createSettingsDraft(status.settings));
+    setError(null);
+  };
+
   const applySettings = async (): Promise<boolean> => {
     if (!draft) return false;
     setBusy(true);
@@ -741,8 +780,8 @@ function App() {
       const next = await invoke<EngineStatus>("update_engine_settings", {
         settings: draft,
       });
-      setDirty(false);
-      acceptStatus(next, true);
+      setStatus(next);
+      setSettingsDraft(createSettingsDraft(next.settings));
       return true;
     } catch (reason) {
       setError(String(reason));
@@ -752,78 +791,18 @@ function App() {
     }
   };
 
-  const mergeQuickDspStatus = (
-    next: EngineStatus,
-    feature: DspFeatureId,
-  ) => {
-    acceptStatus(next);
-    const enabled = dspFeatureEnabled(next.settings, feature);
-    setDraft((current) =>
-      current ? withDspFeatureEnabled(current, feature, enabled) : next.settings,
-    );
-  };
-
-  const setQuickDspFeature = async (
-    feature: DspFeatureId,
-    enabled: boolean,
-  ) => {
-    if (quickDspBusy) return;
-    setQuickDspBusy(feature);
-    setError(null);
-    try {
-      const next = await invoke<EngineStatus>("set_dsp_feature_enabled", {
-        feature,
-        enabled,
-      });
-      mergeQuickDspStatus(next, feature);
-    } catch (reason) {
-      setError(String(reason));
-      try {
-        const next = await invoke<EngineStatus>("get_engine_status");
-        mergeQuickDspStatus(next, feature);
-      } catch {
-        // Keep the original reconfiguration error visible.
-      }
-    } finally {
-      setQuickDspBusy(null);
-    }
-  };
-
   const toggleEngine = async () => {
-    if (!engineRequested && configurationIssue) {
+    if (!engineDesiredOn && configurationIssue) {
       focusConfigurationIssue(configurationIssue);
       return;
     }
     setBusy(true);
     setError(null);
     try {
-      if (engineRequested) {
-        const next = await invoke<EngineStatus>("stop_engine");
-        acceptStatus(next, true);
-      } else {
-        if (dirty && draft) {
-          const next = await invoke<EngineStatus>("update_engine_settings", {
-            settings: draft,
-          });
-          setDirty(false);
-          acceptStatus(next, true);
-        }
-        const next = await invoke<EngineStatus>("start_engine");
-        acceptStatus(next, true);
-      }
-    } catch (reason) {
-      setError(String(reason));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const retryEngine = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      const next = await invoke<EngineStatus>("start_engine");
-      acceptStatus(next);
+      const next = await invoke<EngineStatus>(
+        engineDesiredOn ? "stop_engine" : "start_engine",
+      );
+      acceptStatus(next, !engineDesiredOn);
     } catch (reason) {
       setError(String(reason));
     } finally {
@@ -868,10 +847,23 @@ function App() {
   }
 
   const updateAec = (patch: Partial<AecSettings>) =>
-    changeSettings((current) => ({
-      ...current,
-      dsp: { ...current.dsp, aec: { ...current.dsp.aec, ...patch } },
-    }));
+    changeSettings((current) => {
+      const renderEndpointId =
+        patch.enabled === true &&
+        !current.followDefaultRender &&
+        !current.renderEndpointId
+          ? (renderEndpoints.find((endpoint) =>
+              endpoint.defaultRoles.includes("multimedia"),
+            )?.id ??
+            renderEndpoints[0]?.id ??
+            null)
+          : current.renderEndpointId;
+      return {
+        ...current,
+        renderEndpointId,
+        dsp: { ...current.dsp, aec: { ...current.dsp.aec, ...patch } },
+      };
+    });
   const updateRnnoise = (patch: Partial<RnnoiseSettings>) =>
     changeSettings((current) => ({
       ...current,
@@ -916,33 +908,28 @@ function App() {
     renderEndpoints.find((endpoint) =>
       endpoint.defaultRoles.includes("multimedia"),
     ) ?? renderEndpoints[0];
-  const defaultCapture =
-    allCaptureEndpoints.find((endpoint) =>
-      endpoint.defaultRoles.includes("multimedia"),
-    );
-  const selectedCapture = draft.captureEndpointId
-    ? captureEndpoints.find(
-        (endpoint) => endpoint.id === draft.captureEndpointId,
-      )
-    : followDefaultCaptureBlocked
-      ? undefined
-      : defaultCapture;
-  const visibleRenderId =
-    status.activeRoute?.renderEndpointId ??
-    (draft.followDefaultRender
-      ? defaultRender?.id
-      : (draft.renderEndpointId ?? undefined));
-  const visibleCaptureId =
-    status.activeRoute?.captureEndpointId ??
-    draft.captureEndpointId ??
-    defaultCapture?.id;
-  const visibleOutputId =
-    status.activeRoute?.outputEndpointId ?? draft.outputEndpointId ?? undefined;
-  const profileLabel = status.activeDeviceProfile
-    ? status.activeDeviceProfile.customized
-      ? copy.routing.customizedProfile
-      : copy.routing.defaultProfile
-    : copy.routing.waitingProfile;
+  const defaultCapture = allCaptureEndpoints.find((endpoint) =>
+    endpoint.defaultRoles.includes("multimedia"),
+  );
+  const visibleRenderId = status.activeRoute?.renderEndpointId;
+  const visibleCaptureId = status.activeRoute?.captureEndpointId;
+  const visibleOutputId = status.activeRoute?.outputEndpointId;
+  const appliedDspSettingsLabel = isOptionalDspBypass(status.settings.dsp)
+    ? copy.routing.bypassDspSettings
+    : copy.routing.globalDspSettings;
+  const activeCapture = resolveActiveCapture(
+    visibleCaptureId,
+    status.settings.captureEndpointId,
+    status.endpoints,
+  );
+  const activeCaptureName = visibleCaptureId
+    ? (activeCapture.friendlyName ?? copy.status.endpointUnavailable)
+    : status.activeRoute
+      ? copy.routing.notInUse
+      : copy.engineOutputs.inactive;
+  const activeCaptureLabel = activeCapture.followsDefault
+    ? copy.routing.resolvedDefaultCapture(activeCaptureName)
+    : activeCaptureName;
   const stageEnabled: Record<DspStageId, boolean> = {
     aec: draft.dsp.aec.enabled,
     rnnoise: draft.dsp.rnnoise.enabled,
@@ -950,12 +937,22 @@ function App() {
     vad: draft.dsp.vadGate.enabled,
     limiter: true,
   };
-  const quickDsp = status.settings.dsp;
-  const quickControlsLocked = busy || quickDspBusy !== null;
-  const agc2Bypassed =
-    running &&
-    quickDsp.agc2.enabled &&
-    status.metrics.processingLoadMode === "reduced";
+  const quickDsp = draft.dsp;
+  const quickControlsLocked = controlsDisabled;
+  const primaryReasonText = status.primaryReason
+    ? copy.primaryReasons[status.primaryReason.code]
+    : copy.status.noReason;
+  const primaryReasonEndpoint = status.primaryReason?.endpointId
+    ? (status.endpoints.find(
+        (endpoint) => endpoint.id === status.primaryReason?.endpointId,
+      )?.friendlyName ?? copy.status.endpointUnavailable)
+    : null;
+  const primaryReasonRetry =
+    status.primaryReason?.retryAfterMs == null
+      ? null
+      : copy.status.retryingIn(
+          Math.max(0.1, status.primaryReason.retryAfterMs / 1000).toFixed(1),
+        );
 
   const openProcessor = (stage: DspStageId) => {
     setActiveDspStage(stage);
@@ -963,16 +960,24 @@ function App() {
   };
 
   return (
-    <div className="app-shell" data-engine-mode={status.mode}>
+    <div className="app-shell" data-engine-state={status.state}>
       <aside className="app-sidebar">
-        <div className="brand-block" aria-label="XMic">
+        <div className="brand-block">
           <span className="brand-mark">
             <AudioWaveform size={22} strokeWidth={2.4} aria-hidden="true" />
           </span>
           <span className="brand-name">XMic</span>
+          {appVersion && (
+            <span className="brand-version" title={copy.about.version}>
+              v{appVersion}
+            </span>
+          )}
         </div>
 
-        <nav className="primary-navigation" aria-label={copy.navigation.workspace}>
+        <nav
+          className="primary-navigation"
+          aria-label={copy.navigation.workspace}
+        >
           <span className="navigation-label">{copy.navigation.workspace}</span>
           <NavigationButton
             icon={<LayoutDashboard size={17} />}
@@ -992,44 +997,48 @@ function App() {
             active={activeView === "processing"}
             onClick={() => navigateToView("processing")}
           />
+          <NavigationButton
+            icon={<Info size={17} />}
+            label={copy.navigation.about}
+            active={activeView === "about"}
+            onClick={() => navigateToView("about")}
+          />
         </nav>
 
         <div className="sidebar-spacer" />
 
         <section className="sidebar-engine" aria-label={copy.status.title}>
           <div className="sidebar-state">
-            <span className="state-symbol" data-mode={status.mode}>
+            <span className="state-symbol" data-state={status.state}>
               <Activity size={15} aria-hidden="true" />
             </span>
             <span className="state-copy">
               <small>{copy.status.title}</small>
-              <strong>
-                {resumePending && !running
-                  ? copy.status.pausedWillResume
-                  : copy.engineModes[status.mode]}
-              </strong>
+              <strong>{copy.engineStates[status.state]}</strong>
             </span>
           </div>
           <button
-            className={`engine-action ${engineRequested ? "is-stop" : "is-start"}`}
+            className={`engine-action ${engineDesiredOn ? "is-stop" : "is-start"}`}
             type="button"
             onClick={toggleEngine}
-            disabled={busy || quickDspBusy !== null}
+            disabled={
+              busy || (!engineDesiredOn && (dirty || settingsResetPending))
+            }
+            title={
+              !engineDesiredOn && (dirty || settingsResetPending)
+                ? copy.common.applyBeforeStart
+                : undefined
+            }
           >
-            {engineRequested ? <Square size={15} /> : <Play size={16} />}
+            {engineDesiredOn ? <Square size={15} /> : <Play size={16} />}
             <span>
-              {running
-                ? copy.common.stop
-                : engineRequested
-                  ? copy.common.cancelPending
-                  : copy.common.start}
+              {engineDesiredOn ? copy.common.stop : copy.common.start}
             </span>
           </button>
         </section>
 
-        <div
+        <fieldset
           className="language-switch"
-          role="group"
           aria-label={copy.common.language}
           title={copy.common.language}
         >
@@ -1048,48 +1057,32 @@ function App() {
           >
             EN
           </button>
-        </div>
+        </fieldset>
       </aside>
 
       <section className="app-main">
-        <header className="page-header">
-          <div className="page-title-block">
-            <span>{copy.app.eyebrow}</span>
-            <h1>
-              XMic
-              {appVersion && (
-                <span className="app-version" title={copy.common.version}>
-                  v{appVersion}
-                </span>
-              )}
-            </h1>
-            <p>{copy.app.subtitle}</p>
-          </div>
-          <div className="header-runtime" aria-label={copy.status.title}>
-            <RuntimeItem
-              icon={<Cpu size={14} />}
-              label={copy.status.cpuLoad}
-              value={copy.processingLoads[status.metrics.processingLoadMode]}
-            />
-            <RuntimeItem
-              icon={<Clock3 size={14} />}
-              label={copy.status.dspP99}
-              value={`${status.metrics.processingTimeP99Us.toFixed(0)} µs`}
-            />
-          </div>
-        </header>
-
         <div className="banner-stack">
           {error && (
             <div className="alert-banner error-banner" role="alert">
               <AlertTriangle size={16} />
-              <span>{error}</span>
-              {!running && engineRequested && (
-                <button type="button" onClick={retryEngine} disabled={busy}>
-                  <RefreshCw size={14} />
-                  {copy.common.retryStart}
-                </button>
-              )}
+              <span>{copy.app.operationFailed}</span>
+            </div>
+          )}
+          {dspOverrideWarning && (
+            <div className="alert-banner warning-banner" role="status">
+              <AlertTriangle size={16} aria-hidden="true" />
+              <span>
+                <strong>{copy.app.dspOverrideNotAppliedTitle}</strong>
+                <small>{copy.app.dspOverrideNotApplied}</small>
+              </span>
+              <button
+                type="button"
+                className="icon-button"
+                aria-label={copy.app.dismissNotice}
+                onClick={() => setDspOverrideWarning(false)}
+              >
+                <X size={14} aria-hidden="true" />
+              </button>
             </div>
           )}
           {configurationIssue && configurationIssueMessage && (
@@ -1106,10 +1099,25 @@ function App() {
               <ChevronRight size={15} aria-hidden="true" />
             </button>
           )}
-          {status.warning && (
+          {status.state === "blocked" && (
+            <div className="alert-banner blocked-banner" role="alert">
+              <AlertTriangle size={16} />
+              <span>
+                <strong>{copy.status.blockedTitle}</strong>
+                {primaryReasonText}
+                {primaryReasonEndpoint && <small>{primaryReasonEndpoint}</small>}
+                {primaryReasonRetry && <small>{primaryReasonRetry}</small>}
+              </span>
+            </div>
+          )}
+          {status.state === "degraded" && status.primaryReason && (
             <div className="alert-banner warning-banner" role="status">
               <AlertTriangle size={16} />
-              <span>{status.warning}</span>
+              <span>
+                <strong>{primaryReasonText}</strong>
+                {primaryReasonEndpoint && <small>{primaryReasonEndpoint}</small>}
+                {primaryReasonRetry && <small>{primaryReasonRetry}</small>}
+              </span>
             </div>
           )}
           {(lifecycleStatus?.lastError ||
@@ -1117,7 +1125,9 @@ function App() {
             <div className="alert-banner warning-banner" role="status">
               <AlertTriangle size={16} />
               <span>
-                {lifecycleStatus.lastError ?? copy.app.sessionUnavailable}
+                {lifecycleStatus.lastError
+                  ? copy.app.lifecycleOperationFailed
+                  : copy.app.sessionUnavailable}
               </span>
             </div>
           )}
@@ -1157,17 +1167,17 @@ function App() {
                     title={copy.views.monitor.telemetryTitle}
                     subtitle={copy.views.monitor.telemetrySubtitle}
                     trailing={
-                      <span className={`live-label${running ? " is-live" : ""}`}>
+                      <span
+                        className={`live-label${engineSessionActive ? " is-live" : ""}`}
+                      >
                         <span />
-                        {running
-                          ? copy.engineModes[status.mode]
-                          : copy.engineModes.sleeping}
+                        {copy.engineStates[status.state]}
                       </span>
                     }
                   />
                   <TelemetryCanvas
                     metrics={status.metrics}
-                    running={running}
+                    active={engineSessionActive}
                     label={copy.views.monitor.telemetryAria}
                   />
                   <div className="telemetry-legend">
@@ -1206,7 +1216,8 @@ function App() {
                     <SignalReadout
                       label={copy.views.monitor.vadProbability}
                       value={
-                        !running || status.metrics.vadProbability == null
+                        !engineSessionActive ||
+                        status.metrics.vadProbability == null
                           ? "--"
                           : `${Math.round(status.metrics.vadProbability * 100)}%`
                       }
@@ -1221,20 +1232,16 @@ function App() {
                     title={copy.views.monitor.snapshotTitle}
                     subtitle={copy.views.monitor.snapshotSubtitle}
                   />
-                  <div className="mode-readout" data-mode={status.mode}>
+                  <div className="state-readout" data-state={status.state}>
                     <span>{copy.status.title}</span>
-                    <strong>
-                      {resumePending && !running
-                        ? copy.status.pausedWillResume
-                        : copy.engineModes[status.mode]}
-                    </strong>
-                    <small>{status.detail || copy.app.subtitle}</small>
+                    <strong>{copy.engineStates[status.state]}</strong>
+                    <small>{primaryReasonText}</small>
                   </div>
                   <div className="snapshot-list">
                     <SnapshotItem
                       label={copy.views.monitor.pipelineLatency}
                       value={
-                        running
+                        engineSessionActive
                           ? formatOptionalMetric(
                               status.metrics.pipelineLatencyMs,
                               "ms",
@@ -1245,7 +1252,7 @@ function App() {
                     <SnapshotItem
                       label={copy.views.monitor.calibration}
                       value={
-                        running
+                        engineSessionActive
                           ? calibrationLabel(
                               status.metrics.hostDelayCalibrationState,
                               copy,
@@ -1256,7 +1263,7 @@ function App() {
                     <SnapshotItem
                       label={copy.views.monitor.gateState}
                       value={
-                        running
+                        engineSessionActive
                           ? booleanState(
                               status.metrics.vadGateOpen,
                               copy.dsp.diagnostics.open,
@@ -1268,7 +1275,7 @@ function App() {
                     <SnapshotItem
                       label={copy.views.monitor.echoGuard}
                       value={
-                        running
+                        engineSessionActive
                           ? booleanState(
                               status.metrics.echoGuardActive,
                               copy.dsp.diagnostics.active,
@@ -1278,8 +1285,18 @@ function App() {
                       }
                     />
                     <SnapshotItem
+                      label={copy.status.output}
+                      value={copy.engineOutputs[status.output]}
+                    />
+                    <SnapshotItem
+                      label={copy.status.reason}
+                      value={primaryReasonText}
+                    />
+                    <SnapshotItem
                       label={copy.status.cpuLoad}
-                      value={copy.processingLoads[status.metrics.processingLoadMode]}
+                      value={
+                        copy.processingLoads[status.metrics.processingLoadMode]
+                      }
                     />
                   </div>
                 </section>
@@ -1296,23 +1313,32 @@ function App() {
                     <RouteNode
                       icon={<Speaker size={16} />}
                       label={copy.views.monitor.renderSource}
-                      value={routeName(visibleRenderId, status.endpoints)}
+                      value={routeName(
+                        visibleRenderId,
+                        status.endpoints,
+                        status.activeRoute
+                          ? copy.routing.notInUse
+                          : copy.engineOutputs.inactive,
+                      )}
                       tone="render"
                     />
                     <RouteNode
                       icon={<Mic2 size={16} />}
                       label={copy.views.monitor.captureSource}
-                      value={routeName(visibleCaptureId, status.endpoints)}
+                      value={activeCaptureLabel}
                       tone="capture"
                     />
                   </div>
-                  <span className="route-connector merge-connector" aria-hidden="true">
+                  <span
+                    className="route-connector merge-connector"
+                    aria-hidden="true"
+                  >
                     <GitMerge size={17} />
                   </span>
                   <RouteNode
                     icon={<AudioWaveform size={17} />}
                     label={copy.views.monitor.processor}
-                    value={profileLabel}
+                    value={appliedDspSettingsLabel}
                     tone="processor"
                   />
                   <span className="route-connector" aria-hidden="true">
@@ -1321,7 +1347,11 @@ function App() {
                   <RouteNode
                     icon={<Cable size={16} />}
                     label={copy.views.monitor.outputDestination}
-                    value={routeName(visibleOutputId, status.endpoints)}
+                    value={routeName(
+                      visibleOutputId,
+                      status.endpoints,
+                      copy.engineOutputs.inactive,
+                    )}
                     tone="output"
                   />
                 </div>
@@ -1334,7 +1364,7 @@ function App() {
                     title={copy.views.monitor.chainTitle}
                     subtitle={copy.views.monitor.chainSubtitle}
                   />
-                  <div
+                  <section
                     className="dsp-quick-grid"
                     aria-label={copy.views.monitor.quickControlsAria}
                   >
@@ -1343,16 +1373,10 @@ function App() {
                       description={copy.views.monitor.aecQuickDescription}
                       icon={<Waves size={15} />}
                       enabled={quickDsp.aec.enabled}
-                      status={quickDspStatus(
-                        quickDsp.aec.enabled,
-                        false,
-                        quickDspBusy === "aec",
-                        copy,
-                      )}
-                      busy={quickDspBusy === "aec"}
+                      status={quickDspStatus(quickDsp.aec.enabled, copy)}
                       controlsLocked={quickControlsLocked}
                       onOpen={() => openProcessor("aec")}
-                      onToggle={(enabled) => setQuickDspFeature("aec", enabled)}
+                      onToggle={(enabled) => updateAec({ enabled })}
                       copy={copy}
                     />
                     <QuickDspControl
@@ -1360,13 +1384,7 @@ function App() {
                       description={copy.views.monitor.rnnoiseQuickDescription}
                       icon={<AudioLines size={15} />}
                       enabled={quickDsp.rnnoise.enabled}
-                      status={quickDspStatus(
-                        quickDsp.rnnoise.enabled,
-                        false,
-                        quickDspBusy === "rnnoise",
-                        copy,
-                      )}
-                      busy={quickDspBusy === "rnnoise"}
+                      status={quickDspStatus(quickDsp.rnnoise.enabled, copy)}
                       controlsLocked={quickControlsLocked}
                       disabledReason={
                         quickDsp.rnnoise.enabled && quickDsp.vadGate.enabled
@@ -1374,9 +1392,7 @@ function App() {
                           : undefined
                       }
                       onOpen={() => openProcessor("rnnoise")}
-                      onToggle={(enabled) =>
-                        setQuickDspFeature("rnnoise", enabled)
-                      }
+                      onToggle={(enabled) => updateRnnoise({ enabled })}
                       copy={copy}
                     />
                     <QuickDspControl
@@ -1384,17 +1400,10 @@ function App() {
                       description={copy.views.monitor.agc2QuickDescription}
                       icon={<Gauge size={15} />}
                       enabled={quickDsp.agc2.enabled}
-                      bypassed={agc2Bypassed}
-                      status={quickDspStatus(
-                        quickDsp.agc2.enabled,
-                        agc2Bypassed,
-                        quickDspBusy === "agc2",
-                        copy,
-                      )}
-                      busy={quickDspBusy === "agc2"}
+                      status={quickDspStatus(quickDsp.agc2.enabled, copy)}
                       controlsLocked={quickControlsLocked}
                       onOpen={() => openProcessor("agc2")}
-                      onToggle={(enabled) => setQuickDspFeature("agc2", enabled)}
+                      onToggle={enableAgc2}
                       copy={copy}
                     />
                     <QuickDspControl
@@ -1402,13 +1411,7 @@ function App() {
                       description={copy.views.monitor.vadQuickDescription}
                       icon={<Mic2 size={15} />}
                       enabled={quickDsp.vadGate.enabled}
-                      status={quickDspStatus(
-                        quickDsp.vadGate.enabled,
-                        false,
-                        quickDspBusy === "vadGate",
-                        copy,
-                      )}
-                      busy={quickDspBusy === "vadGate"}
+                      status={quickDspStatus(quickDsp.vadGate.enabled, copy)}
                       controlsLocked={quickControlsLocked}
                       disabledReason={
                         !quickDsp.vadGate.enabled && !quickDsp.rnnoise.enabled
@@ -1416,9 +1419,7 @@ function App() {
                           : undefined
                       }
                       onOpen={() => openProcessor("vad")}
-                      onToggle={(enabled) =>
-                        setQuickDspFeature("vadGate", enabled)
-                      }
+                      onToggle={(enabled) => updateVad({ enabled })}
                       copy={copy}
                     />
                     <QuickDspControl
@@ -1432,7 +1433,7 @@ function App() {
                       onOpen={() => openProcessor("limiter")}
                       copy={copy}
                     />
-                  </div>
+                  </section>
                 </section>
 
                 <section className="surface health-panel">
@@ -1444,11 +1445,15 @@ function App() {
                   <div className="health-grid">
                     <MetricReadout
                       label={copy.status.processedBlocks}
-                      value={status.metrics.processedBlocks.toLocaleString(language)}
+                      value={status.metrics.processedBlocks.toLocaleString(
+                        language,
+                      )}
                     />
                     <MetricReadout
                       label={copy.status.deviceRestarts}
-                      value={status.metrics.deviceRestarts.toLocaleString(language)}
+                      value={status.metrics.deviceRestarts.toLocaleString(
+                        language,
+                      )}
                     />
                     <MetricReadout
                       label={copy.status.outputQueue}
@@ -1457,8 +1462,20 @@ function App() {
                     />
                     <MetricReadout
                       label={copy.status.audioAnomalies}
-                      value={audioAnomalyTotal(status.metrics).toLocaleString(language)}
+                      value={audioAnomalyTotal(status.metrics).toLocaleString(
+                        language,
+                      )}
                       title={copy.status.audioAnomaliesHelp}
+                    />
+                    <MetricReadout
+                      label={copy.status.dspP99}
+                      value={`${status.metrics.processingTimeP99Us.toFixed(0)} µs`}
+                      title={copy.status.dspP99Title(
+                        status.metrics.processingTimeMaxUs.toFixed(0),
+                        status.metrics.processingDeadlineMisses.toLocaleString(
+                          language,
+                        ),
+                      )}
                     />
                     <MetricReadout
                       label={copy.status.deviceDiscontinuities}
@@ -1513,14 +1530,16 @@ function App() {
                       label={copy.routing.followDefaultRender}
                       help={copy.routing.followDefaultRenderHelp}
                       checked={draft.followDefaultRender}
-                      disabled={controlsDisabled}
+                      disabled={controlsDisabled || !draft.dsp.aec.enabled}
                       onChange={(checked) =>
                         changeSettings((current) => ({
                           ...current,
                           followDefaultRender: checked,
                           renderEndpointId: checked
                             ? null
-                            : (current.renderEndpointId ?? defaultRender?.id ?? null),
+                            : (current.renderEndpointId ??
+                              defaultRender?.id ??
+                              null),
                         }))
                       }
                     />
@@ -1530,7 +1549,7 @@ function App() {
                         label={copy.routing.renderReference}
                         help={copy.routing.renderReferenceHelp}
                         value={draft.renderEndpointId ?? ""}
-                        disabled={controlsDisabled}
+                        disabled={controlsDisabled || !draft.dsp.aec.enabled}
                         onChange={(value) =>
                           changeSettings((current) => ({
                             ...current,
@@ -1541,7 +1560,8 @@ function App() {
                         <option value="">{copy.routing.selectRender}</option>
                         {draft.renderEndpointId &&
                           !renderEndpoints.some(
-                            (endpoint) => endpoint.id === draft.renderEndpointId,
+                            (endpoint) =>
+                              endpoint.id === draft.renderEndpointId,
                           ) && (
                             <option value={draft.renderEndpointId}>
                               {copy.routing.savedRenderUnavailable}
@@ -1575,13 +1595,8 @@ function App() {
                       }))
                     }
                   >
-                    <option
-                      value=""
-                      disabled={followDefaultCaptureBlocked}
-                    >
-                      {effectiveVirtualMode === "custom"
-                        ? copy.routing.selectPhysicalCapture
-                        : copy.routing.followDefaultCapture}
+                    <option value="" disabled={followDefaultCaptureBlocked}>
+                      {copy.routing.followDefaultCapture}
                     </option>
                     {draft.captureEndpointId &&
                       !captureEndpoints.some(
@@ -1639,12 +1654,13 @@ function App() {
                     }
                   >
                     <option value="auto">Auto</option>
-                    {draft.captureChannel != null && draft.captureChannel >= 16 && (
-                      <option value={draft.captureChannel}>
-                        {copy.routing.savedChannel(draft.captureChannel + 1)}
-                      </option>
-                    )}
-                    {Array.from({ length: 16 }, (_, channel) => (
+                    {draft.captureChannel != null &&
+                      draft.captureChannel >= 16 && (
+                        <option value={draft.captureChannel}>
+                          {copy.routing.savedChannel(draft.captureChannel + 1)}
+                        </option>
+                      )}
+                    {CAPTURE_CHANNEL_OPTIONS.map((channel) => (
                       <option key={channel} value={channel}>
                         Channel {channel + 1}
                       </option>
@@ -1683,27 +1699,37 @@ function App() {
                     {(customPairOffline || !vbCablePair) && (
                       <div
                         className={`virtual-device-notice${
-                          customPairTrusted ? " is-advisory" : ""
+                          customPairTrusted || knownVbCableOffline
+                            ? " is-advisory"
+                            : ""
                         }`}
-                        role={customPairTrusted ? "status" : "alert"}
+                        role={
+                          customPairTrusted || knownVbCableOffline
+                            ? "status"
+                            : "alert"
+                        }
                       >
                         <AlertTriangle size={17} aria-hidden="true" />
                         <div>
                           <strong>
-                            {customPairOffline
-                              ? copy.routing.customDeviceWaiting
-                              : customPairTrusted
-                              ? copy.routing.customDeviceActive
-                              : copy.routing.vbCableMissing}
+                            {knownVbCableOffline
+                              ? copy.routing.vbCableWaiting
+                              : customPairOffline
+                                ? copy.routing.customDeviceWaiting
+                                : customPairTrusted
+                                  ? copy.routing.customDeviceActive
+                                  : copy.routing.vbCableMissing}
                           </strong>
                           <p>
-                            {customPairOffline
-                              ? copy.routing.customDeviceWaitingHelp
-                              : customPairTrusted
-                              ? copy.routing.customDeviceActiveHelp
-                              : copy.routing.vbCableMissingHelp}
+                            {knownVbCableOffline
+                              ? copy.routing.vbCableWaitingHelp
+                              : customPairOffline
+                                ? copy.routing.customDeviceWaitingHelp
+                                : customPairTrusted
+                                  ? copy.routing.customDeviceActiveHelp
+                                  : copy.routing.vbCableMissingHelp}
                           </p>
-                          {!customPairTrusted && (
+                          {!customPairTrusted && !knownVbCableOffline && (
                             <ol>
                               <li>{copy.routing.vbCableInstallStepDownload}</li>
                               <li>{copy.routing.vbCableInstallStepAdmin}</li>
@@ -1711,7 +1737,7 @@ function App() {
                             </ol>
                           )}
                           <div className="inline-actions">
-                            {!customPairTrusted && (
+                            {!customPairTrusted && !knownVbCableOffline && (
                               <button
                                 type="button"
                                 onClick={openVbCableDownload}
@@ -1738,15 +1764,31 @@ function App() {
                       </div>
                     )}
 
-                    {effectiveVirtualMode === "vbCable" && vbCablePair ? (
-                      <div className="detected-device-pair">
-                        <CircleCheck size={17} aria-hidden="true" />
+                    {effectiveVirtualMode === "vbCable" ? (
+                      <div
+                        className={`detected-device-pair${vbCablePair ? "" : " is-waiting"}`}
+                      >
+                        {vbCablePair ? (
+                          <CircleCheck size={17} aria-hidden="true" />
+                        ) : (
+                          <AlertTriangle size={17} aria-hidden="true" />
+                        )}
                         <div>
-                          <strong>{copy.routing.vbCableDetected}</strong>
+                          <strong>
+                            {vbCablePair
+                              ? copy.routing.vbCableDetected
+                              : copy.routing.vbCableWaiting}
+                          </strong>
                           <span>
-                            {vbCablePair.render.friendlyName}
+                            {vbCablePair
+                              ? vbCablePair.render.friendlyName
+                              : (draft.outputEndpointId ??
+                                copy.routing.savedOutputUnavailable)}
                             <ArrowRight size={13} aria-hidden="true" />
-                            {vbCablePair.capture.friendlyName}
+                            {vbCablePair
+                              ? vbCablePair.capture.friendlyName
+                              : (draft.virtualCaptureEndpointId ??
+                                copy.routing.savedVirtualCaptureUnavailable)}
                           </span>
                         </div>
                       </div>
@@ -1836,8 +1878,7 @@ function App() {
                             draft.virtualCaptureEndpointId &&
                             !allCaptureEndpoints.some(
                               (endpoint) =>
-                                endpoint.id ===
-                                draft.virtualCaptureEndpointId,
+                                endpoint.id === draft.virtualCaptureEndpointId,
                             ) && (
                               <option value={draft.virtualCaptureEndpointId}>
                                 {copy.routing.savedVirtualCaptureUnavailable}
@@ -1885,7 +1926,10 @@ function App() {
                         </label>
 
                         {virtualConfigurationIssue && (
-                          <div className="virtual-configuration-error" role="alert">
+                          <div
+                            className="virtual-configuration-error"
+                            role="alert"
+                          >
                             <AlertTriangle size={15} aria-hidden="true" />
                             <span>
                               {virtualConfigurationIssue.reason ===
@@ -1916,7 +1960,9 @@ function App() {
                                     className="icon-button"
                                     type="button"
                                     title={copy.routing.revokeTrustedDevice}
-                                    aria-label={copy.routing.revokeTrustedDevice}
+                                    aria-label={
+                                      copy.routing.revokeTrustedDevice
+                                    }
                                     disabled={busy}
                                     onClick={() => void revokeTrustedPair(pair)}
                                   >
@@ -1947,6 +1993,9 @@ function App() {
                       value={routeName(
                         status.activeRoute?.renderEndpointId,
                         status.endpoints,
+                        status.activeRoute
+                          ? copy.routing.notInUse
+                          : copy.engineOutputs.inactive,
                       )}
                     />
                     <RouteLine
@@ -1957,9 +2006,7 @@ function App() {
                     <RouteLine
                       icon={<Mic2 size={14} />}
                       label={copy.routing.xmicPhysicalCapture}
-                      value={
-                        selectedCapture?.friendlyName ?? copy.routing.notSelected
-                      }
+                      value={activeCaptureLabel}
                     />
                     <RouteLine
                       icon={<Cable size={14} />}
@@ -1967,12 +2014,13 @@ function App() {
                       value={routeName(
                         status.activeRoute?.outputEndpointId,
                         status.endpoints,
+                        copy.engineOutputs.inactive,
                       )}
                     />
                     <RouteLine
                       icon={<SlidersHorizontal size={14} />}
-                      label={copy.routing.dspProfile}
-                      value={profileLabel}
+                      label={copy.routing.dspSettings}
+                      value={appliedDspSettingsLabel}
                     />
                   </div>
                 </section>
@@ -1985,19 +2033,19 @@ function App() {
                   />
                   <div className="field-heading">
                     <ControlLabel
-                      label={copy.routing.unprocessedOutput}
-                      help={copy.routing.unprocessedOutputHelp}
+                      label={copy.routing.degradedOutput}
+                      help={copy.routing.degradedOutputHelp}
                     />
                   </div>
                   <div className="segmented-control">
                     <button
                       type="button"
-                      aria-pressed={draft.unprocessedOutput === "rawMicrophone"}
+                      aria-pressed={draft.degradedOutput === "raw"}
                       disabled={controlsDisabled}
                       onClick={() =>
                         changeSettings((current) => ({
                           ...current,
-                          unprocessedOutput: "rawMicrophone",
+                          degradedOutput: "raw",
                         }))
                       }
                     >
@@ -2005,12 +2053,12 @@ function App() {
                     </button>
                     <button
                       type="button"
-                      aria-pressed={draft.unprocessedOutput === "silence"}
+                      aria-pressed={draft.degradedOutput === "silence"}
                       disabled={controlsDisabled}
                       onClick={() =>
                         changeSettings((current) => ({
                           ...current,
-                          unprocessedOutput: "silence",
+                          degradedOutput: "silence",
                         }))
                       }
                     >
@@ -2047,16 +2095,18 @@ function App() {
                     <Toggle
                       label={copy.routing.startOnLaunch}
                       help={
-                        configurationIssue
-                          ? copy.routing.startOnLaunchBlockedHelp
-                          : copy.routing.startOnLaunchHelp
+                        settingsResetPending
+                          ? copy.routing.startOnLaunchResetHelp
+                          : configurationIssue
+                            ? copy.routing.startOnLaunchBlockedHelp
+                            : copy.routing.startOnLaunchHelp
                       }
                       checked={lifecycleStatus?.startEngineOnLaunch ?? false}
                       disabled={
                         !lifecycleStatus ||
                         lifecycleBusy ||
                         Boolean(
-                          configurationIssue &&
+                          (configurationIssue || settingsResetPending) &&
                             !lifecycleStatus.startEngineOnLaunch,
                         )
                       }
@@ -2184,7 +2234,9 @@ function App() {
                         label={copy.dsp.vad.enabled}
                         help={copy.dsp.vad.enabledHelp}
                         checked={draft.dsp.vadGate.enabled}
-                        disabled={controlsDisabled || !draft.dsp.rnnoise.enabled}
+                        disabled={
+                          controlsDisabled || !draft.dsp.rnnoise.enabled
+                        }
                         onChange={(enabled) => updateVad({ enabled })}
                       />
                     )}
@@ -2197,13 +2249,6 @@ function App() {
                   </div>
                 </div>
 
-                {running && (
-                  <div className="editor-lock-notice">
-                    <Activity size={14} />
-                    {copy.views.processing.stopToEdit}
-                  </div>
-                )}
-
                 <div className="processor-editor-body">
                   {activeDspStage === "aec" && (
                     <>
@@ -2214,23 +2259,25 @@ function App() {
                             help={copy.dsp.aec.presetHelp}
                           />
                           <div className="segmented-control">
-                            {(["natural", "balanced", "strong"] as AecPreset[]).map(
-                              (preset) => (
-                                <button
-                                  key={preset}
-                                  type="button"
-                                  aria-pressed={draft.dsp.aec.preset === preset}
-                                  disabled={controlsDisabled || !draft.dsp.aec.enabled}
-                                  onClick={() => updateAec({ preset })}
-                                >
-                                  {preset === "natural"
-                                    ? "Natural"
-                                    : preset === "balanced"
-                                      ? "Balanced"
-                                      : "Strong"}
-                                </button>
-                              ),
-                            )}
+                            {(
+                              ["natural", "balanced", "strong"] as AecPreset[]
+                            ).map((preset) => (
+                              <button
+                                key={preset}
+                                type="button"
+                                aria-pressed={draft.dsp.aec.preset === preset}
+                                disabled={
+                                  controlsDisabled || !draft.dsp.aec.enabled
+                                }
+                                onClick={() => updateAec({ preset })}
+                              >
+                                {preset === "natural"
+                                  ? "Natural"
+                                  : preset === "balanced"
+                                    ? "Balanced"
+                                    : "Strong"}
+                              </button>
+                            ))}
                           </div>
                         </div>
                         <div className="single-toggle-field">
@@ -2238,7 +2285,9 @@ function App() {
                             label={copy.dsp.aec.highPass}
                             help={copy.dsp.aec.highPassHelp}
                             checked={draft.dsp.aec.highPassFilterEnabled}
-                            disabled={controlsDisabled || !draft.dsp.aec.enabled}
+                            disabled={
+                              controlsDisabled || !draft.dsp.aec.enabled
+                            }
                             onChange={(highPassFilterEnabled) =>
                               updateAec({ highPassFilterEnabled })
                             }
@@ -2252,7 +2301,9 @@ function App() {
                           </span>
                           <span>
                             <strong>{copy.views.processing.diagnostics}</strong>
-                            <small>{copy.views.processing.diagnosticsSubtitle}</small>
+                            <small>
+                              {copy.views.processing.diagnosticsSubtitle}
+                            </small>
                           </span>
                           <ChevronRight size={15} className="summary-chevron" />
                         </summary>
@@ -2275,8 +2326,12 @@ function App() {
                         maximum={100}
                         step={5}
                         suffix="%"
-                        disabled={controlsDisabled || !draft.dsp.rnnoise.enabled}
-                        onChange={(value) => updateRnnoise({ mix: value / 100 })}
+                        disabled={
+                          controlsDisabled || !draft.dsp.rnnoise.enabled
+                        }
+                        onChange={(value) =>
+                          updateRnnoise({ mix: value / 100 })
+                        }
                       />
                     </div>
                   )}
@@ -2309,7 +2364,9 @@ function App() {
                           step={0.5}
                           suffix="dB"
                           disabled={controlsDisabled || !draft.dsp.agc2.enabled}
-                          onChange={(fixedGainDb) => updateAgc2({ fixedGainDb })}
+                          onChange={(fixedGainDb) =>
+                            updateAgc2({ fixedGainDb })
+                          }
                         />
                         <NumberControl
                           label={copy.dsp.agc2.headroom}
@@ -2342,7 +2399,9 @@ function App() {
                           step={0.5}
                           suffix="dB"
                           disabled={controlsDisabled || !draft.dsp.agc2.enabled}
-                          onChange={(initialGainDb) => updateAgc2({ initialGainDb })}
+                          onChange={(initialGainDb) =>
+                            updateAgc2({ initialGainDb })
+                          }
                         />
                         <NumberControl
                           label={copy.dsp.agc2.gainSpeed}
@@ -2390,7 +2449,9 @@ function App() {
                           maximum={1}
                           step={0.05}
                           suffix=""
-                          disabled={controlsDisabled || !draft.dsp.vadGate.enabled}
+                          disabled={
+                            controlsDisabled || !draft.dsp.vadGate.enabled
+                          }
                           onChange={(threshold) => updateVad({ threshold })}
                         />
                       </div>
@@ -2403,8 +2464,12 @@ function App() {
                           maximum={1000}
                           step={10}
                           suffix="ms"
-                          disabled={controlsDisabled || !draft.dsp.vadGate.enabled}
-                          onChange={(confirmationMs) => updateVad({ confirmationMs })}
+                          disabled={
+                            controlsDisabled || !draft.dsp.vadGate.enabled
+                          }
+                          onChange={(confirmationMs) =>
+                            updateVad({ confirmationMs })
+                          }
                         />
                         <NumberControl
                           label={copy.dsp.vad.hold}
@@ -2414,7 +2479,9 @@ function App() {
                           maximum={10000}
                           step={10}
                           suffix="ms"
-                          disabled={controlsDisabled || !draft.dsp.vadGate.enabled}
+                          disabled={
+                            controlsDisabled || !draft.dsp.vadGate.enabled
+                          }
                           onChange={(holdMs) => updateVad({ holdMs })}
                         />
                         <NumberControl
@@ -2425,7 +2492,9 @@ function App() {
                           maximum={0}
                           step={1}
                           suffix="dB"
-                          disabled={controlsDisabled || !draft.dsp.vadGate.enabled}
+                          disabled={
+                            controlsDisabled || !draft.dsp.vadGate.enabled
+                          }
                           onChange={(floorDb) => updateVad({ floorDb })}
                         />
                         <NumberControl
@@ -2436,7 +2505,9 @@ function App() {
                           maximum={10000}
                           step={1}
                           suffix="ms"
-                          disabled={controlsDisabled || !draft.dsp.vadGate.enabled}
+                          disabled={
+                            controlsDisabled || !draft.dsp.vadGate.enabled
+                          }
                           onChange={(attackMs) => updateVad({ attackMs })}
                         />
                         <NumberControl
@@ -2447,7 +2518,9 @@ function App() {
                           maximum={10000}
                           step={1}
                           suffix="ms"
-                          disabled={controlsDisabled || !draft.dsp.vadGate.enabled}
+                          disabled={
+                            controlsDisabled || !draft.dsp.vadGate.enabled
+                          }
                           onChange={(releaseMs) => updateVad({ releaseMs })}
                         />
                       </div>
@@ -2486,12 +2559,46 @@ function App() {
               </section>
             </div>
           </section>
+
+          <section
+            className="view-section"
+            id="view-about"
+            aria-labelledby="view-about-title"
+          >
+            <ViewSectionHeading
+              id="view-about-title"
+              icon={<Info size={18} />}
+              eyebrow={copy.views.about.eyebrow}
+              title={copy.views.about.title}
+              subtitle={copy.views.about.subtitle}
+            />
+            <AboutView
+              active={activeView === "about"}
+              version={appVersion}
+              copy={copy.about}
+            />
+          </section>
         </main>
 
-        {dirty && (
+        {(dirty || settingsResetPending) && (
           <div className="apply-dock" role="status">
             <span className="pending-indicator" aria-hidden="true" />
-            <span>{copy.common.pendingSettings}</span>
+            <span>
+              {settingsResetPending
+                ? copy.common.settingsResetPending
+                : copy.common.pendingSettings}
+            </span>
+            {dirty && (
+              <button
+                className="discard-settings"
+                type="button"
+                onClick={discardSettings}
+                disabled={controlsDisabled}
+              >
+                <RotateCcw size={15} />
+                {copy.common.discardSettings}
+              </button>
+            )}
             <button
               type="button"
               onClick={applySettings}
@@ -2555,26 +2662,6 @@ function NavigationButton({
       <span>{label}</span>
       <ChevronRight size={14} className="navigation-chevron" />
     </button>
-  );
-}
-
-function RuntimeItem({
-  icon,
-  label,
-  value,
-}: {
-  icon: ReactNode;
-  label: string;
-  value: string;
-}) {
-  return (
-    <div className="runtime-item">
-      <span className="runtime-icon">{icon}</span>
-      <span>
-        <small>{label}</small>
-        <strong>{value}</strong>
-      </span>
-    </div>
   );
 }
 
@@ -2654,9 +2741,7 @@ function QuickDspControl({
   description,
   icon,
   enabled,
-  bypassed = false,
   status,
-  busy = false,
   locked = false,
   controlsLocked,
   disabledReason,
@@ -2668,9 +2753,7 @@ function QuickDspControl({
   description: string;
   icon: ReactNode;
   enabled: boolean;
-  bypassed?: boolean;
   status: string;
-  busy?: boolean;
   locked?: boolean;
   controlsLocked: boolean;
   disabledReason?: string;
@@ -2679,15 +2762,7 @@ function QuickDspControl({
   copy: Translation;
 }) {
   const dependencyBlocked = Boolean(disabledReason);
-  const state = busy
-    ? "busy"
-    : bypassed
-      ? "bypassed"
-      : locked
-        ? "locked"
-        : enabled
-          ? "enabled"
-          : "disabled";
+  const state = locked ? "locked" : enabled ? "enabled" : "disabled";
 
   return (
     <div
@@ -2713,6 +2788,7 @@ function QuickDspControl({
         {locked ? (
           <span
             className="dsp-module-lock"
+            role="img"
             title={copy.views.monitor.alwaysEnabled}
             aria-label={`${label}: ${copy.views.monitor.alwaysEnabled}`}
           >
@@ -2726,23 +2802,13 @@ function QuickDspControl({
             aria-checked={enabled}
             aria-disabled={dependencyBlocked || undefined}
             aria-label={copy.views.monitor.toggleModule(label)}
-            title={
-              disabledReason ?? copy.views.monitor.toggleModule(label)
-            }
+            title={disabledReason ?? copy.views.monitor.toggleModule(label)}
             disabled={controlsLocked}
             onClick={() => {
               if (!dependencyBlocked && !controlsLocked) onToggle?.(!enabled);
             }}
           >
-            {busy ? (
-              <LoaderCircle
-                className="dsp-switch-spinner"
-                size={13}
-                aria-hidden="true"
-              />
-            ) : (
-              <span aria-hidden="true" />
-            )}
+            <span aria-hidden="true" />
           </button>
         )}
       </span>
@@ -2829,7 +2895,10 @@ function AecDiagnostics({
   language: Language;
 }) {
   return (
-    <div className="diagnostics-grid" aria-label={copy.dsp.aec.diagnosticsAria}>
+    <section
+      className="diagnostics-grid"
+      aria-label={copy.dsp.aec.diagnosticsAria}
+    >
       <DiagnosticCell
         label={copy.dsp.diagnostics.pipelineLatency}
         value={formatOptionalMetric(metrics.pipelineLatencyMs, "ms")}
@@ -2896,7 +2965,11 @@ function AecDiagnostics({
       />
       <DiagnosticCell
         label={copy.dsp.diagnostics.residualEcho}
-        value={formatOptionalMetric(metrics.aecResidualEchoLikelihood, "", 2).trim()}
+        value={formatOptionalMetric(
+          metrics.aecResidualEchoLikelihood,
+          "",
+          2,
+        ).trim()}
         title={copy.dsp.diagnostics.residualEchoHelp}
       />
       <DiagnosticCell
@@ -2968,7 +3041,9 @@ function AecDiagnostics({
       />
       <DiagnosticCell
         label={copy.dsp.diagnostics.nearendCandidates}
-        value={(metrics.echoGuardNearendCandidateEvents ?? 0).toLocaleString(language)}
+        value={(metrics.echoGuardNearendCandidateEvents ?? 0).toLocaleString(
+          language,
+        )}
         title={copy.dsp.diagnostics.nearendCandidatesHelp}
       />
       <DiagnosticCell
@@ -2976,7 +3051,7 @@ function AecDiagnostics({
         value={(metrics.echoGuardReleaseEvents ?? 0).toLocaleString(language)}
         title={copy.dsp.diagnostics.echoGuardReleasesHelp}
       />
-    </div>
+    </section>
   );
 }
 
@@ -3021,75 +3096,7 @@ function stageSubtitle(stage: DspStageId, copy: Translation) {
   return copy.dsp.limiterSubtitle;
 }
 
-function dspFeatureEnabled(
-  settings: EngineSettings,
-  feature: DspFeatureId,
-) {
-  if (feature === "aec") return settings.dsp.aec.enabled;
-  if (feature === "rnnoise") return settings.dsp.rnnoise.enabled;
-  if (feature === "agc2") return settings.dsp.agc2.enabled;
-  return settings.dsp.vadGate.enabled;
-}
-
-function withDspFeatureEnabled(
-  settings: EngineSettings,
-  feature: DspFeatureId,
-  enabled: boolean,
-): EngineSettings {
-  if (feature === "aec") {
-    return {
-      ...settings,
-      dsp: {
-        ...settings.dsp,
-        aec: { ...settings.dsp.aec, enabled },
-      },
-    };
-  }
-  if (feature === "rnnoise") {
-    return {
-      ...settings,
-      dsp: {
-        ...settings.dsp,
-        rnnoise: { ...settings.dsp.rnnoise, enabled },
-      },
-    };
-  }
-  if (feature === "agc2") {
-    // Mirrors DspFeature::set_enabled in src-tauri/src/engine.rs, which arms the adaptive gain so
-    // the quick toggle cannot leave AGC2 enabled but transparent.
-    const armAdaptive =
-      enabled &&
-      !settings.dsp.agc2.adaptiveDigitalEnabled &&
-      settings.dsp.agc2.fixedGainDb <= 0;
-    return {
-      ...settings,
-      dsp: {
-        ...settings.dsp,
-        agc2: {
-          ...settings.dsp.agc2,
-          enabled,
-          ...(armAdaptive ? { adaptiveDigitalEnabled: true } : {}),
-        },
-      },
-    };
-  }
-  return {
-    ...settings,
-    dsp: {
-      ...settings.dsp,
-      vadGate: { ...settings.dsp.vadGate, enabled },
-    },
-  };
-}
-
-function quickDspStatus(
-  enabled: boolean,
-  bypassed: boolean,
-  busy: boolean,
-  copy: Translation,
-) {
-  if (busy) return copy.views.monitor.applying;
-  if (bypassed) return copy.views.monitor.bypassed;
+function quickDspStatus(enabled: boolean, copy: Translation) {
   return enabled
     ? copy.views.monitor.moduleEnabled
     : copy.views.monitor.moduleDisabled;
@@ -3104,10 +3111,7 @@ function booleanState(
   return value ? positive : negative;
 }
 
-function calibrationLabel(
-  state: DelayCalibrationState,
-  copy: Translation,
-) {
+function calibrationLabel(state: DelayCalibrationState, copy: Translation) {
   if (state === "calibrated") return copy.dsp.diagnostics.calibrated;
   if (state === "warmingUp") return copy.dsp.diagnostics.warming;
   return copy.dsp.diagnostics.waiting;
@@ -3126,10 +3130,11 @@ function audioAnomalyTotal(metrics: EngineMetrics) {
 }
 
 function routeName(
-  endpointId: string | undefined,
+  endpointId: string | null | undefined,
   endpoints: EndpointDescriptor[],
+  empty = "-",
 ) {
-  if (!endpointId) return "-";
+  if (!endpointId) return empty;
   return (
     endpoints.find((endpoint) => endpoint.id === endpointId)?.friendlyName ??
     endpointId
@@ -3163,24 +3168,49 @@ function describeConfigurationIssue(
 }
 
 function buildDeviceDiagnostics(
-  endpoints: EndpointDescriptor[],
+  status: EngineStatus,
   settings: EngineSettings,
   issue: ConfigurationIssue | null,
+  uiError: string | null,
+  lifecycleError: string | null,
 ) {
-  const vbCable = findStandardVbCablePair(endpoints);
+  const vbCable = findStandardVbCablePair(status.endpoints);
+  const reason = status.primaryReason;
   const lines = [
     "XMic audio device diagnostics",
+    `Desired enabled: ${status.desiredEnabled}`,
+    `State: ${status.state}`,
+    `Output: ${status.output}`,
+    `Primary reason: ${reason ? `${reason.code}${reason.detail ? ` (${reason.detail})` : ""}${reason.endpointId ? ` [${diagnosticEndpoint(reason.endpointId, status.endpoints, "unknown")}]` : ""}${reason.retryAfterMs != null ? ` retry=${reason.retryAfterMs}ms` : ""}` : "none"}`,
+    `Active render: ${diagnosticEndpoint(status.activeRoute?.renderEndpointId, status.endpoints, "not in use")}`,
+    `Active capture: ${diagnosticEndpoint(status.activeRoute?.captureEndpointId, status.endpoints, "not in use")}`,
+    `Active output: ${diagnosticEndpoint(status.activeRoute?.outputEndpointId, status.endpoints, "inactive")}`,
     `VB-CABLE: ${vbCable ? "detected" : "not detected"}`,
-    `Mode: ${settings.virtualDeviceMode ?? "automatic"}`,
+    `Virtual device mode: ${settings.virtualDeviceMode ?? "automatic"}`,
+    "DSP settings: global",
     `Configuration issue: ${issue ? `${issue.type}:${"reason" in issue ? issue.reason : "kind" in issue ? issue.kind : "capture"}` : "none"}`,
+    `UI error detail: ${uiError ?? "none"}`,
+    `Lifecycle error detail: ${lifecycleError ?? "none"}`,
     "Endpoints:",
   ];
-  for (const endpoint of endpoints) {
+  for (const endpoint of status.endpoints) {
     lines.push(
       `- [${endpoint.flow}] ${endpoint.friendlyName} | roles=${endpoint.defaultRoles.join(",") || "none"} | group=${endpoint.groupId ? "present" : "none"} | id#=${shortEndpointHash(endpoint.id)}`,
     );
   }
   return lines.join("\n");
+}
+
+function diagnosticEndpoint(
+  endpointId: string | null | undefined,
+  endpoints: EndpointDescriptor[],
+  empty: string,
+) {
+  if (!endpointId) return empty;
+  const name = endpoints.find(
+    (endpoint) => endpoint.id === endpointId,
+  )?.friendlyName;
+  return `${name ?? "unknown"} (id#=${shortEndpointHash(endpointId)})`;
 }
 
 function shortEndpointHash(value: string) {

@@ -58,11 +58,114 @@ jobs:
       - name: Test frontend and release tooling
         run: npm test
 
-      - name: Build NSIS installer
+      - name: Build validated release assets
         run: npm run bundle
 
-      - name: Smoke-check NSIS installer
+      - name: Verify release assets and runtime smoke
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
-          ./scripts/prepare-release-assets.ps1 -Version $version -OutputDirectory artifacts/ci-smoke
+          $release = Join-Path (Get-Location) "artifacts/release"
+          $payloads = @(
+            "XMic_${version}_x64-setup.exe",
+            "XMic.exe",
+            "XMic_x64-portable.zip",
+            "XMic_${version}_MPL-2.0-source.zip"
+          )
+
+          $expectedSet = @($payloads + "SHA256SUMS.txt" | Sort-Object)
+          $actualSet = @(Get-ChildItem -LiteralPath $release -File |
+            ForEach-Object Name | Sort-Object)
+          if (Compare-Object $expectedSet $actualSet) {
+            throw "Release payload set mismatch: $($actualSet -join ', ')"
+          }
+
+          $checksumLines = @(Get-Content -LiteralPath (
+            Join-Path $release "SHA256SUMS.txt"))
+          if ($checksumLines.Count -ne $payloads.Count) {
+            throw "SHA256SUMS.txt does not list every payload"
+          }
+          foreach ($payload in $payloads) {
+            $payloadPath = Join-Path $release $payload
+            $expectedHash = (Get-FileHash -LiteralPath $payloadPath -Algorithm SHA256).
+              Hash.ToLowerInvariant()
+            $line = $checksumLines | Where-Object { $_ -like "*  $payload" }
+            if (-not $line -or -not $line.StartsWith($expectedHash)) {
+              throw "Checksum mismatch for $payload"
+            }
+          }
+
+          function Invoke-RuntimeSelfTest([string]$Directory, [string]$Mode) {
+            $reportPath = Join-Path $Directory "self-test.json"
+            $process = Start-Process -FilePath (Join-Path $Directory "XMic.exe") `
+              -ArgumentList @("--runtime-self-test", $reportPath) -Wait -PassThru `
+              -WorkingDirectory $Directory
+            if ($process.ExitCode -ne 0) {
+              throw "runtime self-test exited with $($process.ExitCode) in $Mode mode"
+            }
+            $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
+            if ($report.diagnostics.mode -ne $Mode) {
+              throw "runtime self-test reported mode $($report.diagnostics.mode), expected $Mode"
+            }
+            if ($report.diagnostics.dspSource -ne "embedded") {
+              throw "runtime self-test did not select the embedded DSP"
+            }
+            if (-not $report.diagnostics.dspSelectionPinned) {
+              throw "runtime self-test did not pin the selected DSP"
+            }
+            if (-not $report.embeddedLibraryMatches) {
+              throw "managed DSP copy does not match the embedded bytes"
+            }
+            if (-not $report.currentRuntimeCleaned) {
+              throw "runtime self-test left its run directory behind"
+            }
+            if ($report.diagnostics.actualDspAbi -ne $report.diagnostics.expectedDspAbi) {
+              throw "runtime self-test ABI mismatch"
+            }
+            Write-Output "$Mode self-test: $($report.diagnostics.dataDirectory)"
+          }
+
+          $standalone = Join-Path $env:RUNNER_TEMP "xmic-standalone"
+          Remove-Item -LiteralPath $standalone -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $standalone -Force | Out-Null
+          Copy-Item -LiteralPath (Join-Path $release "XMic.exe") -Destination $standalone
+          Invoke-RuntimeSelfTest $standalone "standard"
+
+          $portable = Join-Path $env:RUNNER_TEMP "xmic-portable"
+          Remove-Item -LiteralPath $portable -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -LiteralPath (Join-Path $release "XMic_x64-portable.zip") `
+            -DestinationPath $portable
+          $portableRoot = Join-Path $portable "XMic_x64-portable"
+          $expectedEntries = @(
+            "XMic.exe",
+            "portable.flag",
+            "data"
+          )
+          $actualEntries = @(Get-ChildItem -LiteralPath $portableRoot |
+            ForEach-Object Name | Sort-Object)
+          if (Compare-Object $expectedEntries $actualEntries) {
+            throw "Portable archive layout mismatch: $($actualEntries -join ', ')"
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $portableRoot "data") -PathType Container)) {
+            throw "Portable archive is missing its data directory"
+          }
+          Invoke-RuntimeSelfTest $portableRoot "portable"
+          $runtimeRoot = Join-Path $portableRoot "data/runtime"
+          if (-not (Test-Path -LiteralPath $runtimeRoot -PathType Container)) {
+            throw "Portable runtime directory was not created under data/"
+          }
+          $leftovers = @(Get-ChildItem -LiteralPath $runtimeRoot -Directory)
+          if ($leftovers.Count -ne 0) {
+            throw "Portable runtime directory kept run folders: $($leftovers.Name -join ', ')"
+          }
+
+          $sourceZip = Join-Path $release "XMic_${version}_MPL-2.0-source.zip"
+          $sourceExtract = Join-Path $env:RUNNER_TEMP "xmic-mpl-source"
+          Remove-Item -LiteralPath $sourceExtract -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -LiteralPath $sourceZip -DestinationPath $sourceExtract
+          foreach ($required in @("MPL_SOURCE_CODE.txt", "LICENSE-MPL-2.0.txt", "sources")) {
+            if (-not (Test-Path -LiteralPath (Join-Path $sourceExtract $required))) {
+              throw "MPL source archive is missing $required"
+            }
+          }

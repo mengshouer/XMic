@@ -1,6 +1,6 @@
 // Which workspace section the sidebar highlights while the page scrolls.
 //
-// The three views are one long scrolling document rather than swapped panes, so the active one is
+// The four views are one long scrolling document rather than swapped panes, so the active one is
 // whichever section has passed a marker line 28% down the viewport — capped so a tall window cannot
 // push that line past a short section.
 //
@@ -8,8 +8,8 @@
 // synchronous layout: the caller measures on layout changes and calls this per scroll event, and this
 // is where the semantics of that split are pinned down.
 
-export type ViewId = "monitor" | "routing" | "processing";
-export const VIEWS = ["monitor", "routing", "processing"] as const;
+export type ViewId = "monitor" | "routing" | "processing" | "about";
+export const VIEWS = ["monitor", "routing", "processing", "about"] as const;
 
 const MARKER_VIEWPORT_FRACTION = 0.28;
 const MARKER_MAXIMUM_PX = 180;

@@ -1,7 +1,7 @@
 use std::{
     ffi::c_void,
     sync::{
-        atomic::{AtomicIsize, Ordering},
+        atomic::{AtomicBool, AtomicIsize, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
         Arc, OnceLock,
     },
@@ -35,7 +35,7 @@ use windows::{
 };
 use xmic_platform_api::{PlatformError, SystemLifecycleEvent};
 
-use crate::{join_worker_with_timeout, operation_error, WORKER_START_TIMEOUT};
+use crate::{join_background_worker, operation_error, WORKER_START_TIMEOUT};
 
 const EVENT_QUEUE_CAPACITY: usize = 32;
 const WINDOW_CLASS_NAME: PCWSTR = w!("XMicSystemLifecycleMonitor");
@@ -43,6 +43,7 @@ const WINDOW_CLASS_NAME: PCWSTR = w!("XMicSystemLifecycleMonitor");
 pub struct SystemLifecycleMonitor {
     events: Receiver<SystemLifecycleEvent>,
     window_handle: Arc<AtomicIsize>,
+    stop_requested: Arc<AtomicBool>,
     worker: Option<JoinHandle<Result<(), PlatformError>>>,
 }
 
@@ -60,16 +61,16 @@ impl SystemLifecycleMonitor {
 
     pub fn stop(mut self) -> Result<(), PlatformError> {
         self.request_stop();
-        self.join_worker()
+        self.join_background_worker()
     }
 
     fn request_stop(&self) {
-        request_window_close(&self.window_handle);
+        request_background_stop(&self.window_handle, &self.stop_requested);
     }
 
-    fn join_worker(&mut self) -> Result<(), PlatformError> {
+    fn join_background_worker(&mut self) -> Result<(), PlatformError> {
         self.worker.take().map_or(Ok(()), |worker| {
-            join_worker_with_timeout(worker, "system lifecycle monitor")?
+            join_background_worker(worker, "system lifecycle monitor")
         })
     }
 }
@@ -77,7 +78,7 @@ impl SystemLifecycleMonitor {
 impl Drop for SystemLifecycleMonitor {
     fn drop(&mut self) {
         self.request_stop();
-        let _ = self.join_worker();
+        let _ = self.join_background_worker();
     }
 }
 
@@ -85,11 +86,13 @@ pub fn start_system_lifecycle_monitor() -> Result<SystemLifecycleMonitor, Platfo
     let (event_tx, event_rx) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let window_handle = Arc::new(AtomicIsize::new(0));
+    let stop_requested = Arc::new(AtomicBool::new(false));
     let worker_handle = Arc::clone(&window_handle);
+    let worker_stop = Arc::clone(&stop_requested);
     let worker = thread::Builder::new()
         .name("xmic-system-lifecycle".to_owned())
         .spawn(move || {
-            let result = run_monitor(event_tx, worker_handle, &ready_tx);
+            let result = run_monitor(event_tx, worker_handle, &worker_stop, &ready_tx);
             if let Err(error) = &result {
                 let _ = ready_tx.send(Err(error.to_string()));
             }
@@ -101,20 +104,21 @@ pub fn start_system_lifecycle_monitor() -> Result<SystemLifecycleMonitor, Platfo
         Ok(Ok(())) => Ok(SystemLifecycleMonitor {
             events: event_rx,
             window_handle,
+            stop_requested,
             worker: Some(worker),
         }),
         Ok(Err(error)) => {
-            stop_failed_start(&window_handle, worker);
+            stop_failed_start(&window_handle, &stop_requested, worker);
             Err(PlatformError::Operation(error))
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            stop_failed_start(&window_handle, worker);
+            stop_failed_start(&window_handle, &stop_requested, worker);
             Err(PlatformError::Operation(
                 "system lifecycle monitor preparation timed out after 5 seconds".to_owned(),
             ))
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
-            stop_failed_start(&window_handle, worker);
+            stop_failed_start(&window_handle, &stop_requested, worker);
             Err(PlatformError::WorkerStopped)
         }
     }
@@ -128,9 +132,18 @@ fn request_window_close(window_handle: &AtomicIsize) {
     }
 }
 
-fn stop_failed_start(window_handle: &AtomicIsize, worker: JoinHandle<Result<(), PlatformError>>) {
+fn stop_failed_start(
+    window_handle: &AtomicIsize,
+    stop_requested: &AtomicBool,
+    worker: JoinHandle<Result<(), PlatformError>>,
+) {
+    request_background_stop(window_handle, stop_requested);
+    let _ = join_background_worker(worker, "failed system lifecycle monitor startup");
+}
+
+fn request_background_stop(window_handle: &AtomicIsize, stop_requested: &AtomicBool) {
+    stop_requested.store(true, Ordering::Release);
     request_window_close(window_handle);
-    let _ = join_worker_with_timeout(worker, "failed system lifecycle monitor startup");
 }
 
 struct WindowContext {
@@ -140,6 +153,7 @@ struct WindowContext {
 fn run_monitor(
     events: SyncSender<SystemLifecycleEvent>,
     window_handle: Arc<AtomicIsize>,
+    stop_requested: &AtomicBool,
     ready: &SyncSender<Result<(), String>>,
 ) -> Result<(), PlatformError> {
     register_window_class()?;
@@ -173,6 +187,13 @@ fn run_monitor(
             "register Windows session lifecycle notifications",
             error,
         ));
+    }
+
+    if stop_requested.load(Ordering::Acquire) {
+        let _ = unsafe { WTSUnRegisterSessionNotification(window) };
+        let _ = unsafe { DestroyWindow(window) };
+        window_handle.store(0, Ordering::Release);
+        return Ok(());
     }
 
     let _ = ready.send(Ok(()));
@@ -302,6 +323,16 @@ mod tests {
             Some(SystemLifecycleEvent::Suspending)
         );
         assert_eq!(classify_message(WM_CLOSE, 0), None);
+    }
+
+    #[test]
+    fn failed_start_records_stop_even_before_a_window_exists() {
+        let handle = AtomicIsize::new(0);
+        let stop_requested = AtomicBool::new(false);
+
+        request_background_stop(&handle, &stop_requested);
+
+        assert!(stop_requested.load(Ordering::Acquire));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, path::Path};
+use std::{path::Path, sync::Arc};
 
 use xmic_engine_core::{
     EchoGuard, EchoGuardConfig, SafetyLimiter, SafetyLimiterConfig, VadGate, VadGateConfig,
@@ -8,6 +8,7 @@ use xmic_engine_protocol::{AecPreset, DspSettings};
 use xmic_rnnoise_dsp::{RnnoiseConfig, RnnoiseDsp};
 use xmic_webrtc_dsp::{
     AecPreset as NativeAecPreset, Agc2Config, DspConfig, DspMetrics, WebRtcAgc2, WebRtcDsp,
+    WebRtcLibrary,
 };
 
 const ECHO_GUARD_SMOOTHING_PRE_ROLL_FRAMES: usize = 2;
@@ -38,6 +39,11 @@ pub struct DspProcessor {
     aec_output: [f32; DSP_SAMPLES_PER_FRAME],
     rnnoise_output: [f32; DSP_SAMPLES_PER_FRAME],
     post_agc_output: [f32; DSP_SAMPLES_PER_FRAME],
+    /// RNNoise emits audio/VAD for the previous 10 ms frame. Delay the raw/AEC power pair by the
+    /// same frame so EchoGuard never compares a VAD decision with the following frame's attenuation.
+    echo_guard_input: [f32; DSP_SAMPLES_PER_FRAME],
+    echo_guard_aec_output: [f32; DSP_SAMPLES_PER_FRAME],
+    echo_guard_residual_likelihood: Option<f32>,
 }
 
 impl DspProcessor {
@@ -54,13 +60,42 @@ impl DspProcessor {
         if settings.vad_gate.enabled && !settings.rnnoise.enabled {
             return Err(DspProcessorError::VadRequiresRnnoise);
         }
+        let library = if settings.aec.enabled || settings.agc2.enabled {
+            Some(WebRtcLibrary::load(native_library).map_err(|failure| failure.error)?)
+        } else {
+            None
+        };
+        Self::build(library, render_channels, settings)
+    }
+
+    pub fn from_library(
+        native_library: Arc<WebRtcLibrary>,
+        render_channels: usize,
+        settings: &DspSettings,
+    ) -> Result<Self, DspProcessorError> {
+        Self::build(Some(native_library), render_channels, settings)
+    }
+
+    fn build(
+        native_library: Option<Arc<WebRtcLibrary>>,
+        render_channels: usize,
+        settings: &DspSettings,
+    ) -> Result<Self, DspProcessorError> {
+        if !(1..=MAX_RENDER_CHANNELS).contains(&render_channels) {
+            return Err(DspProcessorError::UnsupportedRenderChannels(
+                render_channels,
+            ));
+        }
+        if settings.vad_gate.enabled && !settings.rnnoise.enabled {
+            return Err(DspProcessorError::VadRequiresRnnoise);
+        }
 
         let aec = settings
             .aec
             .enabled
             .then(|| {
-                WebRtcDsp::load(
-                    native_library,
+                WebRtcDsp::from_library(
+                    Arc::clone(native_library.as_ref().expect("validated native library")),
                     DspConfig {
                         render_channels,
                         aec_preset: map_aec_preset(settings.aec.preset),
@@ -82,8 +117,8 @@ impl DspProcessor {
             .agc2
             .enabled
             .then(|| {
-                WebRtcAgc2::load(
-                    native_library,
+                WebRtcAgc2::from_library(
+                    Arc::clone(native_library.as_ref().expect("validated native library")),
                     Agc2Config {
                         adaptive_digital_enabled: settings.agc2.adaptive_digital_enabled,
                         fixed_gain_db: settings.agc2.fixed_gain_db,
@@ -142,6 +177,9 @@ impl DspProcessor {
             aec_output: [0.0; DSP_SAMPLES_PER_FRAME],
             rnnoise_output: [0.0; DSP_SAMPLES_PER_FRAME],
             post_agc_output: [0.0; DSP_SAMPLES_PER_FRAME],
+            echo_guard_input: [0.0; DSP_SAMPLES_PER_FRAME],
+            echo_guard_aec_output: [0.0; DSP_SAMPLES_PER_FRAME],
+            echo_guard_residual_likelihood: None,
         })
     }
 
@@ -176,16 +214,6 @@ impl DspProcessor {
         output: &mut [f32],
         stream_delay_ms: i32,
     ) -> Result<DspFrameMetrics, DspProcessorError> {
-        self.process_capture_with_options(capture, output, stream_delay_ms, false)
-    }
-
-    pub fn process_capture_with_options(
-        &mut self,
-        capture: &[f32],
-        output: &mut [f32],
-        stream_delay_ms: i32,
-        bypass_agc2: bool,
-    ) -> Result<DspFrameMetrics, DspProcessorError> {
         validate_capture_lengths(capture, output)?;
 
         let residual_echo_likelihood = if let Some(aec) = &mut self.aec {
@@ -217,9 +245,7 @@ impl DspProcessor {
             None
         };
 
-        if bypass_agc2 {
-            self.post_agc_output.copy_from_slice(&self.rnnoise_output);
-        } else if let Some(agc2) = &mut self.agc2 {
+        if let Some(agc2) = &mut self.agc2 {
             agc2.process_capture(&self.rnnoise_output, &mut self.post_agc_output)?;
         } else {
             self.post_agc_output.copy_from_slice(&self.rnnoise_output);
@@ -228,18 +254,22 @@ impl DspProcessor {
             echo_guard_vad_probability(vad_probability, speech_vad_active);
         let echo_guard_metrics = self.echo_guard.process_frame(
             echo_guard_vad_probability,
-            residual_echo_likelihood,
-            capture,
-            &self.aec_output,
+            self.echo_guard_residual_likelihood,
+            &self.echo_guard_input,
+            &self.echo_guard_aec_output,
         )?;
+        self.echo_guard_input.copy_from_slice(capture);
+        self.echo_guard_aec_output.copy_from_slice(&self.aec_output);
+        self.echo_guard_residual_likelihood = residual_echo_likelihood;
         let gate_vad_probability = if echo_guard_metrics.active {
             0.0
         } else {
             vad_probability
         };
-        let gate_metrics = self.gate.process_frame_with_secondary_vad(
+        let gate_metrics = self.gate.process_frame_with_secondary_vad_and_veto(
             gate_vad_probability,
             speech_vad_active,
+            echo_guard_metrics.active,
             &mut self.post_agc_output,
         )?;
         let limiter_metrics = self.limiter.process_frame(&mut self.post_agc_output)?;
@@ -274,13 +304,14 @@ impl DspProcessor {
         if let Some(aec) = &mut self.aec {
             aec.reset_echo_path()?;
         }
-        Ok(())
-    }
-
-    pub fn reset_agc2(&mut self) -> Result<(), DspProcessorError> {
-        if let Some(agc2) = &mut self.agc2 {
-            agc2.reset()?;
-        }
+        // Every decision state that was aligned with the old echo path must reset together. Keeping
+        // old attenuation smoothing, VAD hold or delayed power frames after the native AEC rebuild
+        // can open the gate on evidence from before the reset.
+        self.echo_guard.reset();
+        self.gate.reset();
+        self.echo_guard_input.fill(0.0);
+        self.echo_guard_aec_output.fill(0.0);
+        self.echo_guard_residual_likelihood = None;
         Ok(())
     }
 }
@@ -342,33 +373,6 @@ fn echo_guard_vad_probability(vad_probability: f32, speech_vad_active: Option<bo
         0.0
     } else {
         vad_probability
-    }
-}
-
-pub struct AlignedRawPath {
-    delayed: VecDeque<[f32; DSP_SAMPLES_PER_FRAME]>,
-}
-
-impl AlignedRawPath {
-    pub fn new(delay_frames: usize) -> Self {
-        let mut delayed = VecDeque::with_capacity(delay_frames);
-        delayed.resize(delay_frames, [0.0; DSP_SAMPLES_PER_FRAME]);
-        Self { delayed }
-    }
-
-    pub fn process_frame(&mut self, input: &[f32], output: &mut [f32]) -> bool {
-        if input.len() != DSP_SAMPLES_PER_FRAME || output.len() != DSP_SAMPLES_PER_FRAME {
-            return false;
-        }
-        if let Some(delayed) = self.delayed.pop_front() {
-            output.copy_from_slice(&delayed);
-            let mut current = [0.0; DSP_SAMPLES_PER_FRAME];
-            current.copy_from_slice(input);
-            self.delayed.push_back(current);
-        } else {
-            output.copy_from_slice(input);
-        }
-        true
     }
 }
 
@@ -482,20 +486,7 @@ mod tests {
     }
 
     #[test]
-    fn aligned_raw_path_delays_one_frame_when_requested() {
-        let mut path = AlignedRawPath::new(1);
-        let first = [0.25; DSP_SAMPLES_PER_FRAME];
-        let second = [-0.5; DSP_SAMPLES_PER_FRAME];
-        let mut output = [1.0; DSP_SAMPLES_PER_FRAME];
-
-        assert!(path.process_frame(&first, &mut output));
-        assert_eq!(output, [0.0; DSP_SAMPLES_PER_FRAME]);
-        assert!(path.process_frame(&second, &mut output));
-        assert_eq!(output, first);
-    }
-
-    #[test]
-    fn raw_fallback_latency_matches_each_preset() {
+    fn processing_latency_matches_each_preset() {
         let natural = DspSettings::default();
         let mut strong = natural.clone();
         strong.aec.preset = AecPreset::Strong;
@@ -537,8 +528,9 @@ mod tests {
         if !native_library.is_file() {
             return;
         }
+        let library = WebRtcLibrary::load(&native_library).unwrap();
         let mut processor =
-            DspProcessor::load(&native_library, 2, &DspSettings::default()).unwrap();
+            DspProcessor::from_library(library, 2, &DspSettings::default()).unwrap();
         let render = [0.0; DSP_SAMPLES_PER_FRAME * 2];
         let capture = [0.0; DSP_SAMPLES_PER_FRAME];
         let mut output = [1.0; DSP_SAMPLES_PER_FRAME];

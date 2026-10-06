@@ -80,17 +80,127 @@ jobs:
       - name: Audit Cargo dependencies
         run: cargo audit
 
-      - name: Build NSIS installer
+      - name: Check Rust formatting
+        run: cargo fmt --check
+
+      - name: Lint Rust
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test Rust
+        run: cargo test --workspace --locked
+
+      - name: Test frontend and release tooling
+        run: npm test
+
+      - name: Build validated release assets
         run: npm run bundle
 
-      - name: Prepare installer and checksum
+      - name: Verify release payload set and checksums
         shell: pwsh
-        run: ./scripts/prepare-release-assets.ps1 -Version "${{ inputs.version }}"
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ("${{ inputs.version }}" -ne
+              (Get-Content package.json -Raw | ConvertFrom-Json).version) {
+            throw "Requested version does not match the repository version"
+          }
+          $release = Join-Path (Get-Location) "artifacts/release"
+          $payloads = @(
+            "XMic_${{ inputs.version }}_x64-setup.exe",
+            "XMic.exe",
+            "XMic_x64-portable.zip",
+            "XMic_${{ inputs.version }}_MPL-2.0-source.zip"
+          )
+          $expectedSet = @($payloads + "SHA256SUMS.txt" | Sort-Object)
+          $actualSet = @(Get-ChildItem -LiteralPath $release -File |
+            ForEach-Object Name | Sort-Object)
+          if (Compare-Object $expectedSet $actualSet) {
+            throw "Release payload set mismatch: $($actualSet -join ', ')"
+          }
+          $checksumLines = @(Get-Content -LiteralPath (
+            Join-Path $release "SHA256SUMS.txt"))
+          if ($checksumLines.Count -ne $payloads.Count) {
+            throw "SHA256SUMS.txt does not list every payload"
+          }
+          foreach ($payload in $payloads) {
+            $payloadPath = Join-Path $release $payload
+            $expectedHash = (Get-FileHash -LiteralPath $payloadPath -Algorithm SHA256).
+              Hash.ToLowerInvariant()
+            $matches = @($checksumLines | Where-Object { $_ -match "  $([Regex]::Escape($payload))$" })
+            if ($matches.Count -ne 1 -or -not $matches[0].StartsWith($expectedHash)) {
+              throw "Checksum mismatch for $payload"
+            }
+          }
 
-      - name: Attest installer provenance
+      - name: Smoke-test standalone and portable runtimes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $release = Join-Path (Get-Location) "artifacts/release"
+
+          function Invoke-RuntimeSelfTest([string]$Directory, [string]$Mode) {
+            $reportPath = Join-Path $Directory "self-test.json"
+            $process = Start-Process -FilePath (Join-Path $Directory "XMic.exe") `
+              -ArgumentList @("--runtime-self-test", $reportPath) -Wait -PassThru `
+              -WorkingDirectory $Directory
+            if ($process.ExitCode -ne 0) {
+              throw "runtime self-test exited with $($process.ExitCode) in $Mode mode"
+            }
+            $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
+            if ($report.diagnostics.mode -ne $Mode) {
+              throw "runtime self-test reported mode $($report.diagnostics.mode), expected $Mode"
+            }
+            if ($report.diagnostics.dspSource -ne "embedded" -or
+                -not $report.diagnostics.dspSelectionPinned -or
+                -not $report.embeddedLibraryMatches -or
+                -not $report.currentRuntimeCleaned) {
+              throw "runtime self-test did not satisfy the embedded DSP contract"
+            }
+            if ($report.diagnostics.actualDspAbi -ne $report.diagnostics.expectedDspAbi) {
+              throw "runtime self-test ABI mismatch"
+            }
+          }
+
+          $standalone = Join-Path $env:RUNNER_TEMP "xmic-release-standalone"
+          Remove-Item -LiteralPath $standalone -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $standalone -Force | Out-Null
+          Copy-Item -LiteralPath (Join-Path $release "XMic.exe") -Destination $standalone
+          Invoke-RuntimeSelfTest $standalone "standard"
+
+          $portable = Join-Path $env:RUNNER_TEMP "xmic-release-portable"
+          Remove-Item -LiteralPath $portable -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -LiteralPath (Join-Path $release "XMic_x64-portable.zip") -DestinationPath $portable
+          $portableRoot = Join-Path $portable "XMic_x64-portable"
+          $expectedEntries = @("XMic.exe", "portable.flag", "data")
+          $actualEntries = @(Get-ChildItem -LiteralPath $portableRoot |
+            ForEach-Object Name | Sort-Object)
+          if (Compare-Object $expectedEntries $actualEntries) {
+            throw "Portable archive layout mismatch: $($actualEntries -join ', ')"
+          }
+          Invoke-RuntimeSelfTest $portableRoot "portable"
+          $leftovers = @(Get-ChildItem -LiteralPath (Join-Path $portableRoot "data/runtime") -Directory)
+          if ($leftovers.Count -ne 0) {
+            throw "Portable runtime directory kept run folders: $($leftovers.Name -join ', ')"
+          }
+
+          $sourceExtract = Join-Path $env:RUNNER_TEMP "xmic-release-mpl-source"
+          Remove-Item -LiteralPath $sourceExtract -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -LiteralPath (
+            Join-Path $release "XMic_${{ inputs.version }}_MPL-2.0-source.zip") `
+            -DestinationPath $sourceExtract
+          foreach ($required in @("MPL_SOURCE_CODE.txt", "LICENSE-MPL-2.0.txt", "sources")) {
+            if (-not (Test-Path -LiteralPath (Join-Path $sourceExtract $required))) {
+              throw "MPL source archive is missing $required"
+            }
+          }
+
+      - name: Attest release payload provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
-          subject-path: artifacts/release/*.exe
+          subject-path: |
+            artifacts/release/XMic_${{ inputs.version }}_x64-setup.exe
+            artifacts/release/XMic.exe
+            artifacts/release/XMic_x64-portable.zip
+            artifacts/release/XMic_${{ inputs.version }}_MPL-2.0-source.zip
 
       - name: Upload validated release assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -119,9 +229,37 @@ jobs:
           name: release-assets
           path: artifacts/release
 
-      - name: Verify downloaded installer checksum
+      - name: Verify downloaded release payloads
         working-directory: artifacts/release
-        run: sha256sum --check SHA256SUMS.txt
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          sha256sum --check --strict SHA256SUMS.txt
+
+          expected=$(printf '%s\n' \
+            "SHA256SUMS.txt" \
+            "XMic.exe" \
+            "XMic_${RELEASE_VERSION}_MPL-2.0-source.zip" \
+            "XMic_${RELEASE_VERSION}_x64-setup.exe" \
+            "XMic_x64-portable.zip")
+          actual=$(find . -maxdepth 1 -type f -printf '%f\n' | sort)
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::Release payload set mismatch"
+            printf 'expected:\n%s\nactual:\n%s\n' "$expected" "$actual"
+            exit 1
+          fi
+
+          checksum_entries=$(awk '{ print $2 }' SHA256SUMS.txt | sort)
+          if [ "$checksum_entries" != "$(printf '%s\n' \
+            "XMic.exe" \
+            "XMic_${RELEASE_VERSION}_MPL-2.0-source.zip" \
+            "XMic_${RELEASE_VERSION}_x64-setup.exe" \
+            "XMic_x64-portable.zip")" ]; then
+            echo "::error::SHA256SUMS.txt does not cover exactly the release payloads"
+            exit 1
+          fi
 
       - name: Create tag and draft release
         shell: bash
@@ -146,7 +284,8 @@ jobs:
             --jq '.body // ""')
           {
             echo "> [!WARNING]"
-            echo "> The Windows installer is unsigned. Verify it with SHA256SUMS.txt before running; Windows SmartScreen may show an unknown publisher warning."
+            echo "> The Windows installer, the standalone executable, and the portable archive are all unsigned. Verify them with SHA256SUMS.txt before running; Windows SmartScreen may show an unknown publisher warning."
+            echo "> The standalone and portable editions require the system Microsoft Edge WebView2 Evergreen Runtime."
             echo
             printf '%s\n' "$generated_notes"
           } > "$notes_file"

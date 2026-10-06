@@ -125,6 +125,14 @@ impl EchoGuard {
         self.config.enabled
     }
 
+    pub fn reset(&mut self) {
+        self.smoothed_input_power = 0.0;
+        self.smoothed_output_power = 0.0;
+        self.initialized = false;
+        self.nearend_candidate_frames = 0;
+        self.hold_remaining = 0;
+    }
+
     pub fn process_frame(
         &mut self,
         vad_probability: f32,
@@ -348,6 +356,23 @@ impl VadGate {
         secondary_voice_active: Option<bool>,
         samples: &mut [f32],
     ) -> Result<VadGateFrameMetrics, PostProcessConfigError> {
+        self.process_frame_with_secondary_vad_and_veto(
+            vad_probability,
+            secondary_voice_active,
+            false,
+            samples,
+        )
+    }
+
+    /// Processes a frame while allowing a sidechain to veto the gate. A veto clears both pending
+    /// confirmation and an existing hold, so a stale candidate cannot reopen the gate on echo.
+    pub fn process_frame_with_secondary_vad_and_veto(
+        &mut self,
+        vad_probability: f32,
+        secondary_voice_active: Option<bool>,
+        veto: bool,
+        samples: &mut [f32],
+    ) -> Result<VadGateFrameMetrics, PostProcessConfigError> {
         if samples.len() != DSP_SAMPLES_PER_FRAME {
             return Err(PostProcessConfigError::InvalidFrameLength {
                 actual: samples.len(),
@@ -361,32 +386,45 @@ impl VadGate {
             });
         }
 
-        let primary_voice_candidate =
-            vad_probability.is_finite() && vad_probability >= self.config.threshold;
-        let secondary_voice_candidate = secondary_voice_active == Some(true);
-        let voice_candidate = primary_voice_candidate || secondary_voice_candidate;
-        if voice_candidate {
-            self.voice_candidate_frames = self
-                .voice_candidate_frames
-                .saturating_add(1)
-                .min(self.config.confirmation_frames);
-            self.primary_voice_seen |= primary_voice_candidate;
-            self.secondary_voice_seen |=
-                secondary_voice_candidate || secondary_voice_active.is_none();
-        } else {
+        let open = if veto {
             self.voice_candidate_frames = 0;
             self.primary_voice_seen = false;
             self.secondary_voice_seen = false;
-        }
-        let voice_active = self.voice_candidate_frames >= self.config.confirmation_frames
-            && self.primary_voice_seen
-            && self.secondary_voice_seen;
-        if voice_active {
-            self.hold_remaining = self.config.hold_frames;
-        } else if self.hold_remaining > 0 {
-            self.hold_remaining -= 1;
-        }
-        let open = voice_active || self.hold_remaining > 0;
+            self.hold_remaining = 0;
+            false
+        } else {
+            let primary_voice_candidate =
+                vad_probability.is_finite() && vad_probability >= self.config.threshold;
+            let secondary_voice_candidate = secondary_voice_active == Some(true);
+            let voice_candidate = primary_voice_candidate || secondary_voice_candidate;
+            if voice_candidate {
+                self.voice_candidate_frames = self
+                    .voice_candidate_frames
+                    .saturating_add(1)
+                    .min(self.config.confirmation_frames);
+                self.primary_voice_seen |= primary_voice_candidate;
+                self.secondary_voice_seen |=
+                    secondary_voice_candidate || secondary_voice_active.is_none();
+            } else {
+                self.voice_candidate_frames = 0;
+                self.primary_voice_seen = false;
+                self.secondary_voice_seen = false;
+            }
+            let voice_active = self.voice_candidate_frames >= self.config.confirmation_frames
+                && self.primary_voice_seen
+                && self.secondary_voice_seen;
+            if voice_active {
+                self.hold_remaining = self.config.hold_frames;
+                true
+            } else if self.hold_remaining > 0 {
+                // Publish this frame as held before consuming it. Otherwise a configured N-frame
+                // hold only kept N-1 complete frames open after speech ended.
+                self.hold_remaining -= 1;
+                true
+            } else {
+                false
+            }
+        };
         let target = if open { 1.0 } else { self.floor_gain };
         let coefficient = if target > self.gain {
             self.attack_coefficient
@@ -410,6 +448,21 @@ impl VadGate {
             final_gain: self.gain,
             minimum_gain,
         })
+    }
+
+    pub fn reset(&mut self) {
+        self.voice_candidate_frames = 0;
+        self.primary_voice_seen = false;
+        self.secondary_voice_seen = false;
+        self.hold_remaining = 0;
+        for frame in &mut self.delayed_frames {
+            frame.fill(0.0);
+        }
+        self.gain = if self.config.enabled {
+            self.floor_gain
+        } else {
+            1.0
+        };
     }
 }
 
@@ -593,7 +646,45 @@ mod tests {
 
         assert!(gate.process_frame(1.0, &mut samples).unwrap().open);
         assert!(gate.process_frame(0.0, &mut samples).unwrap().open);
+        assert!(gate.process_frame(0.0, &mut samples).unwrap().open);
         assert!(!gate.process_frame(0.0, &mut samples).unwrap().open);
+    }
+
+    #[test]
+    fn sidechain_veto_clears_pending_confirmation_and_hold() {
+        let mut gate = VadGate::new(VadGateConfig {
+            enabled: true,
+            confirmation_frames: 2,
+            hold_frames: 3,
+            pre_roll_frames: 0,
+            ..VadGateConfig::default()
+        })
+        .unwrap();
+        let mut samples = [0.25; DSP_SAMPLES_PER_FRAME];
+
+        assert!(
+            !gate
+                .process_frame_with_secondary_vad_and_veto(1.0, Some(true), false, &mut samples)
+                .unwrap()
+                .open
+        );
+        assert!(
+            !gate
+                .process_frame_with_secondary_vad_and_veto(0.0, Some(false), true, &mut samples)
+                .unwrap()
+                .open
+        );
+        assert!(
+            !gate
+                .process_frame_with_secondary_vad_and_veto(1.0, Some(true), false, &mut samples)
+                .unwrap()
+                .open
+        );
+        assert!(
+            gate.process_frame_with_secondary_vad_and_veto(1.0, Some(true), false, &mut samples)
+                .unwrap()
+                .open
+        );
     }
 
     #[test]

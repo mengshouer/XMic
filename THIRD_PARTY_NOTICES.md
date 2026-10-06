@@ -6,9 +6,10 @@ in this document and the generated notices.
 
 XMic release packages also contain software developed by third parties. The
 build creates complete notices from the exact Cargo and npm dependency graphs
-and installs them under the application's `licenses` resource directory. The
-WebRTC build creates a separate notice from the pinned WebRTC checkout and the
-GN dependency graph used for `xmic_webrtc_dsp.dll`.
+and embeds them in the executable, where the About page loads each notice on
+demand. The WebRTC build creates a separate notice from the pinned WebRTC
+checkout and the GN dependency graph used for `xmic_webrtc_dsp.dll`, which is
+embedded in the executable as well.
 
 The following components are central to XMic's runtime and require explicit
 attribution:
@@ -59,11 +60,17 @@ The generated files are:
 - `artifacts/licenses/MPL_SOURCE_CODE.txt`
 - `artifacts/webrtc/win-x64/WEBRTC_THIRD_PARTY_NOTICES.txt`
 
+All four notice texts, plus `LICENSE` and `third-party/licenses/MPL-2.0.txt`, are
+embedded in the frontend build and shown in the About page. A lone `XMic.exe`
+thus carries its own attributions, and the installer no longer installs separate
+notice files or a second copy of the WebRTC DSP library.
+
 The Windows dependency graph currently includes MPL-2.0 packages such as
-`selectors`, `cssparser`, `dtoa-short`, and `option-ext`. Release packages
-therefore also include their exact, lockfile-installed Source Code Form under
-`licenses/sources/`, along with the MPL-2.0 text. This file-level obligation
-does not change the license of XMic-authored code.
+`selectors`, `cssparser`, `dtoa-short`, and `option-ext`. Every release therefore
+publishes their exact, lockfile-installed Source Code Form in
+`XMic_<version>_MPL-2.0-source.zip`, which carries `MPL_SOURCE_CODE.txt`,
+`LICENSE-MPL-2.0.txt`, and the `sources/` tree. This file-level obligation does
+not change the license of XMic-authored code.
 
 Run `npm run licenses:generate` after installing dependencies to regenerate the
 Cargo and npm notices and required source bundles. `npm run licenses:check`

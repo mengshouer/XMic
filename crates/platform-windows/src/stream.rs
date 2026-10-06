@@ -35,7 +35,7 @@ use crate::{
         copy_wave_format, flag_is_set, select_endpoint, CoTaskMemWaveFormat, EventHandle,
         MmcssRegistration,
     },
-    device_group_id, device_id, friendly_name, join_worker_with_timeout, operation_error,
+    container_group_id, device_id, friendly_name, join_audio_worker, operation_error,
     smoothed_sample, AudioFormatDescriptor, ComApartment, QpcClock, WORKER_START_TIMEOUT,
 };
 
@@ -130,6 +130,16 @@ impl DuplexSourceStream {
         self.capture_consumer.pop().ok()
     }
 
+    /// Discards the unused loopback backlog when a processing session reuses its capture stream for
+    /// Raw fallback. The fixed ring capacity keeps the drain bounded on the realtime thread.
+    pub fn discard_render_backlog(&mut self) {
+        for _ in 0..SOURCE_RING_BLOCKS {
+            if self.render_consumer.pop().is_err() {
+                break;
+            }
+        }
+    }
+
     /// Capture frames already normalized and waiting for the DSP thread, including the next one.
     pub fn capture_queue_blocks(&self) -> usize {
         self.capture_consumer.slots()
@@ -143,31 +153,43 @@ impl DuplexSourceStream {
         self.workers.iter().any(JoinHandle::is_finished)
     }
 
+    /// Raw fallback may keep a healthy capture worker even after its now-unused loopback worker
+    /// exits. Successful construction always stores render first and capture second.
+    pub fn capture_worker_finished(&self) -> bool {
+        self.workers.get(1).is_none_or(JoinHandle::is_finished)
+    }
+
     pub fn stop(mut self) -> Result<(), PlatformError> {
         self.request_stop();
-        self.join_workers()
+        self.join_audio_workers()
     }
 
     fn request_stop(&self) {
         self.stop.store(true, Ordering::Release);
     }
 
-    fn join_workers(&mut self) -> Result<(), PlatformError> {
-        let mut first_error = None;
-        for worker in self.workers.drain(..) {
-            let result = join_worker_with_timeout(worker, "WASAPI source worker")?;
-            if let Err(error) = result {
-                first_error.get_or_insert(error);
-            }
-        }
-        first_error.map_or(Ok(()), Err)
+    fn join_audio_workers(&mut self) -> Result<(), PlatformError> {
+        join_source_workers(self.workers.drain(..))
     }
+}
+
+fn join_source_workers(
+    workers: impl IntoIterator<Item = JoinHandle<Result<(), PlatformError>>>,
+) -> Result<(), PlatformError> {
+    let mut first_error = None;
+    for worker in workers {
+        let result = join_audio_worker(worker).and_then(|result| result);
+        if let Err(error) = result {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 impl Drop for DuplexSourceStream {
     fn drop(&mut self) {
         self.request_stop();
-        let _ = self.join_workers();
+        let _ = self.join_audio_workers();
     }
 }
 
@@ -209,8 +231,8 @@ pub fn start_duplex_source(
         Ok(ready) => ready,
         Err(error) => {
             stop.store(true, Ordering::Release);
-            drop(render_worker.handle);
-            drop(capture_worker.handle);
+            let _ = render_worker.handle.join();
+            let _ = capture_worker.handle.join();
             return Err(error);
         }
     };
@@ -219,8 +241,8 @@ pub fn start_duplex_source(
             Ok(ready) => ready,
             Err(error) => {
                 stop.store(true, Ordering::Release);
-                drop(render_worker.handle);
-                drop(capture_worker.handle);
+                let _ = render_worker.handle.join();
+                let _ = capture_worker.handle.join();
                 return Err(error);
             }
         };
@@ -236,7 +258,7 @@ pub fn start_duplex_source(
         (render, capture) => {
             stop.store(true, Ordering::Release);
             for worker in workers {
-                drop(worker);
+                let _ = worker.join();
             }
             return Err(PlatformError::Operation(
                 render.err().or_else(|| capture.err()).unwrap_or_else(|| {
@@ -303,25 +325,25 @@ impl CaptureSourceStream {
 
     pub fn stop(mut self) -> Result<(), PlatformError> {
         self.request_stop();
-        self.join_worker()
+        self.join_audio_worker()
     }
 
     fn request_stop(&self) {
         self.stop.store(true, Ordering::Release);
     }
 
-    fn join_worker(&mut self) -> Result<(), PlatformError> {
+    fn join_audio_worker(&mut self) -> Result<(), PlatformError> {
         let Some(worker) = self.worker.take() else {
             return Ok(());
         };
-        join_worker_with_timeout(worker, "WASAPI capture source worker")?
+        join_audio_worker(worker)?
     }
 }
 
 impl Drop for CaptureSourceStream {
     fn drop(&mut self) {
         self.request_stop();
-        let _ = self.join_worker();
+        let _ = self.join_audio_worker();
     }
 }
 
@@ -353,7 +375,7 @@ pub fn start_capture_source(
         Ok(prepared) => prepared,
         Err(error) => {
             stop.store(true, Ordering::Release);
-            drop(capture_worker.handle);
+            let _ = capture_worker.handle.join();
             return Err(error);
         }
     };
@@ -361,7 +383,7 @@ pub fn start_capture_source(
         Ok(prepared) => prepared,
         Err(error) => {
             stop.store(true, Ordering::Release);
-            drop(capture_worker.handle);
+            let _ = capture_worker.handle.join();
             return Err(PlatformError::Operation(error));
         }
     };
@@ -488,7 +510,7 @@ fn prepare_source(
     let endpoint = EndpointDescriptor {
         platform: "windows".to_owned(),
         id: device_id(&device)?,
-        group_id: device_group_id(&device).ok(),
+        group_id: container_group_id(&device),
         friendly_name: friendly_name(&device)?,
         flow: request.flow,
         default_roles: Vec::new(),
@@ -878,6 +900,22 @@ impl OutputTimeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn joining_source_workers_does_not_detach_after_an_earlier_panic() {
+        let completed = Arc::new(AtomicBool::new(false));
+        let worker_completed = Arc::clone(&completed);
+        let workers = [
+            thread::spawn(|| -> Result<(), PlatformError> { panic!("first worker") }),
+            thread::spawn(move || {
+                worker_completed.store(true, Ordering::Release);
+                Ok(())
+            }),
+        ];
+
+        assert!(join_source_workers(workers).is_err());
+        assert!(completed.load(Ordering::Acquire));
+    }
 
     #[test]
     fn output_timeline_advances_by_ten_milliseconds() {

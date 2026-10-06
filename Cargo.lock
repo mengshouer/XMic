@@ -5104,8 +5104,9 @@ dependencies = [
 
 [[package]]
 name = "xmic"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
+ "rtrb",
  "serde",
  "serde_json",
  "tauri",
@@ -5113,17 +5114,19 @@ dependencies = [
  "tauri-plugin-autostart",
  "tauri-plugin-notification",
  "tauri-plugin-single-instance",
+ "windows",
  "xmic-engine-core",
  "xmic-engine-protocol",
  "xmic-engine-runtime",
  "xmic-platform-api",
  "xmic-platform-windows",
  "xmic-rnnoise-dsp",
+ "xmic-webrtc-dsp",
 ]
 
 [[package]]
 name = "xmic-audio-spike"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -5136,7 +5139,7 @@ dependencies = [
 
 [[package]]
 name = "xmic-engine-core"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "audioadapter-buffers",
  "rubato",
@@ -5146,7 +5149,7 @@ dependencies = [
 
 [[package]]
 name = "xmic-engine-protocol"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -5156,7 +5159,7 @@ dependencies = [
 
 [[package]]
 name = "xmic-engine-runtime"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "thiserror 2.0.19",
  "xmic-engine-core",
@@ -5167,7 +5170,7 @@ dependencies = [
 
 [[package]]
 name = "xmic-platform-api"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "serde",
  "thiserror 2.0.19",
@@ -5175,7 +5178,7 @@ dependencies = [
 
 [[package]]
 name = "xmic-platform-windows"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "rtrb",
  "serde",
@@ -5187,7 +5190,7 @@ dependencies = [
 
 [[package]]
 name = "xmic-rnnoise-dsp"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "nnnoiseless",
  "thiserror 2.0.19",
@@ -5195,7 +5198,7 @@ dependencies = [
 
 [[package]]
 name = "xmic-webrtc-dsp"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "libloading 0.8.9",
  "thiserror 2.0.19",

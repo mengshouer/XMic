@@ -22,12 +22,14 @@ pub(super) fn validate_topology(
     validate_capture_output_topology(&source.info().capture_endpoint, output_endpoint)
 }
 
-/// The checks that do not involve the playback reference, so the idle session can run them too.
+/// The checks that do not involve the playback reference, shared by processing and raw fallback.
 pub(super) fn validate_capture_output_topology(
     capture_endpoint: &EndpointDescriptor,
     output_endpoint: &EndpointDescriptor,
 ) -> Result<(), String> {
-    if same_device_group(capture_endpoint, output_endpoint) {
+    if capture_endpoint.id == output_endpoint.id
+        || same_device_group(capture_endpoint, output_endpoint)
+    {
         return Err(
             "the virtual output belongs to the same device group as the physical microphone"
                 .to_owned(),
@@ -119,7 +121,17 @@ mod tests {
     }
 
     #[test]
-    fn the_idle_session_refuses_to_feed_the_virtual_cable_back_into_itself() {
+    fn identical_endpoint_ids_conflict_even_without_container_ids() {
+        let mut capture = endpoint("same-endpoint", None);
+        capture.flow = DataFlow::Capture;
+        capture.friendly_name = "Physical microphone".to_owned();
+        let output = endpoint("same-endpoint", None);
+
+        assert!(validate_capture_output_topology(&capture, &output).is_err());
+    }
+
+    #[test]
+    fn raw_fallback_refuses_to_feed_the_virtual_cable_back_into_itself() {
         let mut capture = endpoint("cable-output", Some("cable-group"));
         capture.friendly_name = "CABLE Output (VB-Audio Virtual Cable)".to_owned();
         let output = endpoint("cable-input", Some("other-group"));

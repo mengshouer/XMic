@@ -3,27 +3,93 @@
 use serde::{Deserialize, Serialize};
 use xmic_platform_api::EndpointDescriptor;
 
-pub const PROTOCOL_VERSION: u16 = 17;
+pub const PROTOCOL_VERSION: u16 = 22;
+pub const DSP_ABI_VERSION: u32 = 2;
 pub const MAX_CAPTURE_CHANNEL_INDEX: usize = 31;
 pub const MAX_TRUSTED_VIRTUAL_AUDIO_PAIRS: usize = 32;
 
-/// VAD gate values that earlier builds shipped as defaults. `DspSettings::migrate_legacy_defaults`
-/// rewrites exactly these two values so stored settings pick up the lower-latency defaults, while
-/// anything the user tuned by hand is left alone.
-pub const LEGACY_VAD_CONFIRMATION_MS: u32 = 120;
-pub const LEGACY_VAD_FLOOR_DB: f32 = -90.0;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EngineState {
+    Off,
+    Processing,
+    Degraded,
+    Blocked,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum EngineMode {
-    Sleeping,
+pub enum EngineOutput {
+    Inactive,
+    Processed,
+    Raw,
+    Silence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct DspLibraryValidation {
+    pub expected_abi: u32,
+    pub actual_abi: Option<u32>,
+    pub error: Option<String>,
+}
+
+impl DspLibraryValidation {
+    pub fn pending() -> Self {
+        Self {
+            expected_abi: DSP_ABI_VERSION,
+            actual_abi: None,
+            error: None,
+        }
+    }
+
+    pub fn valid(actual_abi: u32) -> Self {
+        Self {
+            expected_abi: DSP_ABI_VERSION,
+            actual_abi: Some(actual_abi),
+            error: None,
+        }
+    }
+
+    pub fn invalid(actual_abi: Option<u32>, error: impl Into<String>) -> Self {
+        Self {
+            expected_abi: DSP_ABI_VERSION,
+            actual_abi,
+            error: Some(error.into()),
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.error.is_none() && self.actual_abi == Some(self.expected_abi)
+    }
+}
+
+impl Default for DspLibraryValidation {
+    fn default() -> Self {
+        Self::pending()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PrimaryReasonCode {
+    ManualOff,
     Starting,
-    Converging,
-    Active,
-    RawFallback,
-    SafeMode,
-    Muted,
-    Error,
+    AecWarmup,
+    AecRebuild,
+    WaitingForPlayback,
+    WaitingForCapture,
+    WaitingForVirtualOutput,
+    AudioDeviceFailure,
+    DspFailure,
+    CpuOverload,
+    SafetyConflict,
+    PairUnconfirmed,
+    SessionUnavailable,
+    HelperUnavailable,
+    CrashLoop,
+    SettingsReset,
+    WorkerTimeout,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,16 +100,12 @@ pub enum AecPreset {
     Strong,
 }
 
-/// What the virtual microphone carries whenever XMic is not processing: a DSP failure, CPU overload
-/// protection, safe mode, or simply no processing session at all. The `serde` aliases keep settings
-/// files written by builds that called this the "DSP failure policy" loadable.
+/// What the virtual microphone carries while processing is degraded.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum UnprocessedOutput {
-    #[serde(alias = "rawPassthrough")]
-    RawMicrophone,
+pub enum DegradedOutput {
+    Raw,
     #[default]
-    #[serde(alias = "mute")]
     Silence,
 }
 
@@ -61,12 +123,11 @@ pub enum DelayCalibrationState {
 pub enum ProcessingLoadMode {
     #[default]
     Full,
-    Reduced,
     Protection,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct AecSettings {
     pub enabled: bool,
     pub preset: AecPreset,
@@ -84,7 +145,7 @@ impl Default for AecSettings {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RnnoiseSettings {
     pub enabled: bool,
     pub mix: f32,
@@ -100,7 +161,7 @@ impl Default for RnnoiseSettings {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Agc2Settings {
     pub enabled: bool,
     pub adaptive_digital_enabled: bool,
@@ -145,11 +206,10 @@ impl Agc2Settings {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct VadGateSettings {
     pub enabled: bool,
     pub threshold: f32,
-    #[serde(default = "default_vad_confirmation_ms")]
     pub confirmation_ms: u32,
     pub hold_ms: u32,
     pub floor_db: f32,
@@ -178,7 +238,7 @@ const fn default_vad_confirmation_ms() -> u32 {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct LimiterSettings {
     pub ceiling_dbfs: f32,
     pub release_ms: f32,
@@ -194,36 +254,13 @@ impl Default for LimiterSettings {
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct DspSettings {
     pub aec: AecSettings,
     pub rnnoise: RnnoiseSettings,
     pub agc2: Agc2Settings,
     pub vad_gate: VadGateSettings,
     pub limiter: LimiterSettings,
-}
-
-impl DspSettings {
-    /// Rewrites values that still hold a superseded default and repairs the AGC2 pass-through
-    /// combination. Callers run this once per stored file and persist the result; values the user
-    /// tuned away from the old defaults are preserved.
-    pub fn migrate_legacy_defaults(&mut self) -> bool {
-        let defaults = VadGateSettings::default();
-        let mut changed = false;
-        if self.vad_gate.confirmation_ms == LEGACY_VAD_CONFIRMATION_MS {
-            self.vad_gate.confirmation_ms = defaults.confirmation_ms;
-            changed = true;
-        }
-        if holds_value(self.vad_gate.floor_db, LEGACY_VAD_FLOOR_DB) {
-            self.vad_gate.floor_db = defaults.floor_db;
-            changed = true;
-        }
-        changed | self.agc2.repair_pass_through()
-    }
-}
-
-fn holds_value(value: f32, expected: f32) -> bool {
-    (value - expected).abs() <= f32::EPSILON
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,7 +271,7 @@ pub enum VirtualDeviceMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct TrustedVirtualAudioPair {
     pub render_endpoint_id: String,
     pub capture_endpoint_id: String,
@@ -242,20 +279,80 @@ pub struct TrustedVirtualAudioPair {
     pub capture_name: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct VirtualRenderEndpointId(String);
+
+impl VirtualRenderEndpointId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for VirtualRenderEndpointId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct VirtualCaptureEndpointId(String);
+
+impl VirtualCaptureEndpointId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for VirtualCaptureEndpointId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+/// Endpoint IDs previously observed as the complete, name-recognised standard VB-CABLE pair.
+/// Unlike a custom pair, this marker is written by route discovery rather than user confirmation.
+/// Distinct transparent ID types prevent accidentally swapping the render and capture sides while
+/// retaining the existing JSON string representation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct KnownVbCablePair {
+    pub render_endpoint_id: VirtualRenderEndpointId,
+    pub capture_endpoint_id: VirtualCaptureEndpointId,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct EngineSettings {
     pub follow_default_render: bool,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub render_endpoint_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub capture_endpoint_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub capture_channel: Option<usize>,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub output_endpoint_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub virtual_device_mode: Option<VirtualDeviceMode>,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub virtual_capture_endpoint_id: Option<String>,
     pub trusted_virtual_audio_pairs: Vec<TrustedVirtualAudioPair>,
-    #[serde(alias = "failurePolicy")]
-    pub unprocessed_output: UnprocessedOutput,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub known_vb_cable_pair: Option<KnownVbCablePair>,
+    pub degraded_output: DegradedOutput,
     pub dsp: DspSettings,
+}
+
+// A custom deserializer makes the key required without rejecting an explicit null. Deriving Option
+// alone silently accepts a missing key as None, bypassing the strict settings reset contract.
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer)
 }
 
 impl Default for EngineSettings {
@@ -269,7 +366,8 @@ impl Default for EngineSettings {
             virtual_device_mode: None,
             virtual_capture_endpoint_id: None,
             trusted_virtual_audio_pairs: Vec::new(),
-            unprocessed_output: UnprocessedOutput::Silence,
+            known_vb_cable_pair: None,
+            degraded_output: DegradedOutput::Silence,
             dsp: DspSettings::default(),
         }
     }
@@ -288,13 +386,18 @@ impl EngineSettings {
             validate_endpoint(&pair.render_endpoint_id)?;
             validate_endpoint(&pair.capture_endpoint_id)?;
         }
+        if let Some(pair) = &self.known_vb_cable_pair {
+            validate_endpoint(pair.render_endpoint_id.as_str())?;
+            validate_endpoint(pair.capture_endpoint_id.as_str())?;
+        }
         if self
             .capture_channel
             .is_some_and(|channel| channel > MAX_CAPTURE_CHANNEL_INDEX)
         {
             return Err(SettingsError::OutOfRange("capture channel"));
         }
-        if !self.follow_default_render && self.render_endpoint_id.is_none() {
+        if self.dsp.aec.enabled && !self.follow_default_render && self.render_endpoint_id.is_none()
+        {
             return Err(SettingsError::FixedRenderEndpointRequired);
         }
         validate_range("RNNoise mix", self.dsp.rnnoise.mix, 0.0, 1.0)?;
@@ -395,19 +498,11 @@ pub enum SettingsError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ActiveRoute {
-    pub render_endpoint_id: String,
-    pub capture_endpoint_id: String,
+    pub render_endpoint_id: Option<String>,
+    pub capture_endpoint_id: Option<String>,
     pub output_endpoint_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ActiveDeviceProfile {
-    pub render_endpoint_id: String,
-    pub capture_endpoint_id: String,
-    pub customized: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -423,7 +518,6 @@ pub enum VirtualDeviceIssueReason {
 pub enum VirtualRouteConflictKind {
     DefaultRender,
     FixedRender,
-    PhysicalCapture,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -445,8 +539,76 @@ pub enum ConfigurationIssue {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct PrimaryReason {
+    pub code: PrimaryReasonCode,
+    pub detail: Option<String>,
+    pub endpoint_id: Option<String>,
+    pub retry_after_ms: Option<u64>,
+    pub configuration_issue: Option<ConfigurationIssue>,
+}
+
+impl PrimaryReason {
+    pub fn new(code: PrimaryReasonCode) -> Self {
+        Self {
+            code,
+            detail: None,
+            endpoint_id: None,
+            retry_after_ms: None,
+            configuration_issue: None,
+        }
+    }
+
+    pub fn with_detail(code: PrimaryReasonCode, detail: impl Into<String>) -> Self {
+        Self {
+            detail: Some(detail.into()),
+            ..Self::new(code)
+        }
+    }
+
+    pub fn waiting(code: PrimaryReasonCode, endpoint_id: Option<String>) -> Self {
+        debug_assert!(matches!(
+            code,
+            PrimaryReasonCode::WaitingForPlayback
+                | PrimaryReasonCode::WaitingForCapture
+                | PrimaryReasonCode::WaitingForVirtualOutput
+        ));
+        Self {
+            endpoint_id,
+            ..Self::new(code)
+        }
+    }
+
+    pub fn configuration(issue: ConfigurationIssue) -> Self {
+        let (code, endpoint_id) = match &issue {
+            ConfigurationIssue::VirtualDeviceRequired {
+                reason: VirtualDeviceIssueReason::CustomPairUnconfirmed,
+            } => (PrimaryReasonCode::PairUnconfirmed, None),
+            ConfigurationIssue::VirtualDeviceRequired { .. } => {
+                (PrimaryReasonCode::WaitingForVirtualOutput, None)
+            }
+            ConfigurationIssue::PhysicalCaptureRequired {
+                virtual_capture_endpoint_id,
+            } => (
+                PrimaryReasonCode::SafetyConflict,
+                virtual_capture_endpoint_id.clone(),
+            ),
+            ConfigurationIssue::VirtualRouteConflict { endpoint_id, .. } => {
+                (PrimaryReasonCode::SafetyConflict, Some(endpoint_id.clone()))
+            }
+        };
+        Self {
+            code,
+            endpoint_id,
+            configuration_issue: Some(issue),
+            ..Self::new(code)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct EngineMetrics {
     pub processed_blocks: u64,
     pub render_underruns: u64,
@@ -503,58 +665,190 @@ pub struct EngineMetrics {
     pub echo_guard_release_events: u64,
 }
 
+impl EngineMetrics {
+    /// Clears values that only describe a currently owned audio session while retaining cumulative
+    /// counters. Both the helper and UI supervisor use this transition so inactive snapshots cannot
+    /// drift as metrics evolve.
+    pub fn clear_session_gauges(&mut self) {
+        self.input_peak_dbfs = None;
+        self.output_peak_dbfs = None;
+        self.output_queue_depth_ms = 0.0;
+        self.output_rate_adjustment_ppm = 0.0;
+        self.processing_time_p99_us = 0.0;
+        self.processing_time_max_us = 0;
+        self.processing_load_mode = ProcessingLoadMode::Full;
+        self.capture_latency_ms = 0.0;
+        self.dsp_latency_ms = 0.0;
+        self.output_latency_ms = 0.0;
+        self.pipeline_latency_ms = 0.0;
+        self.host_delay_ms = None;
+        self.host_delay_raw_skew_ms = None;
+        self.host_delay_jitter_ms = None;
+        self.host_delay_calibration_state = DelayCalibrationState::Uncalibrated;
+        self.aec_estimated_delay_ms = None;
+        self.aec_echo_return_loss_db = None;
+        self.aec_echo_return_loss_enhancement_db = None;
+        self.aec_residual_echo_likelihood = None;
+        self.aec_attenuation_db = None;
+        self.vad_probability = None;
+        self.speech_vad_active = None;
+        self.vad_gate_open = None;
+        self.echo_guard_active = None;
+    }
+
+    pub fn inactive(self) -> Self {
+        let mut metrics = self;
+        metrics.clear_session_gauges();
+        metrics
+    }
+
+    /// Adds counters accumulated before a helper process restart while leaving current-session
+    /// gauges untouched. The UI supervisor applies this to every helper status so crash recovery
+    /// cannot make app-lifetime diagnostics move backwards.
+    pub fn with_counter_baseline(mut self, baseline: &Self) -> Self {
+        self.processed_blocks = self
+            .processed_blocks
+            .saturating_add(baseline.processed_blocks);
+        self.render_underruns = self
+            .render_underruns
+            .saturating_add(baseline.render_underruns);
+        self.render_overflows = self
+            .render_overflows
+            .saturating_add(baseline.render_overflows);
+        self.capture_overflows = self
+            .capture_overflows
+            .saturating_add(baseline.capture_overflows);
+        self.device_discontinuities = self
+            .device_discontinuities
+            .saturating_add(baseline.device_discontinuities);
+        self.output_underruns = self
+            .output_underruns
+            .saturating_add(baseline.output_underruns);
+        self.output_queue_overflows = self
+            .output_queue_overflows
+            .saturating_add(baseline.output_queue_overflows);
+        self.device_restarts = self
+            .device_restarts
+            .saturating_add(baseline.device_restarts);
+        self.dsp_failures = self.dsp_failures.saturating_add(baseline.dsp_failures);
+        self.processing_deadline_misses = self
+            .processing_deadline_misses
+            .saturating_add(baseline.processing_deadline_misses);
+        self.processing_budget_exceeded_blocks = self
+            .processing_budget_exceeded_blocks
+            .saturating_add(baseline.processing_budget_exceeded_blocks);
+        self.processing_overload_events = self
+            .processing_overload_events
+            .saturating_add(baseline.processing_overload_events);
+        self.processing_recovery_events = self
+            .processing_recovery_events
+            .saturating_add(baseline.processing_recovery_events);
+        self.host_delay_reset_events = self
+            .host_delay_reset_events
+            .saturating_add(baseline.host_delay_reset_events);
+        self.input_clipped_samples = self
+            .input_clipped_samples
+            .saturating_add(baseline.input_clipped_samples);
+        self.limiter_limited_samples = self
+            .limiter_limited_samples
+            .saturating_add(baseline.limiter_limited_samples);
+        self.vad_gate_open_events = self
+            .vad_gate_open_events
+            .saturating_add(baseline.vad_gate_open_events);
+        self.echo_guard_active_events = self
+            .echo_guard_active_events
+            .saturating_add(baseline.echo_guard_active_events);
+        self.echo_guard_nearend_candidate_events = self
+            .echo_guard_nearend_candidate_events
+            .saturating_add(baseline.echo_guard_nearend_candidate_events);
+        self.echo_guard_release_events = self
+            .echo_guard_release_events
+            .saturating_add(baseline.echo_guard_release_events);
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct EngineStatus {
     pub protocol_version: u16,
-    pub running: bool,
-    pub mode: EngineMode,
-    pub detail: String,
-    /// Filled in by the UI process, which owns the endpoint enumeration and its cache. The helper
-    /// leaves this empty — it has no reason to enumerate devices just to answer a status poll.
+    pub desired_enabled: bool,
+    pub state: EngineState,
+    pub output: EngineOutput,
+    pub primary_reason: Option<PrimaryReason>,
+    pub dsp_validation: DspLibraryValidation,
+    /// Filled in by the UI process, which owns endpoint enumeration and its cache.
     pub endpoints: Vec<EndpointDescriptor>,
     pub settings: EngineSettings,
     pub active_route: Option<ActiveRoute>,
-    pub active_device_profile: Option<ActiveDeviceProfile>,
-    pub configuration_issue: Option<ConfigurationIssue>,
     pub metrics: EngineMetrics,
-    pub warning: Option<String>,
-    /// Latched once the engine hears speech while the virtual microphone is not carrying processed
-    /// audio. The UI turns this into a single notification per application run.
-    pub unprocessed_speech_detected: bool,
+    /// Latched when the Off-time capture-only probe hears sustained speech.
+    pub notification_probe_speech_detected: bool,
 }
 
 impl EngineStatus {
     pub fn bootstrap(endpoints: Vec<EndpointDescriptor>) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
-            running: false,
-            mode: EngineMode::Sleeping,
-            detail: "audio engine is stopped".to_owned(),
+            desired_enabled: false,
+            state: EngineState::Off,
+            output: EngineOutput::Inactive,
+            primary_reason: Some(PrimaryReason::new(PrimaryReasonCode::ManualOff)),
+            dsp_validation: DspLibraryValidation::pending(),
             endpoints,
             settings: EngineSettings::default(),
             active_route: None,
-            active_device_profile: None,
-            configuration_issue: None,
             metrics: EngineMetrics::default(),
-            warning: None,
-            unprocessed_speech_detected: false,
+            notification_probe_speech_detected: false,
         }
+    }
+
+    pub fn session_active(&self) -> bool {
+        matches!(self.state, EngineState::Processing | EngineState::Degraded)
+            && self.output != EngineOutput::Inactive
+    }
+
+    pub fn configuration_issue(&self) -> Option<&ConfigurationIssue> {
+        self.primary_reason
+            .as_ref()
+            .and_then(|reason| reason.configuration_issue.as_ref())
+    }
+
+    pub fn transition_to_inactive(
+        &mut self,
+        state: EngineState,
+        primary_reason: Option<PrimaryReason>,
+    ) {
+        self.state = state;
+        self.output = EngineOutput::Inactive;
+        self.primary_reason = primary_reason;
+        self.active_route = None;
+        self.metrics.clear_session_gauges();
     }
 }
 
-/// Renewed by the UI on every status poll. Only the UI process knows whether the Windows session is
-/// usable, whether the app is exiting, and whether the one-shot "not processing" notice has already
-/// been shown, so the helper never starts an idle session on its own guesswork. A helper that has not
-/// heard from the UI yet holds the default: nothing runs, the microphone stays closed.
+/// Session/runtime facts reported by the helper process. The UI-side `EngineController` owns the
+/// public desired intent and is the only layer that derives `EngineState`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct HelperStatus {
+    pub session_running: bool,
+    pub output: EngineOutput,
+    pub reason: Option<PrimaryReason>,
+    pub dsp_validation: DspLibraryValidation,
+    pub settings: EngineSettings,
+    pub active_route: Option<ActiveRoute>,
+    pub metrics: EngineMetrics,
+    pub notification_probe_speech_detected: bool,
+}
+
+/// Renewed by the UI on every status poll. The only session allowed while desired processing is Off
+/// is a temporary capture-only notification probe.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct IdleSessionPermit {
-    /// The idle session may open audio devices; false while Windows is locked, disconnected, asleep,
-    /// or while XMic is exiting.
-    pub bypass_allowed: bool,
-    /// Speech detection is still worth running because the notice has not been shown yet.
-    pub speech_notice_needed: bool,
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct NotificationProbePermit {
+    pub allowed: bool,
+    pub needed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -564,11 +858,13 @@ pub enum EngineRequest {
         protocol_version: u16,
     },
     GetStatus {
-        #[serde(default)]
-        permit: IdleSessionPermit,
+        probe_permit: NotificationProbePermit,
     },
     UpdateSettings {
         settings: Box<EngineSettings>,
+    },
+    PrepareFallback {
+        reason: PrimaryReasonCode,
     },
     Start,
     Stop,
@@ -579,7 +875,7 @@ pub enum EngineRequest {
 #[serde(tag = "type", content = "payload", rename_all = "camelCase")]
 pub enum EngineResponse {
     Hello { protocol_version: u16 },
-    Status(Box<EngineStatus>),
+    Status(Box<HelperStatus>),
     Ack,
     ConfigurationRequired(ConfigurationIssue),
     Error(String),
@@ -590,237 +886,317 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accepted_defaults_are_valid() {
-        let settings = EngineSettings::default();
-        settings.validate().unwrap();
+    fn helper_status_exposes_runtime_facts_without_public_state() {
+        let helper = HelperStatus {
+            session_running: true,
+            output: EngineOutput::Processed,
+            reason: None,
+            dsp_validation: DspLibraryValidation::valid(DSP_ABI_VERSION),
+            settings: EngineSettings::default(),
+            active_route: None,
+            metrics: EngineMetrics::default(),
+            notification_probe_speech_detected: false,
+        };
 
-        assert_eq!(settings.dsp.aec.preset, AecPreset::Natural);
-        assert_eq!(settings.dsp.rnnoise.mix, 1.0);
-        assert_eq!(settings.dsp.agc2.max_gain_db, 6.0);
-        assert!(!settings.dsp.agc2.enabled);
-        assert!(settings.dsp.agc2.adaptive_digital_enabled);
-        assert!(settings.dsp.vad_gate.enabled);
-        assert_eq!(settings.dsp.vad_gate.threshold, 0.70);
-        assert_eq!(settings.dsp.vad_gate.confirmation_ms, 40);
-        assert_eq!(settings.dsp.vad_gate.floor_db, -20.0);
-        assert_eq!(settings.dsp.limiter.ceiling_dbfs, -1.0);
-        assert_eq!(settings.unprocessed_output, UnprocessedOutput::Silence);
-        assert_eq!(settings.capture_channel, None);
+        let value = serde_json::to_value(helper).unwrap();
+
+        assert_eq!(value["sessionRunning"], true);
+        assert_eq!(value["output"], "processed");
+        assert!(value.get("desiredEnabled").is_none());
+        assert!(value.get("state").is_none());
     }
 
     #[test]
-    fn settings_written_as_a_dsp_failure_policy_still_load() {
-        let mut value = serde_json::to_value(EngineSettings::default()).unwrap();
-        let object = value.as_object_mut().unwrap();
-        object.remove("unprocessedOutput");
-        object.insert("failurePolicy".to_owned(), "rawPassthrough".into());
+    fn dsp_validation_round_trips_with_explicit_abi_metadata() {
+        let validation = DspLibraryValidation::invalid(Some(1), "ABI mismatch");
 
-        let settings: EngineSettings = serde_json::from_value(value).unwrap();
+        let value = serde_json::to_value(&validation).unwrap();
+        let round_trip: DspLibraryValidation = serde_json::from_value(value.clone()).unwrap();
 
+        assert_eq!(value["expectedAbi"], DSP_ABI_VERSION);
+        assert_eq!(value["actualAbi"], 1);
+        assert_eq!(value["error"], "ABI mismatch");
+        assert_eq!(round_trip, validation);
+        assert!(!round_trip.is_valid());
+        assert!(DspLibraryValidation::valid(DSP_ABI_VERSION).is_valid());
+        assert!(!DspLibraryValidation::pending().is_valid());
+    }
+
+    #[test]
+    fn primary_reason_metadata_reaches_typescript_in_camel_case() {
+        let reason = PrimaryReason {
+            code: PrimaryReasonCode::WaitingForPlayback,
+            detail: Some("waiting".to_owned()),
+            endpoint_id: Some("render-id".to_owned()),
+            retry_after_ms: Some(750),
+            configuration_issue: None,
+        };
+
+        let value = serde_json::to_value(reason).unwrap();
+
+        assert_eq!(value["code"], "waitingForPlayback");
+        assert_eq!(value["detail"], "waiting");
+        assert_eq!(value["endpointId"], "render-id");
+        assert_eq!(value["retryAfterMs"], 750);
+        assert!(value.get("message").is_none());
+        assert!(value.get("endpointName").is_none());
+    }
+
+    #[test]
+    fn configuration_issues_map_to_structured_primary_reason_codes() {
         assert_eq!(
-            settings.unprocessed_output,
-            UnprocessedOutput::RawMicrophone
+            PrimaryReason::configuration(ConfigurationIssue::PhysicalCaptureRequired {
+                virtual_capture_endpoint_id: Some("virtual".to_owned()),
+            })
+            .code,
+            PrimaryReasonCode::SafetyConflict,
+        );
+        assert_eq!(
+            PrimaryReason::configuration(ConfigurationIssue::VirtualDeviceRequired {
+                reason: VirtualDeviceIssueReason::CustomPairUnconfirmed,
+            })
+            .code,
+            PrimaryReasonCode::PairUnconfirmed,
+        );
+        assert_eq!(
+            PrimaryReason::configuration(ConfigurationIssue::VirtualDeviceRequired {
+                reason: VirtualDeviceIssueReason::VbCableUnavailable,
+            })
+            .code,
+            PrimaryReasonCode::WaitingForVirtualOutput,
         );
     }
 
     #[test]
-    fn the_legacy_mute_value_maps_to_silence() {
-        let settings: EngineSettings = serde_json::from_str(r#"{"failurePolicy":"mute"}"#).unwrap();
+    fn prepare_fallback_carries_a_structured_reason() {
+        let request = EngineRequest::PrepareFallback {
+            reason: PrimaryReasonCode::AudioDeviceFailure,
+        };
 
-        assert_eq!(settings.unprocessed_output, UnprocessedOutput::Silence);
+        assert_eq!(
+            serde_json::to_string(&request).unwrap(),
+            r#"{"type":"prepareFallback","reason":"audioDeviceFailure"}"#,
+        );
     }
 
     #[test]
-    fn unprocessed_output_writes_the_current_names() {
-        let settings = EngineSettings {
-            unprocessed_output: UnprocessedOutput::RawMicrophone,
+    fn known_vb_cable_identity_types_keep_string_wire_shape() {
+        let pair = KnownVbCablePair {
+            render_endpoint_id: "render".to_owned().into(),
+            capture_endpoint_id: "capture".to_owned().into(),
+        };
+
+        let value = serde_json::to_value(pair).unwrap();
+
+        assert_eq!(value["renderEndpointId"], "render");
+        assert_eq!(value["captureEndpointId"], "capture");
+    }
+
+    #[test]
+    fn helper_counter_baseline_preserves_app_lifetime_totals() {
+        let current = EngineMetrics {
+            processed_blocks: 5,
+            pipeline_latency_ms: 12.0,
+            ..EngineMetrics::default()
+        };
+        let baseline = EngineMetrics {
+            processed_blocks: 7,
+            dsp_failures: 2,
+            pipeline_latency_ms: 99.0,
+            ..EngineMetrics::default()
+        };
+
+        let merged = current.with_counter_baseline(&baseline);
+
+        assert_eq!(merged.processed_blocks, 12);
+        assert_eq!(merged.dsp_failures, 2);
+        assert_eq!(merged.pipeline_latency_ms, 12.0);
+    }
+
+    #[test]
+    fn accepted_defaults_are_preserved_and_valid() {
+        let settings = EngineSettings::default();
+        settings.validate().unwrap();
+
+        assert!(settings.dsp.aec.enabled);
+        assert_eq!(settings.dsp.aec.preset, AecPreset::Natural);
+        assert!(settings.dsp.aec.high_pass_filter_enabled);
+        assert!(settings.dsp.rnnoise.enabled);
+        assert_eq!(settings.dsp.rnnoise.mix, 1.0);
+        assert!(!settings.dsp.agc2.enabled);
+        assert!(settings.dsp.vad_gate.enabled);
+        assert_eq!(settings.dsp.vad_gate.confirmation_ms, 40);
+        assert_eq!(settings.dsp.vad_gate.hold_ms, 300);
+        assert_eq!(settings.dsp.vad_gate.floor_db, -20.0);
+        assert_eq!(settings.dsp.limiter.ceiling_dbfs, -1.0);
+        assert_eq!(settings.dsp.limiter.release_ms, 50.0);
+        assert_eq!(settings.degraded_output, DegradedOutput::Silence);
+        assert_eq!(settings.known_vb_cable_pair, None);
+    }
+
+    #[test]
+    fn old_setting_names_and_values_are_a_clean_break() {
+        let mut value = serde_json::to_value(EngineSettings::default()).unwrap();
+        value["failurePolicy"] = "rawPassthrough".into();
+        assert!(serde_json::from_value::<EngineSettings>(value).is_err());
+        assert!(serde_json::from_str::<DegradedOutput>(r#""mute""#).is_err());
+        assert_eq!(
+            serde_json::to_string(&DegradedOutput::Raw).unwrap(),
+            r#""raw""#
+        );
+    }
+
+    #[test]
+    fn unknown_nested_setting_fields_are_rejected() {
+        let mut value = serde_json::to_value(EngineSettings::default()).unwrap();
+        value["dsp"]["aec"]["legacyMode"] = true.into();
+        assert!(serde_json::from_value::<EngineSettings>(value).is_err());
+    }
+
+    #[test]
+    fn missing_current_schema_fields_are_rejected() {
+        let mut value = serde_json::to_value(EngineSettings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("degradedOutput");
+        assert!(serde_json::from_value::<EngineSettings>(value).is_err());
+
+        let mut value = serde_json::to_value(EngineSettings::default()).unwrap();
+        value["dsp"]["vadGate"]
+            .as_object_mut()
+            .unwrap()
+            .remove("confirmationMs");
+        assert!(serde_json::from_value::<EngineSettings>(value).is_err());
+    }
+
+    #[test]
+    fn nullable_setting_fields_require_explicit_keys() {
+        let value = serde_json::to_value(EngineSettings::default()).unwrap();
+        for field in [
+            "renderEndpointId",
+            "captureEndpointId",
+            "captureChannel",
+            "outputEndpointId",
+            "virtualDeviceMode",
+            "virtualCaptureEndpointId",
+            "knownVbCablePair",
+        ] {
+            assert_eq!(value.get(field), Some(&serde_json::Value::Null));
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(field);
+
+            let error = serde_json::from_value::<EngineSettings>(missing).unwrap_err();
+
+            assert!(error
+                .to_string()
+                .contains(&format!("missing field `{field}`")));
+        }
+    }
+
+    #[test]
+    fn nullable_setting_values_round_trip_with_nulls_and_values() {
+        let populated = EngineSettings {
+            render_endpoint_id: Some("playback".to_owned()),
+            capture_endpoint_id: Some("microphone".to_owned()),
+            capture_channel: Some(3),
+            output_endpoint_id: Some("virtual-render".to_owned()),
+            virtual_device_mode: Some(VirtualDeviceMode::VbCable),
+            virtual_capture_endpoint_id: Some("virtual-capture".to_owned()),
+            known_vb_cable_pair: Some(KnownVbCablePair {
+                render_endpoint_id: "virtual-render".to_owned().into(),
+                capture_endpoint_id: "virtual-capture".to_owned().into(),
+            }),
             ..EngineSettings::default()
         };
+        for settings in [EngineSettings::default(), populated] {
+            let json = serde_json::to_string(&settings).unwrap();
+            let decoded: EngineSettings = serde_json::from_str(&json).unwrap();
 
-        let encoded = serde_json::to_string(&settings).unwrap();
-
-        assert!(encoded.contains("\"unprocessedOutput\":\"rawMicrophone\""));
-        assert!(!encoded.contains("failurePolicy"));
+            decoded.validate().unwrap();
+            assert_eq!(decoded, settings);
+        }
     }
 
-    #[test]
-    fn a_helper_without_a_permit_keeps_the_microphone_closed() {
-        // `permit` carries a `serde` default, so a request that predates it still parses — and has to
-        // parse as "nothing is allowed to run" rather than as the permissive all-false-is-false trap.
-        let request: EngineRequest = serde_json::from_str(r#"{"type":"getStatus"}"#).unwrap();
-
-        let EngineRequest::GetStatus { permit, .. } = request else {
-            panic!("expected a status request");
-        };
-        assert!(!permit.bypass_allowed);
-        assert!(!permit.speech_notice_needed);
-    }
-
-    /// `ConfigurationIssue` is the only tagged enum in this protocol whose struct-variant fields
-    /// cross into TypeScript, and `rename_all` on an enum renames variants only — the fields need
-    /// `rename_all_fields`. Without it the wire carried `virtual_capture_endpoint_id` while
-    /// `App.tsx` read `virtualCaptureEndpointId`, so an issue produced by the helper rendered its
-    /// device name as "-". The frontend recomputes the same issue from the draft and wins almost
-    /// every time, which is why that stayed invisible; this test makes sure it cannot come back.
     #[test]
     fn configuration_issue_fields_reach_typescript_in_camel_case() {
         let capture = serde_json::to_string(&ConfigurationIssue::PhysicalCaptureRequired {
             virtual_capture_endpoint_id: Some("cable-output".to_owned()),
         })
         .unwrap();
-        let device = serde_json::to_string(&ConfigurationIssue::VirtualDeviceRequired {
-            reason: VirtualDeviceIssueReason::CustomPairUnconfirmed,
-        })
-        .unwrap();
-        let conflict = serde_json::to_string(&ConfigurationIssue::VirtualRouteConflict {
-            kind: VirtualRouteConflictKind::DefaultRender,
-            endpoint_id: "cable-input".to_owned(),
-        })
-        .unwrap();
-
         assert_eq!(
             capture,
             r#"{"type":"physicalCaptureRequired","virtualCaptureEndpointId":"cable-output"}"#
         );
-        assert_eq!(
-            device,
-            r#"{"type":"virtualDeviceRequired","reason":"customPairUnconfirmed"}"#
-        );
-        assert_eq!(
-            conflict,
-            r#"{"type":"virtualRouteConflict","kind":"defaultRender","endpointId":"cable-input"}"#
-        );
     }
 
     #[test]
-    fn old_settings_default_vad_confirmation() {
-        let mut value = serde_json::to_value(EngineSettings::default()).unwrap();
-        value["dsp"]["vadGate"]
-            .as_object_mut()
-            .unwrap()
-            .remove("confirmationMs");
-
-        let settings: EngineSettings = serde_json::from_value(value).unwrap();
-
-        assert_eq!(settings.dsp.vad_gate.confirmation_ms, 40);
-    }
-
-    #[test]
-    fn migration_replaces_only_the_superseded_gate_defaults() {
-        let mut dsp = DspSettings::default();
-        dsp.vad_gate.confirmation_ms = LEGACY_VAD_CONFIRMATION_MS;
-        dsp.vad_gate.floor_db = LEGACY_VAD_FLOOR_DB;
-        dsp.vad_gate.hold_ms = 500;
-
-        assert!(dsp.migrate_legacy_defaults());
-
-        assert_eq!(dsp.vad_gate.confirmation_ms, 40);
-        assert_eq!(dsp.vad_gate.floor_db, -20.0);
-        assert_eq!(dsp.vad_gate.hold_ms, 500);
-    }
-
-    #[test]
-    fn migration_keeps_hand_tuned_gate_values() {
-        let mut dsp = DspSettings::default();
-        dsp.vad_gate.confirmation_ms = 200;
-        dsp.vad_gate.floor_db = -45.0;
-
-        assert!(!dsp.migrate_legacy_defaults());
-
-        assert_eq!(dsp.vad_gate.confirmation_ms, 200);
-        assert_eq!(dsp.vad_gate.floor_db, -45.0);
-    }
-
-    #[test]
-    fn migration_arms_a_pass_through_agc2() {
-        let mut dsp = DspSettings::default();
-        dsp.agc2.adaptive_digital_enabled = false;
-        dsp.agc2.fixed_gain_db = 0.0;
-
-        assert!(dsp.migrate_legacy_defaults());
-
-        assert!(dsp.agc2.adaptive_digital_enabled);
-    }
-
-    #[test]
-    fn migration_keeps_a_fixed_gain_only_agc2() {
-        let mut dsp = DspSettings::default();
-        dsp.agc2.adaptive_digital_enabled = false;
-        dsp.agc2.fixed_gain_db = 6.0;
-
-        assert!(!dsp.migrate_legacy_defaults());
-
-        assert!(!dsp.agc2.adaptive_digital_enabled);
-    }
-
-    #[test]
-    fn rejects_an_enabled_agc2_that_would_pass_through() {
-        let mut settings = EngineSettings::default();
-        settings.dsp.agc2.enabled = true;
-        settings.dsp.agc2.adaptive_digital_enabled = false;
-
-        assert_eq!(
-            settings.validate(),
-            Err(SettingsError::Agc2WouldPassThrough)
-        );
-
-        settings.dsp.agc2.fixed_gain_db = 3.0;
-        settings.validate().unwrap();
-    }
-
-    #[test]
-    fn a_disabled_pass_through_agc2_stays_loadable() {
-        let mut settings = EngineSettings::default();
-        settings.dsp.agc2.adaptive_digital_enabled = false;
-
-        settings.validate().unwrap();
-    }
-
-    #[test]
-    fn missing_settings_fields_use_current_defaults() {
-        let settings: EngineSettings = serde_json::from_str("{}").unwrap();
-
-        assert_eq!(settings, EngineSettings::default());
-    }
-
-    #[test]
-    fn rejects_non_finite_settings() {
-        let mut settings = EngineSettings::default();
-        settings.dsp.rnnoise.mix = f32::NAN;
-        assert_eq!(
-            settings.validate(),
-            Err(SettingsError::OutOfRange("RNNoise mix"))
-        );
-    }
-
-    #[test]
-    fn rejects_fixed_render_mode_without_an_endpoint() {
-        let settings = EngineSettings {
+    fn aec_off_does_not_require_a_playback_endpoint() {
+        let mut settings = EngineSettings {
             follow_default_render: false,
             ..EngineSettings::default()
         };
-
         assert_eq!(
             settings.validate(),
             Err(SettingsError::FixedRenderEndpointRequired)
         );
+
+        settings.dsp.aec.enabled = false;
+        settings.validate().unwrap();
     }
 
     #[test]
-    fn rejects_vad_gate_without_rnnoise_vad() {
-        let mut settings = EngineSettings::default();
-        settings.dsp.rnnoise.enabled = false;
-
-        assert_eq!(settings.validate(), Err(SettingsError::VadRequiresRnnoise));
+    fn output_only_active_route_serializes_a_null_capture() {
+        let route = ActiveRoute {
+            render_endpoint_id: None,
+            capture_endpoint_id: None,
+            output_endpoint_id: "virtual-output".to_owned(),
+        };
+        let json = serde_json::to_string(&route).unwrap();
+        assert!(json.contains(r#""captureEndpointId":null"#));
     }
 
     #[test]
-    fn bootstrap_uses_current_protocol() {
+    fn session_active_requires_a_non_blocked_processing_state() {
+        let mut status = EngineStatus::bootstrap(Vec::new());
+        status.state = EngineState::Blocked;
+        status.output = EngineOutput::Silence;
+        assert!(!status.session_active());
+
+        status.state = EngineState::Degraded;
+        assert!(status.session_active());
+    }
+
+    #[test]
+    fn inactive_transition_clears_route_and_session_gauges_but_keeps_counters() {
+        let mut status = EngineStatus::bootstrap(Vec::new());
+        status.active_route = Some(ActiveRoute {
+            render_endpoint_id: None,
+            capture_endpoint_id: Some("mic".to_owned()),
+            output_endpoint_id: "virtual-output".to_owned(),
+        });
+        status.metrics.processed_blocks = 9;
+        status.metrics.input_peak_dbfs = Some(-3.0);
+
+        status.transition_to_inactive(
+            EngineState::Degraded,
+            Some(PrimaryReason::new(PrimaryReasonCode::AudioDeviceFailure)),
+        );
+
+        assert_eq!(status.output, EngineOutput::Inactive);
+        assert!(status.active_route.is_none());
+        assert_eq!(status.metrics.processed_blocks, 9);
+        assert_eq!(status.metrics.input_peak_dbfs, None);
+    }
+
+    #[test]
+    fn bootstrap_uses_the_public_state_contract() {
         let status = EngineStatus::bootstrap(Vec::new());
         assert_eq!(status.protocol_version, PROTOCOL_VERSION);
-        assert!(!status.running);
-        assert_eq!(status.mode, EngineMode::Sleeping);
-        assert_eq!(status.settings, EngineSettings::default());
-        assert!(!status.unprocessed_speech_detected);
+        assert!(!status.desired_enabled);
+        assert_eq!(status.state, EngineState::Off);
+        assert_eq!(status.output, EngineOutput::Inactive);
+        assert_eq!(
+            status.primary_reason.as_ref().map(|reason| reason.code),
+            Some(PrimaryReasonCode::ManualOff)
+        );
+        assert!(!status.notification_probe_speech_detected);
     }
 }

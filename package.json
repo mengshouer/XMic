@@ -1,7 +1,7 @@
 {
   "name": "xmic",
   "private": true,
-  "version": "0.3.5",
+  "version": "0.3.6",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -11,8 +11,10 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "bundle": "npm run version:check && npm run licenses:generate && npm run artifacts:check && tauri build --ci --config src-tauri/tauri.bundle.conf.json -- --locked",
+    "bundle": "npm run version:check && npm run licenses:generate && npm run artifacts:check && tauri build --ci --config src-tauri/tauri.bundle.conf.json -- --locked && npm run bundle:assets",
+    "bundle:assets": "npm run notices:check-embedded && powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-release-assets.ps1",
     "artifacts:check": "node scripts/check-webrtc-artifacts.mjs",
+    "notices:check-embedded": "node scripts/check-embedded-notices.mjs",
     "licenses:generate": "node scripts/generate-third-party-notices.mjs",
     "licenses:check": "node scripts/generate-third-party-notices.mjs --check",
     "preview": "vite preview",

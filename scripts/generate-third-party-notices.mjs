@@ -497,13 +497,15 @@ function generateSourceBundles(packages, paths) {
       cpSync(overrideLicensePaths.mpl, bundledLicense);
     }
 
-    packageInfo.sourceBundlePath = `licenses/sources/${portableDirectory}/`;
+    packageInfo.sourceBundlePath = `sources/${portableDirectory}/`;
     const lockFile = packageInfo.ecosystem === "cargo" ? "Cargo.lock" : "package-lock.json";
     const sourceInfo = [
       `Package: ${packageInfo.name} ${packageInfo.version}`,
       `License: ${packageInfo.license}`,
       `Repository: ${packageInfo.repository ?? "not declared"}`,
       `Locked by: ${lockFile}`,
+      `Archive: XMic_<version>_MPL-2.0-source.zip`,
+      `Archive path: ${packageInfo.sourceBundlePath}`,
       "",
       "The package source files in this directory were copied without modification",
       "from the package installed from the lock file. XMic added this SOURCE_INFO.txt",
@@ -534,8 +536,10 @@ function generateSourceBundles(packages, paths) {
     `Files: ${totalFiles}`,
     `Bytes: ${totalBytes}`,
     "",
-    "The listed directories contain the Source Code Form for dependencies whose",
-    "license requires it to accompany the executable distribution.",
+    "This manifest is embedded in XMic.exe for reference. The matching Source Code",
+    "Form is distributed separately in XMic_<version>_MPL-2.0-source.zip, which also",
+    "carries LICENSE-MPL-2.0.txt at its root.",
+    "Paths below are relative to the root of that versioned archive.",
     "",
   ];
   for (const packageInfo of sourcePackages) {

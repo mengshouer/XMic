@@ -19,15 +19,18 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+rtrb.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-notification = "2"
+windows.workspace = true
 xmic-engine-core = { path = "../crates/engine-core" }
 xmic-engine-protocol = { path = "../crates/engine-protocol" }
 xmic-engine-runtime = { path = "../crates/engine-runtime" }
 xmic-platform-api = { path = "../crates/platform-api" }
 xmic-platform-windows = { path = "../crates/platform-windows" }
 xmic-rnnoise-dsp = { path = "../crates/rnnoise-dsp" }
+xmic-webrtc-dsp = { path = "../crates/webrtc-dsp" }

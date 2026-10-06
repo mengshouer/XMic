@@ -10,6 +10,7 @@ use std::{
 use windows::{
     core::{implement, PCWSTR},
     Win32::{
+        Devices::FunctionDiscovery::{PKEY_Device_ContainerId, PKEY_Device_FriendlyName},
         Foundation::PROPERTYKEY,
         Media::Audio::{
             EDataFlow, ERole, IMMDeviceEnumerator, IMMNotificationClient,
@@ -20,7 +21,7 @@ use windows::{
 };
 use xmic_platform_api::PlatformError;
 
-use crate::{join_worker_with_timeout, operation_error, ComApartment, WORKER_START_TIMEOUT};
+use crate::{join_background_worker, operation_error, ComApartment, WORKER_START_TIMEOUT};
 
 pub struct DeviceChangeMonitor {
     generation: Arc<AtomicU64>,
@@ -39,16 +40,16 @@ impl DeviceChangeMonitor {
 
     pub fn stop(mut self) -> Result<(), PlatformError> {
         self.request_stop();
-        self.join_worker()
+        self.join_background_worker()
     }
 
     fn request_stop(&self) {
         self.stop.store(true, Ordering::Release);
     }
 
-    fn join_worker(&mut self) -> Result<(), PlatformError> {
+    fn join_background_worker(&mut self) -> Result<(), PlatformError> {
         self.worker.take().map_or(Ok(()), |worker| {
-            join_worker_with_timeout(worker, "device change monitor")?
+            join_background_worker(worker, "device change monitor")
         })
     }
 }
@@ -56,7 +57,7 @@ impl DeviceChangeMonitor {
 impl Drop for DeviceChangeMonitor {
     fn drop(&mut self) {
         self.request_stop();
-        let _ = self.join_worker();
+        let _ = self.join_background_worker();
     }
 }
 
@@ -82,19 +83,19 @@ pub fn start_device_change_monitor() -> Result<DeviceChangeMonitor, PlatformErro
         }),
         Ok(Err(error)) => {
             stop.store(true, Ordering::Release);
-            drop(worker);
+            let _ = join_background_worker(worker, "failed device monitor startup");
             Err(PlatformError::Operation(error))
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {
             stop.store(true, Ordering::Release);
-            drop(worker);
+            let _ = join_background_worker(worker, "timed-out device monitor startup");
             Err(PlatformError::Operation(
                 "device change monitor preparation timed out after 5 seconds".to_owned(),
             ))
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             stop.store(true, Ordering::Release);
-            drop(worker);
+            let _ = join_background_worker(worker, "disconnected device monitor startup");
             Err(PlatformError::WorkerStopped)
         }
     }
@@ -172,8 +173,13 @@ impl IMMNotificationClient_Impl for DeviceNotificationClient_Impl {
     fn OnPropertyValueChanged(
         &self,
         _device_id: &PCWSTR,
-        _key: &PROPERTYKEY,
+        key: &PROPERTYKEY,
     ) -> windows::core::Result<()> {
+        // Friendly-name and container changes affect virtual-pair recognition and topology safety.
+        // Ignore unrelated property churn, but invalidate the snapshot for these identity fields.
+        if *key == PKEY_Device_FriendlyName || *key == PKEY_Device_ContainerId {
+            self.mark_changed();
+        }
         Ok(())
     }
 }

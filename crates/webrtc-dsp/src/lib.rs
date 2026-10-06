@@ -2,6 +2,7 @@ use std::{
     ffi::c_void,
     path::Path,
     ptr::{self, NonNull},
+    sync::Arc,
 };
 
 use libloading::Library;
@@ -83,11 +84,73 @@ impl Default for Agc2Config {
     }
 }
 
+/// A single validated and pinned native module shared by every WebRTC stage in a helper process.
+/// Loading resolves the complete public ABI before any audio endpoint is opened.
+pub struct WebRtcLibrary {
+    _library: Library,
+    functions: Functions,
+    agc2_functions: Agc2Functions,
+    actual_abi: u32,
+}
+
+impl WebRtcLibrary {
+    pub fn load(path: &Path) -> Result<Arc<Self>, LibraryLoadFailure> {
+        // XMic's production UI never calls this; native overrides are loaded only by its helper.
+        let library = unsafe { Library::new(path) }
+            .map_err(|error| LibraryLoadFailure::new(None, DspError::Library(error)))?;
+        let abi_version: AbiVersionFn = unsafe {
+            load_export(
+                &library,
+                b"xmic_webrtc_dsp_abi_version\0",
+                "xmic_webrtc_dsp_abi_version",
+            )
+        }
+        .map_err(|error| LibraryLoadFailure::new(None, error))?;
+        let actual_abi = unsafe { abi_version() };
+        validate_abi(actual_abi)
+            .map_err(|error| LibraryLoadFailure::new(Some(actual_abi), error))?;
+        let functions = unsafe { Functions::load(&library) }
+            .map_err(|error| LibraryLoadFailure::new(Some(actual_abi), error))?;
+        let agc2_functions = unsafe { Agc2Functions::load(&library) }
+            .map_err(|error| LibraryLoadFailure::new(Some(actual_abi), error))?;
+        Ok(Arc::new(Self {
+            _library: library,
+            functions,
+            agc2_functions,
+            actual_abi,
+        }))
+    }
+
+    pub fn actual_abi(&self) -> u32 {
+        self.actual_abi
+    }
+}
+
+#[derive(Debug)]
+pub struct LibraryLoadFailure {
+    pub actual_abi: Option<u32>,
+    pub error: DspError,
+}
+
+impl LibraryLoadFailure {
+    fn new(actual_abi: Option<u32>, error: DspError) -> Self {
+        Self { actual_abi, error }
+    }
+}
+
+impl std::fmt::Display for LibraryLoadFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for LibraryLoadFailure {}
+
 pub struct WebRtcDsp {
     handle: NonNull<c_void>,
     render_channels: usize,
     functions: Functions,
-    _library: Library,
+    _library: Arc<WebRtcLibrary>,
 }
 
 impl WebRtcDsp {
@@ -95,19 +158,15 @@ impl WebRtcDsp {
         if !(1..=2).contains(&config.render_channels) {
             return Err(DspError::UnsupportedRenderChannels(config.render_channels));
         }
+        let library = WebRtcLibrary::load(path).map_err(|failure| failure.error)?;
+        Self::from_library(library, config)
+    }
 
-        // Loading a native library can run its initialization code. The caller
-        // supplies the pinned xmic DLL path rather than an ambient search name.
-        let library = unsafe { Library::new(path) }?;
-        let functions = unsafe { Functions::load(&library)? };
-        let actual_abi = unsafe { (functions.abi_version)() };
-        if actual_abi != ABI_VERSION {
-            return Err(DspError::AbiMismatch {
-                expected: ABI_VERSION,
-                actual: actual_abi,
-            });
+    pub fn from_library(library: Arc<WebRtcLibrary>, config: DspConfig) -> Result<Self, DspError> {
+        if !(1..=2).contains(&config.render_channels) {
+            return Err(DspError::UnsupportedRenderChannels(config.render_channels));
         }
-
+        let functions = library.functions;
         let raw_config = RawConfig {
             struct_size: size_of_u32::<RawConfig>()?,
             abi_version: ABI_VERSION,
@@ -244,22 +303,19 @@ impl Drop for WebRtcDsp {
 pub struct WebRtcAgc2 {
     handle: NonNull<c_void>,
     functions: Agc2Functions,
-    _library: Library,
+    _library: Arc<WebRtcLibrary>,
 }
 
 impl WebRtcAgc2 {
     pub fn load(path: &Path, config: Agc2Config) -> Result<Self, DspError> {
         validate_agc2_config(config)?;
-        let library = unsafe { Library::new(path) }?;
-        let functions = unsafe { Agc2Functions::load(&library)? };
-        let actual_abi = unsafe { (functions.abi_version)() };
-        if actual_abi != ABI_VERSION {
-            return Err(DspError::AbiMismatch {
-                expected: ABI_VERSION,
-                actual: actual_abi,
-            });
-        }
+        let library = WebRtcLibrary::load(path).map_err(|failure| failure.error)?;
+        Self::from_library(library, config)
+    }
 
+    pub fn from_library(library: Arc<WebRtcLibrary>, config: Agc2Config) -> Result<Self, DspError> {
+        validate_agc2_config(config)?;
+        let functions = library.agc2_functions;
         let raw_config = RawAgc2Config {
             struct_size: size_of_u32::<RawAgc2Config>()?,
             abi_version: ABI_VERSION,
@@ -317,7 +373,6 @@ impl Drop for WebRtcAgc2 {
 
 #[derive(Clone, Copy)]
 struct Functions {
-    abi_version: AbiVersionFn,
     create: CreateFn,
     destroy: DestroyFn,
     process_render: ProcessRenderFn,
@@ -328,23 +383,49 @@ struct Functions {
 }
 
 impl Functions {
-    unsafe fn load(library: &Library) -> Result<Self, libloading::Error> {
+    unsafe fn load(library: &Library) -> Result<Self, DspError> {
         Ok(Self {
-            abi_version: *library.get(b"xmic_webrtc_dsp_abi_version\0")?,
-            create: *library.get(b"xmic_webrtc_dsp_create\0")?,
-            destroy: *library.get(b"xmic_webrtc_dsp_destroy\0")?,
-            process_render: *library.get(b"xmic_webrtc_dsp_process_render\0")?,
-            process_capture: *library.get(b"xmic_webrtc_dsp_process_aec_capture\0")?,
-            detect_speech: *library.get(b"xmic_webrtc_dsp_detect_speech\0")?,
-            reset: *library.get(b"xmic_webrtc_dsp_reset_echo_path\0")?,
-            get_metrics: *library.get(b"xmic_webrtc_dsp_get_metrics\0")?,
+            create: load_export(
+                library,
+                b"xmic_webrtc_dsp_create\0",
+                "xmic_webrtc_dsp_create",
+            )?,
+            destroy: load_export(
+                library,
+                b"xmic_webrtc_dsp_destroy\0",
+                "xmic_webrtc_dsp_destroy",
+            )?,
+            process_render: load_export(
+                library,
+                b"xmic_webrtc_dsp_process_render\0",
+                "xmic_webrtc_dsp_process_render",
+            )?,
+            process_capture: load_export(
+                library,
+                b"xmic_webrtc_dsp_process_aec_capture\0",
+                "xmic_webrtc_dsp_process_aec_capture",
+            )?,
+            detect_speech: load_export(
+                library,
+                b"xmic_webrtc_dsp_detect_speech\0",
+                "xmic_webrtc_dsp_detect_speech",
+            )?,
+            reset: load_export(
+                library,
+                b"xmic_webrtc_dsp_reset_echo_path\0",
+                "xmic_webrtc_dsp_reset_echo_path",
+            )?,
+            get_metrics: load_export(
+                library,
+                b"xmic_webrtc_dsp_get_metrics\0",
+                "xmic_webrtc_dsp_get_metrics",
+            )?,
         })
     }
 }
 
 #[derive(Clone, Copy)]
 struct Agc2Functions {
-    abi_version: AbiVersionFn,
     create: Agc2CreateFn,
     destroy: Agc2DestroyFn,
     process: Agc2ProcessFn,
@@ -352,15 +433,41 @@ struct Agc2Functions {
 }
 
 impl Agc2Functions {
-    unsafe fn load(library: &Library) -> Result<Self, libloading::Error> {
+    unsafe fn load(library: &Library) -> Result<Self, DspError> {
         Ok(Self {
-            abi_version: *library.get(b"xmic_webrtc_dsp_abi_version\0")?,
-            create: *library.get(b"xmic_webrtc_agc2_create\0")?,
-            destroy: *library.get(b"xmic_webrtc_agc2_destroy\0")?,
-            process: *library.get(b"xmic_webrtc_agc2_process_capture\0")?,
-            reset: *library.get(b"xmic_webrtc_agc2_reset\0")?,
+            create: load_export(
+                library,
+                b"xmic_webrtc_agc2_create\0",
+                "xmic_webrtc_agc2_create",
+            )?,
+            destroy: load_export(
+                library,
+                b"xmic_webrtc_agc2_destroy\0",
+                "xmic_webrtc_agc2_destroy",
+            )?,
+            process: load_export(
+                library,
+                b"xmic_webrtc_agc2_process_capture\0",
+                "xmic_webrtc_agc2_process_capture",
+            )?,
+            reset: load_export(
+                library,
+                b"xmic_webrtc_agc2_reset\0",
+                "xmic_webrtc_agc2_reset",
+            )?,
         })
     }
+}
+
+unsafe fn load_export<T: Copy>(
+    library: &Library,
+    symbol: &'static [u8],
+    name: &'static str,
+) -> Result<T, DspError> {
+    library
+        .get::<T>(symbol)
+        .map(|symbol| *symbol)
+        .map_err(|source| DspError::MissingExport { name, source })
 }
 
 #[repr(C)]
@@ -404,6 +511,17 @@ struct RawAgc2Config {
     reserved: [u8; 8],
 }
 
+fn validate_abi(actual: u32) -> Result<(), DspError> {
+    if actual == ABI_VERSION {
+        Ok(())
+    } else {
+        Err(DspError::AbiMismatch {
+            expected: ABI_VERSION,
+            actual,
+        })
+    }
+}
+
 fn validate_agc2_config(config: Agc2Config) -> Result<(), DspError> {
     let valid = config.fixed_gain_db.is_finite()
         && (0.0..=30.0).contains(&config.fixed_gain_db)
@@ -442,6 +560,12 @@ fn check_result(operation: &'static str, result: i32) -> Result<(), DspError> {
 pub enum DspError {
     #[error("load WebRTC DSP library: {0}")]
     Library(#[from] libloading::Error),
+    #[error("WebRTC DSP library is missing required export {name}: {source}")]
+    MissingExport {
+        name: &'static str,
+        #[source]
+        source: libloading::Error,
+    },
     #[error("WebRTC DSP ABI mismatch: expected {expected}, got {actual}")]
     AbiMismatch { expected: u32, actual: u32 },
     #[error("WebRTC DSP returned a null handle")]
@@ -474,6 +598,16 @@ pub enum DspError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bundled_library_path() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("artifacts")
+            .join("webrtc")
+            .join("win-x64")
+            .join("xmic_webrtc_dsp.dll")
+    }
 
     #[test]
     fn ffi_struct_sizes_match_c_abi() {
@@ -512,19 +646,49 @@ mod tests {
     }
 
     #[test]
-    fn bundled_vad_rejects_silence() {
-        let native_library = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("artifacts")
-            .join("webrtc")
-            .join("win-x64")
-            .join("xmic_webrtc_dsp.dll");
+    fn abi_mismatch_is_rejected_before_objects_are_created() {
+        assert!(matches!(
+            validate_abi(ABI_VERSION + 1),
+            Err(DspError::AbiMismatch {
+                expected: ABI_VERSION,
+                actual
+            }) if actual == ABI_VERSION + 1
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn missing_required_export_names_the_failed_contract() {
+        let Some(system_root) = std::env::var_os("SystemRoot") else {
+            return;
+        };
+        let system_library = Path::new(&system_root).join("System32/kernel32.dll");
+
+        let failure = match WebRtcLibrary::load(&system_library) {
+            Ok(_) => panic!("system library unexpectedly implemented the XMic DSP ABI"),
+            Err(failure) => failure,
+        };
+
+        assert!(failure.actual_abi.is_none());
+        assert!(matches!(
+            failure.error,
+            DspError::MissingExport {
+                name: "xmic_webrtc_dsp_abi_version",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn bundled_library_resolves_the_full_abi_and_is_shared_by_aec_and_agc2() {
+        let native_library = bundled_library_path();
         if !native_library.is_file() {
             return;
         }
-        let mut dsp = WebRtcDsp::load(
-            &native_library,
+        let library = WebRtcLibrary::load(&native_library).unwrap();
+        assert_eq!(library.actual_abi(), ABI_VERSION);
+        let mut dsp = WebRtcDsp::from_library(
+            Arc::clone(&library),
             DspConfig {
                 render_channels: 2,
                 aec_preset: AecPreset::Strong,
@@ -532,6 +696,7 @@ mod tests {
             },
         )
         .unwrap();
+        let _agc2 = WebRtcAgc2::from_library(library, Agc2Config::default()).unwrap();
 
         assert!(!dsp.detect_speech(&[0.0; FRAME_SAMPLES]).unwrap());
     }

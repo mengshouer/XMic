@@ -1,10 +1,13 @@
-use std::{ffi::OsString, path::PathBuf, process, thread};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+    process, thread,
+};
 
 use xmic_engine_protocol::{EngineRequest, EngineResponse, PROTOCOL_VERSION};
 use xmic_platform_windows::{wait_for_process_exit, LocalIpcServer};
 
 use crate::{
-    device_profiles::DeviceProfileStore,
     engine::{EngineStartError, RealtimeEngineController},
     engine_ipc::{read_message, write_message},
     settings_store::SettingsStore,
@@ -14,8 +17,8 @@ struct AudioEngineProcessConfig {
     pipe_name: String,
     parent_process_id: u32,
     native_library: PathBuf,
+    native_library_guard_error: Option<String>,
     config_dir: PathBuf,
-    safe_mode: bool,
 }
 
 pub fn run_from_environment() -> Result<(), String> {
@@ -26,14 +29,11 @@ pub fn run_from_environment() -> Result<(), String> {
 fn run(config: AudioEngineProcessConfig) -> Result<(), String> {
     let server = LocalIpcServer::bind(&config.pipe_name).map_err(|error| error.to_string())?;
     monitor_parent(config.parent_process_id)?;
-    let controller = RealtimeEngineController::new(
+    remove_legacy_state_files(&config.config_dir);
+    let controller = RealtimeEngineController::new_with_library_guard_error(
         config.native_library,
-        SettingsStore::new(
-            config.config_dir.join("settings.json"),
-            config.config_dir.join("audio-route.json"),
-        ),
-        DeviceProfileStore::new(config.config_dir.join("device-profiles.json")),
-        config.safe_mode,
+        config.native_library_guard_error,
+        SettingsStore::new(config.config_dir.join("settings.json")),
     );
 
     loop {
@@ -76,11 +76,15 @@ fn handle_request(
                 )
             }
         }
-        EngineRequest::GetStatus { permit } => (
-            EngineResponse::Status(Box::new(controller.status(permit))),
+        EngineRequest::GetStatus { probe_permit } => (
+            EngineResponse::Status(Box::new(controller.status(probe_permit))),
             false,
         ),
         EngineRequest::UpdateSettings { settings } => match controller.update_settings(*settings) {
+            Ok(()) => (EngineResponse::Ack, false),
+            Err(error) => (EngineResponse::Error(error), false),
+        },
+        EngineRequest::PrepareFallback { reason } => match controller.prepare_fallback(reason) {
             Ok(()) => (EngineResponse::Ack, false),
             Err(error) => (EngineResponse::Error(error), false),
         },
@@ -105,6 +109,14 @@ fn handle_request(
     }
 }
 
+fn remove_legacy_state_files(config_dir: &Path) {
+    // Clean break: old route/profile files are neither read nor migrated. Best-effort deletion keeps
+    // a stale profile from being mistaken for active state while preserving startup if cleanup fails.
+    for name in ["device-profiles.json", "audio-route.json"] {
+        let _ = std::fs::remove_file(config_dir.join(name));
+    }
+}
+
 fn monitor_parent(parent_process_id: u32) -> Result<(), String> {
     thread::Builder::new()
         .name("xmic-parent-monitor".to_owned())
@@ -122,8 +134,8 @@ fn parse_args(
     let mut pipe_name = None;
     let mut parent_process_id = None;
     let mut native_library = None;
+    let mut native_library_guard_error = None;
     let mut config_dir = None;
-    let mut safe_mode = false;
     let mut args = args.into_iter();
     while let Some(argument) = args.next() {
         match argument.to_string_lossy().as_ref() {
@@ -144,10 +156,16 @@ fn parse_args(
                     "--native-library",
                 )?));
             }
+            "--native-library-guard-error" => {
+                native_library_guard_error = Some(
+                    required_value(&mut args, "--native-library-guard-error")?
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
             "--config-dir" => {
                 config_dir = Some(PathBuf::from(required_value(&mut args, "--config-dir")?));
             }
-            "--safe-mode" => safe_mode = true,
             unknown => return Err(format!("unknown audio engine argument: {unknown}")),
         }
     }
@@ -159,8 +177,8 @@ fn parse_args(
             .into_owned(),
         parent_process_id: parent_process_id.ok_or_else(|| "missing --parent-pid".to_owned())?,
         native_library: native_library.ok_or_else(|| "missing --native-library".to_owned())?,
+        native_library_guard_error,
         config_dir: config_dir.ok_or_else(|| "missing --config-dir".to_owned())?,
-        safe_mode,
     })
 }
 
@@ -177,7 +195,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_required_process_arguments_and_safe_mode() {
+    fn removes_legacy_state_files_without_affecting_current_settings() {
+        let directory = std::env::temp_dir().join(format!(
+            "xmic-engine-process-cleanup-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let legacy_profile = directory.join("device-profiles.json");
+        let legacy_route = directory.join("audio-route.json");
+        let current = directory.join("settings.json");
+        std::fs::write(&legacy_profile, "old").unwrap();
+        std::fs::write(&legacy_route, "old").unwrap();
+        std::fs::write(&current, "current").unwrap();
+
+        remove_legacy_state_files(&directory);
+
+        assert!(!legacy_profile.exists());
+        assert!(!legacy_route.exists());
+        assert!(current.exists());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn parses_required_process_arguments() {
         let config = parse_args(
             [
                 "--pipe-name",
@@ -188,7 +228,6 @@ mod tests {
                 "dsp.dll",
                 "--config-dir",
                 "config",
-                "--safe-mode",
             ]
             .map(OsString::from),
         )
@@ -197,7 +236,33 @@ mod tests {
         assert_eq!(config.pipe_name, "xmic-engine-test");
         assert_eq!(config.parent_process_id, 42);
         assert_eq!(config.native_library, PathBuf::from("dsp.dll"));
+        assert!(config.native_library_guard_error.is_none());
         assert_eq!(config.config_dir, PathBuf::from("config"));
-        assert!(config.safe_mode);
+    }
+
+    #[test]
+    fn parses_an_immutable_library_guard_failure() {
+        let config = parse_args(
+            [
+                "--audio-engine",
+                "--pipe-name",
+                "xmic-engine-test",
+                "--parent-pid",
+                "42",
+                "--native-library",
+                "missing.dll",
+                "--native-library-guard-error",
+                "selected library could not be pinned",
+                "--config-dir",
+                "config",
+            ]
+            .map(OsString::from),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.native_library_guard_error.as_deref(),
+            Some("selected library could not be pinned")
+        );
     }
 }

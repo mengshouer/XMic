@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    sync::{mpsc, Mutex, OnceLock},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -24,6 +25,8 @@ use windows::{
 use xmic_platform_api::{AudioPlatform, DataFlow, DeviceRole, EndpointDescriptor, PlatformError};
 
 mod capture;
+mod dialogs;
+mod file_ops;
 mod format;
 mod ipc;
 mod monitor;
@@ -31,8 +34,11 @@ mod output;
 mod stream;
 mod system_lifecycle;
 
+pub use dialogs::show_error_dialog;
+pub use file_ops::atomic_replace;
+
 const WORKER_START_TIMEOUT: Duration = Duration::from_secs(5);
-const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+const BACKGROUND_WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const QPC_UNITS_PER_SECOND: i64 = 10_000_000;
 const LATENCY_SMOOTHING_SHIFT: u32 = 3;
 /// Windows hands out this well-known container ID for endpoints that belong to no device container,
@@ -83,21 +89,67 @@ pub(crate) fn smoothed_sample(previous: u64, sample: u64) -> u64 {
     previous - (previous >> LATENCY_SMOOTHING_SHIFT) + (sample >> LATENCY_SMOOTHING_SHIFT)
 }
 
-fn join_worker_with_timeout<T>(
-    worker: JoinHandle<T>,
+fn join_audio_worker<T>(worker: JoinHandle<T>) -> Result<T, PlatformError> {
+    // Never detach an audio worker after a stop boundary: it may still own a device. Stream stop
+    // signals wake at bounded intervals, so retaining ownership and joining is the only safe handoff.
+    worker.join().map_err(|_| PlatformError::WorkerStopped)
+}
+
+type BackgroundWorker = JoinHandle<Result<(), PlatformError>>;
+
+fn join_background_worker(
+    worker: BackgroundWorker,
     description: &str,
-) -> Result<T, PlatformError> {
-    let deadline = Instant::now() + WORKER_STOP_TIMEOUT;
+) -> Result<(), PlatformError> {
+    join_background_worker_with_timeout(worker, description, BACKGROUND_WORKER_STOP_TIMEOUT)
+}
+
+fn join_background_worker_with_timeout(
+    worker: BackgroundWorker,
+    description: &str,
+    timeout: Duration,
+) -> Result<(), PlatformError> {
+    let deadline = Instant::now() + timeout;
     while !worker.is_finished() {
         if Instant::now() >= deadline {
-            drop(worker);
+            retain_background_worker(worker);
             return Err(PlatformError::Operation(format!(
-                "{description} did not stop within 2 seconds"
+                "{description} did not stop within {} ms; a background reaper retains its handle",
+                timeout.as_millis(),
             )));
         }
         thread::sleep(Duration::from_millis(10));
     }
-    worker.join().map_err(|_| PlatformError::WorkerStopped)
+    worker.join().map_err(|_| PlatformError::WorkerStopped)?
+}
+
+fn retain_background_worker(worker: BackgroundWorker) {
+    static REAPER: OnceLock<Option<mpsc::Sender<BackgroundWorker>>> = OnceLock::new();
+    static RETAINED: OnceLock<Mutex<Vec<BackgroundWorker>>> = OnceLock::new();
+    let sender = REAPER.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel::<BackgroundWorker>();
+        thread::Builder::new()
+            .name("xmic-background-worker-reaper".to_owned())
+            .spawn(move || {
+                for worker in receiver {
+                    let _ = worker.join();
+                }
+            })
+            .ok()
+            .map(|_| sender)
+    });
+    let worker = match sender {
+        Some(sender) => match sender.send(worker) {
+            Ok(()) => return,
+            Err(error) => error.0,
+        },
+        None => worker,
+    };
+    RETAINED
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(worker);
 }
 
 pub use capture::{
@@ -354,6 +406,38 @@ mod tests {
         }
 
         assert_eq!(value, 100_000);
+    }
+
+    #[test]
+    fn background_worker_join_is_bounded() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let release = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let worker_release = Arc::clone(&release);
+        let worker_finished = Arc::clone(&finished);
+        let worker = thread::spawn(move || {
+            while !worker_release.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            worker_finished.store(true, Ordering::Release);
+            Ok(())
+        });
+
+        let error =
+            join_background_worker_with_timeout(worker, "test monitor", Duration::from_millis(20))
+                .expect_err("the caller must not wait indefinitely");
+        assert!(error.to_string().contains("background reaper retains"));
+        assert!(!finished.load(Ordering::Acquire));
+        release.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !finished.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(finished.load(Ordering::Acquire));
     }
 
     #[test]

@@ -9,7 +9,44 @@
       "outputEndpointId": null,
       "virtualDeviceMode": null,
       "virtualCaptureEndpointId": null,
-      "trustedVirtualAudioPairs": []
+      "trustedVirtualAudioPairs": [],
+      "captureChannel": null,
+      "knownVbCablePair": null,
+      "degradedOutput": "silence",
+      "dsp": {
+        "aec": {
+          "enabled": true,
+          "preset": "natural",
+          "highPassFilterEnabled": true
+        },
+        "rnnoise": {
+          "enabled": true,
+          "mix": 1
+        },
+        "agc2": {
+          "enabled": false,
+          "adaptiveDigitalEnabled": true,
+          "fixedGainDb": 0,
+          "headroomDb": 5,
+          "maxGainDb": 6,
+          "initialGainDb": 0,
+          "maxGainChangeDbPerSecond": 3,
+          "maxOutputNoiseLevelDbfs": -55
+        },
+        "vadGate": {
+          "enabled": true,
+          "threshold": 0.7,
+          "confirmationMs": 40,
+          "holdMs": 300,
+          "floorDb": -20,
+          "attackMs": 10,
+          "releaseMs": 150
+        },
+        "limiter": {
+          "ceilingDbfs": -1,
+          "releaseMs": 50
+        }
+      }
     },
     "endpoints": [
       {
@@ -29,7 +66,10 @@
         "defaultRoles": []
       }
     ],
-    "expected": { "type": "virtualDeviceRequired", "reason": "vbCableUnavailable" }
+    "expected": {
+      "type": "virtualDeviceRequired",
+      "reason": "vbCableUnavailable"
+    }
   },
   {
     "name": "no endpoints at all blocks configuration",
@@ -41,22 +81,209 @@
       "outputEndpointId": null,
       "virtualDeviceMode": null,
       "virtualCaptureEndpointId": null,
-      "trustedVirtualAudioPairs": []
+      "trustedVirtualAudioPairs": [],
+      "captureChannel": null,
+      "knownVbCablePair": null,
+      "degradedOutput": "silence",
+      "dsp": {
+        "aec": {
+          "enabled": true,
+          "preset": "natural",
+          "highPassFilterEnabled": true
+        },
+        "rnnoise": {
+          "enabled": true,
+          "mix": 1
+        },
+        "agc2": {
+          "enabled": false,
+          "adaptiveDigitalEnabled": true,
+          "fixedGainDb": 0,
+          "headroomDb": 5,
+          "maxGainDb": 6,
+          "initialGainDb": 0,
+          "maxGainChangeDbPerSecond": 3,
+          "maxOutputNoiseLevelDbfs": -55
+        },
+        "vadGate": {
+          "enabled": true,
+          "threshold": 0.7,
+          "confirmationMs": 40,
+          "holdMs": 300,
+          "floorDb": -20,
+          "attackMs": 10,
+          "releaseMs": 150
+        },
+        "limiter": {
+          "ceilingDbfs": -1,
+          "releaseMs": 50
+        }
+      }
     },
     "endpoints": [],
-    "expected": { "type": "virtualDeviceRequired", "reason": "vbCableUnavailable" }
+    "expected": {
+      "type": "virtualDeviceRequired",
+      "reason": "vbCableUnavailable"
+    }
   },
   {
-    "name": "the virtual capture being the Windows default is not a physical microphone",
-    "why": "VB-CABLE installs itself as the default recording device, so 'follow the Windows default' would feed the cable back into itself. The physical microphone has to be named explicitly.",
+    "name": "a recognised VB-CABLE pair may be temporarily offline",
+    "why": "Only endpoint IDs previously recorded when standard VB-CABLE names were recognised may be retained through a complete temporary disappearance.",
     "settings": {
       "followDefaultRender": true,
       "renderEndpointId": null,
-      "captureEndpointId": null,
+      "captureEndpointId": "microphone",
       "outputEndpointId": "cable-input",
       "virtualDeviceMode": "vbCable",
       "virtualCaptureEndpointId": "cable-output",
-      "trustedVirtualAudioPairs": []
+      "trustedVirtualAudioPairs": [],
+      "knownVbCablePair": {
+        "renderEndpointId": "cable-input",
+        "captureEndpointId": "cable-output"
+      },
+      "captureChannel": null,
+      "degradedOutput": "silence",
+      "dsp": {
+        "aec": {
+          "enabled": true,
+          "preset": "natural",
+          "highPassFilterEnabled": true
+        },
+        "rnnoise": {
+          "enabled": true,
+          "mix": 1
+        },
+        "agc2": {
+          "enabled": false,
+          "adaptiveDigitalEnabled": true,
+          "fixedGainDb": 0,
+          "headroomDb": 5,
+          "maxGainDb": 6,
+          "initialGainDb": 0,
+          "maxGainChangeDbPerSecond": 3,
+          "maxOutputNoiseLevelDbfs": -55
+        },
+        "vadGate": {
+          "enabled": true,
+          "threshold": 0.7,
+          "confirmationMs": 40,
+          "holdMs": 300,
+          "floorDb": -20,
+          "attackMs": 10,
+          "releaseMs": 150
+        },
+        "limiter": {
+          "ceilingDbfs": -1,
+          "releaseMs": 50
+        }
+      }
+    },
+    "endpoints": [],
+    "expected": null
+  },
+  {
+    "name": "arbitrary VB-CABLE IDs do not pass as an offline pair",
+    "why": "Claiming VB-CABLE mode is not enough to make physical or unrelated endpoint IDs safe while the standard pair is absent.",
+    "settings": {
+      "followDefaultRender": true,
+      "renderEndpointId": null,
+      "captureEndpointId": "microphone",
+      "outputEndpointId": "speakers",
+      "virtualDeviceMode": "vbCable",
+      "virtualCaptureEndpointId": "microphone",
+      "trustedVirtualAudioPairs": [],
+      "captureChannel": null,
+      "knownVbCablePair": null,
+      "degradedOutput": "silence",
+      "dsp": {
+        "aec": {
+          "enabled": true,
+          "preset": "natural",
+          "highPassFilterEnabled": true
+        },
+        "rnnoise": {
+          "enabled": true,
+          "mix": 1
+        },
+        "agc2": {
+          "enabled": false,
+          "adaptiveDigitalEnabled": true,
+          "fixedGainDb": 0,
+          "headroomDb": 5,
+          "maxGainDb": 6,
+          "initialGainDb": 0,
+          "maxGainChangeDbPerSecond": 3,
+          "maxOutputNoiseLevelDbfs": -55
+        },
+        "vadGate": {
+          "enabled": true,
+          "threshold": 0.7,
+          "confirmationMs": 40,
+          "holdMs": 300,
+          "floorDb": -20,
+          "attackMs": 10,
+          "releaseMs": 150
+        },
+        "limiter": {
+          "ceilingDbfs": -1,
+          "releaseMs": 50
+        }
+      }
+    },
+    "endpoints": [],
+    "expected": {
+      "type": "virtualDeviceRequired",
+      "reason": "vbCableUnavailable"
+    }
+  },
+  {
+    "name": "mismatched VB-CABLE IDs do not pass while the pair is present",
+    "why": "The selected VB-CABLE IDs must be the pair currently identified by endpoint names; otherwise the stream could open an unrelated render endpoint.",
+    "settings": {
+      "followDefaultRender": true,
+      "renderEndpointId": null,
+      "captureEndpointId": "microphone",
+      "outputEndpointId": "speakers",
+      "virtualDeviceMode": "vbCable",
+      "virtualCaptureEndpointId": "microphone",
+      "trustedVirtualAudioPairs": [],
+      "captureChannel": null,
+      "knownVbCablePair": null,
+      "degradedOutput": "silence",
+      "dsp": {
+        "aec": {
+          "enabled": true,
+          "preset": "natural",
+          "highPassFilterEnabled": true
+        },
+        "rnnoise": {
+          "enabled": true,
+          "mix": 1
+        },
+        "agc2": {
+          "enabled": false,
+          "adaptiveDigitalEnabled": true,
+          "fixedGainDb": 0,
+          "headroomDb": 5,
+          "maxGainDb": 6,
+          "initialGainDb": 0,
+          "maxGainChangeDbPerSecond": 3,
+          "maxOutputNoiseLevelDbfs": -55
+        },
+        "vadGate": {
+          "enabled": true,
+          "threshold": 0.7,
+          "confirmationMs": 40,
+          "holdMs": 300,
+          "floorDb": -20,
+          "attackMs": 10,
+          "releaseMs": 150
+        },
+        "limiter": {
+          "ceilingDbfs": -1,
+          "releaseMs": 50
+        }
+      }
     },
     "endpoints": [
       {
@@ -73,7 +300,89 @@
         "groupId": "cable",
         "friendlyName": "CABLE Output (VB-Audio Virtual Cable)",
         "flow": "capture",
-        "defaultRoles": ["multimedia"]
+        "defaultRoles": []
+      },
+      {
+        "platform": "windows",
+        "id": "microphone",
+        "groupId": "microphone",
+        "friendlyName": "Physical microphone",
+        "flow": "capture",
+        "defaultRoles": []
+      }
+    ],
+    "expected": {
+      "type": "virtualDeviceRequired",
+      "reason": "vbCableUnavailable"
+    }
+  },
+  {
+    "name": "the virtual capture being the Windows default is not a physical microphone",
+    "why": "VB-CABLE installs itself as the default recording device, so 'follow the Windows default' would feed the cable back into itself. The physical microphone has to be named explicitly.",
+    "settings": {
+      "followDefaultRender": true,
+      "renderEndpointId": null,
+      "captureEndpointId": null,
+      "outputEndpointId": "cable-input",
+      "virtualDeviceMode": "vbCable",
+      "virtualCaptureEndpointId": "cable-output",
+      "trustedVirtualAudioPairs": [],
+      "captureChannel": null,
+      "knownVbCablePair": null,
+      "degradedOutput": "silence",
+      "dsp": {
+        "aec": {
+          "enabled": true,
+          "preset": "natural",
+          "highPassFilterEnabled": true
+        },
+        "rnnoise": {
+          "enabled": true,
+          "mix": 1
+        },
+        "agc2": {
+          "enabled": false,
+          "adaptiveDigitalEnabled": true,
+          "fixedGainDb": 0,
+          "headroomDb": 5,
+          "maxGainDb": 6,
+          "initialGainDb": 0,
+          "maxGainChangeDbPerSecond": 3,
+          "maxOutputNoiseLevelDbfs": -55
+        },
+        "vadGate": {
+          "enabled": true,
+          "threshold": 0.7,
+          "confirmationMs": 40,
+          "holdMs": 300,
+          "floorDb": -20,
+          "attackMs": 10,
+          "releaseMs": 150
+        },
+        "limiter": {
+          "ceilingDbfs": -1,
+          "releaseMs": 50
+        }
+      }
+    },
+    "endpoints": [
+      {
+        "platform": "windows",
+        "id": "cable-input",
+        "groupId": "cable",
+        "friendlyName": "CABLE Input (VB-Audio Virtual Cable)",
+        "flow": "render",
+        "defaultRoles": []
+      },
+      {
+        "platform": "windows",
+        "id": "cable-output",
+        "groupId": "cable",
+        "friendlyName": "CABLE Output (VB-Audio Virtual Cable)",
+        "flow": "capture",
+        "defaultRoles": [
+          "multimedia"
+        ]
       }
     ],
     "expected": {
@@ -91,7 +400,44 @@
       "outputEndpointId": "cable-input",
       "virtualDeviceMode": "vbCable",
       "virtualCaptureEndpointId": "cable-output",
-      "trustedVirtualAudioPairs": []
+      "trustedVirtualAudioPairs": [],
+      "captureChannel": null,
+      "knownVbCablePair": null,
+      "degradedOutput": "silence",
+      "dsp": {
+        "aec": {
+          "enabled": true,
+          "preset": "natural",
+          "highPassFilterEnabled": true
+        },
+        "rnnoise": {
+          "enabled": true,
+          "mix": 1
+        },
+        "agc2": {
+          "enabled": false,
+          "adaptiveDigitalEnabled": true,
+          "fixedGainDb": 0,
+          "headroomDb": 5,
+          "maxGainDb": 6,
+          "initialGainDb": 0,
+          "maxGainChangeDbPerSecond": 3,
+          "maxOutputNoiseLevelDbfs": -55
+        },
+        "vadGate": {
+          "enabled": true,
+          "threshold": 0.7,
+          "confirmationMs": 40,
+          "holdMs": 300,
+          "floorDb": -20,
+          "attackMs": 10,
+          "releaseMs": 150
+        },
+        "limiter": {
+          "ceilingDbfs": -1,
+          "releaseMs": 50
+        }
+      }
     },
     "endpoints": [
       {
@@ -108,7 +454,9 @@
         "groupId": "cable",
         "friendlyName": "CABLE Output (VB-Audio Virtual Cable)",
         "flow": "capture",
-        "defaultRoles": ["multimedia"]
+        "defaultRoles": [
+          "multimedia"
+        ]
       },
       {
         "platform": "windows",
@@ -122,8 +470,8 @@
     "expected": null
   },
   {
-    "name": "custom mode still requires an explicit physical microphone",
-    "why": "A confirmed custom pair says which endpoints are the virtual cable; it says nothing about which one is the real microphone.",
+    "name": "custom mode rejects the virtual capture as the default microphone",
+    "why": "A null capture endpoint follows the Windows multimedia default, and a virtual-cable default must still be rejected as feedback rather than treated as a physical microphone.",
     "settings": {
       "followDefaultRender": true,
       "renderEndpointId": null,
@@ -138,9 +486,57 @@
           "renderName": "Custom virtual input",
           "captureName": "Custom virtual output"
         }
-      ]
+      ],
+      "captureChannel": null,
+      "knownVbCablePair": null,
+      "degradedOutput": "silence",
+      "dsp": {
+        "aec": {
+          "enabled": true,
+          "preset": "natural",
+          "highPassFilterEnabled": true
+        },
+        "rnnoise": {
+          "enabled": true,
+          "mix": 1
+        },
+        "agc2": {
+          "enabled": false,
+          "adaptiveDigitalEnabled": true,
+          "fixedGainDb": 0,
+          "headroomDb": 5,
+          "maxGainDb": 6,
+          "initialGainDb": 0,
+          "maxGainChangeDbPerSecond": 3,
+          "maxOutputNoiseLevelDbfs": -55
+        },
+        "vadGate": {
+          "enabled": true,
+          "threshold": 0.7,
+          "confirmationMs": 40,
+          "holdMs": 300,
+          "floorDb": -20,
+          "attackMs": 10,
+          "releaseMs": 150
+        },
+        "limiter": {
+          "ceilingDbfs": -1,
+          "releaseMs": 50
+        }
+      }
     },
-    "endpoints": [],
+    "endpoints": [
+      {
+        "platform": "windows",
+        "id": "virtual-capture",
+        "groupId": "virtual",
+        "friendlyName": "Custom virtual output",
+        "flow": "capture",
+        "defaultRoles": [
+          "multimedia"
+        ]
+      }
+    ],
     "expected": {
       "type": "physicalCaptureRequired",
       "virtualCaptureEndpointId": "virtual-capture"
@@ -156,7 +552,44 @@
       "outputEndpointId": "virtual-render",
       "virtualDeviceMode": "custom",
       "virtualCaptureEndpointId": "virtual-capture",
-      "trustedVirtualAudioPairs": []
+      "trustedVirtualAudioPairs": [],
+      "captureChannel": null,
+      "knownVbCablePair": null,
+      "degradedOutput": "silence",
+      "dsp": {
+        "aec": {
+          "enabled": true,
+          "preset": "natural",
+          "highPassFilterEnabled": true
+        },
+        "rnnoise": {
+          "enabled": true,
+          "mix": 1
+        },
+        "agc2": {
+          "enabled": false,
+          "adaptiveDigitalEnabled": true,
+          "fixedGainDb": 0,
+          "headroomDb": 5,
+          "maxGainDb": 6,
+          "initialGainDb": 0,
+          "maxGainChangeDbPerSecond": 3,
+          "maxOutputNoiseLevelDbfs": -55
+        },
+        "vadGate": {
+          "enabled": true,
+          "threshold": 0.7,
+          "confirmationMs": 40,
+          "holdMs": 300,
+          "floorDb": -20,
+          "attackMs": 10,
+          "releaseMs": 150
+        },
+        "limiter": {
+          "ceilingDbfs": -1,
+          "releaseMs": 50
+        }
+      }
     },
     "endpoints": [],
     "expected": {
@@ -174,7 +607,44 @@
       "outputEndpointId": "virtual-render",
       "virtualDeviceMode": "custom",
       "virtualCaptureEndpointId": null,
-      "trustedVirtualAudioPairs": []
+      "trustedVirtualAudioPairs": [],
+      "captureChannel": null,
+      "knownVbCablePair": null,
+      "degradedOutput": "silence",
+      "dsp": {
+        "aec": {
+          "enabled": true,
+          "preset": "natural",
+          "highPassFilterEnabled": true
+        },
+        "rnnoise": {
+          "enabled": true,
+          "mix": 1
+        },
+        "agc2": {
+          "enabled": false,
+          "adaptiveDigitalEnabled": true,
+          "fixedGainDb": 0,
+          "headroomDb": 5,
+          "maxGainDb": 6,
+          "initialGainDb": 0,
+          "maxGainChangeDbPerSecond": 3,
+          "maxOutputNoiseLevelDbfs": -55
+        },
+        "vadGate": {
+          "enabled": true,
+          "threshold": 0.7,
+          "confirmationMs": 40,
+          "holdMs": 300,
+          "floorDb": -20,
+          "attackMs": 10,
+          "releaseMs": 150
+        },
+        "limiter": {
+          "ceilingDbfs": -1,
+          "releaseMs": 50
+        }
+      }
     },
     "endpoints": [],
     "expected": {
@@ -199,7 +669,44 @@
           "renderName": "Custom virtual input",
           "captureName": "Custom virtual output"
         }
-      ]
+      ],
+      "captureChannel": null,
+      "knownVbCablePair": null,
+      "degradedOutput": "silence",
+      "dsp": {
+        "aec": {
+          "enabled": true,
+          "preset": "natural",
+          "highPassFilterEnabled": true
+        },
+        "rnnoise": {
+          "enabled": true,
+          "mix": 1
+        },
+        "agc2": {
+          "enabled": false,
+          "adaptiveDigitalEnabled": true,
+          "fixedGainDb": 0,
+          "headroomDb": 5,
+          "maxGainDb": 6,
+          "initialGainDb": 0,
+          "maxGainChangeDbPerSecond": 3,
+          "maxOutputNoiseLevelDbfs": -55
+        },
+        "vadGate": {
+          "enabled": true,
+          "threshold": 0.7,
+          "confirmationMs": 40,
+          "holdMs": 300,
+          "floorDb": -20,
+          "attackMs": 10,
+          "releaseMs": 150
+        },
+        "limiter": {
+          "ceilingDbfs": -1,
+          "releaseMs": 50
+        }
+      }
     },
     "endpoints": [],
     "expected": null
@@ -214,7 +721,44 @@
       "outputEndpointId": "cable-input",
       "virtualDeviceMode": "vbCable",
       "virtualCaptureEndpointId": "cable-output",
-      "trustedVirtualAudioPairs": []
+      "trustedVirtualAudioPairs": [],
+      "captureChannel": null,
+      "knownVbCablePair": null,
+      "degradedOutput": "silence",
+      "dsp": {
+        "aec": {
+          "enabled": true,
+          "preset": "natural",
+          "highPassFilterEnabled": true
+        },
+        "rnnoise": {
+          "enabled": true,
+          "mix": 1
+        },
+        "agc2": {
+          "enabled": false,
+          "adaptiveDigitalEnabled": true,
+          "fixedGainDb": 0,
+          "headroomDb": 5,
+          "maxGainDb": 6,
+          "initialGainDb": 0,
+          "maxGainChangeDbPerSecond": 3,
+          "maxOutputNoiseLevelDbfs": -55
+        },
+        "vadGate": {
+          "enabled": true,
+          "threshold": 0.7,
+          "confirmationMs": 40,
+          "holdMs": 300,
+          "floorDb": -20,
+          "attackMs": 10,
+          "releaseMs": 150
+        },
+        "limiter": {
+          "ceilingDbfs": -1,
+          "releaseMs": 50
+        }
+      }
     },
     "endpoints": [
       {
@@ -239,7 +783,10 @@
         "groupId": null,
         "friendlyName": "Realtek Digital Output",
         "flow": "render",
-        "defaultRoles": ["console", "multimedia"]
+        "defaultRoles": [
+          "console",
+          "multimedia"
+        ]
       },
       {
         "platform": "windows",
@@ -262,7 +809,44 @@
       "outputEndpointId": "cable-input",
       "virtualDeviceMode": "vbCable",
       "virtualCaptureEndpointId": "cable-output",
-      "trustedVirtualAudioPairs": []
+      "trustedVirtualAudioPairs": [],
+      "captureChannel": null,
+      "knownVbCablePair": null,
+      "degradedOutput": "silence",
+      "dsp": {
+        "aec": {
+          "enabled": true,
+          "preset": "natural",
+          "highPassFilterEnabled": true
+        },
+        "rnnoise": {
+          "enabled": true,
+          "mix": 1
+        },
+        "agc2": {
+          "enabled": false,
+          "adaptiveDigitalEnabled": true,
+          "fixedGainDb": 0,
+          "headroomDb": 5,
+          "maxGainDb": 6,
+          "initialGainDb": 0,
+          "maxGainChangeDbPerSecond": 3,
+          "maxOutputNoiseLevelDbfs": -55
+        },
+        "vadGate": {
+          "enabled": true,
+          "threshold": 0.7,
+          "confirmationMs": 40,
+          "holdMs": 300,
+          "floorDb": -20,
+          "attackMs": 10,
+          "releaseMs": 150
+        },
+        "limiter": {
+          "ceilingDbfs": -1,
+          "releaseMs": 50
+        }
+      }
     },
     "endpoints": [
       {
@@ -271,7 +855,9 @@
         "groupId": null,
         "friendlyName": "CABLE Input (VB-Audio Virtual Cable)",
         "flow": "render",
-        "defaultRoles": ["multimedia"]
+        "defaultRoles": [
+          "multimedia"
+        ]
       },
       {
         "platform": "windows",
@@ -306,7 +892,44 @@
       "outputEndpointId": "cable-input",
       "virtualDeviceMode": "vbCable",
       "virtualCaptureEndpointId": "cable-output",
-      "trustedVirtualAudioPairs": []
+      "trustedVirtualAudioPairs": [],
+      "captureChannel": null,
+      "knownVbCablePair": null,
+      "degradedOutput": "silence",
+      "dsp": {
+        "aec": {
+          "enabled": true,
+          "preset": "natural",
+          "highPassFilterEnabled": true
+        },
+        "rnnoise": {
+          "enabled": true,
+          "mix": 1
+        },
+        "agc2": {
+          "enabled": false,
+          "adaptiveDigitalEnabled": true,
+          "fixedGainDb": 0,
+          "headroomDb": 5,
+          "maxGainDb": 6,
+          "initialGainDb": 0,
+          "maxGainChangeDbPerSecond": 3,
+          "maxOutputNoiseLevelDbfs": -55
+        },
+        "vadGate": {
+          "enabled": true,
+          "threshold": 0.7,
+          "confirmationMs": 40,
+          "holdMs": 300,
+          "floorDb": -20,
+          "attackMs": 10,
+          "releaseMs": 150
+        },
+        "limiter": {
+          "ceilingDbfs": -1,
+          "releaseMs": 50
+        }
+      }
     },
     "endpoints": [
       {
@@ -357,7 +980,44 @@
           "renderName": "Custom virtual input",
           "captureName": "Custom virtual output"
         }
-      ]
+      ],
+      "captureChannel": null,
+      "knownVbCablePair": null,
+      "degradedOutput": "silence",
+      "dsp": {
+        "aec": {
+          "enabled": true,
+          "preset": "natural",
+          "highPassFilterEnabled": true
+        },
+        "rnnoise": {
+          "enabled": true,
+          "mix": 1
+        },
+        "agc2": {
+          "enabled": false,
+          "adaptiveDigitalEnabled": true,
+          "fixedGainDb": 0,
+          "headroomDb": 5,
+          "maxGainDb": 6,
+          "initialGainDb": 0,
+          "maxGainChangeDbPerSecond": 3,
+          "maxOutputNoiseLevelDbfs": -55
+        },
+        "vadGate": {
+          "enabled": true,
+          "threshold": 0.7,
+          "confirmationMs": 40,
+          "holdMs": 300,
+          "floorDb": -20,
+          "attackMs": 10,
+          "releaseMs": 150
+        },
+        "limiter": {
+          "ceilingDbfs": -1,
+          "releaseMs": 50
+        }
+      }
     },
     "endpoints": [
       {
@@ -366,7 +1026,9 @@
         "groupId": "virtual-render",
         "friendlyName": "Custom virtual input",
         "flow": "render",
-        "defaultRoles": ["multimedia"]
+        "defaultRoles": [
+          "multimedia"
+        ]
       },
       {
         "platform": "windows",
@@ -400,7 +1062,44 @@
           "renderName": "Custom virtual input",
           "captureName": "Custom virtual output"
         }
-      ]
+      ],
+      "captureChannel": null,
+      "knownVbCablePair": null,
+      "degradedOutput": "silence",
+      "dsp": {
+        "aec": {
+          "enabled": true,
+          "preset": "natural",
+          "highPassFilterEnabled": true
+        },
+        "rnnoise": {
+          "enabled": true,
+          "mix": 1
+        },
+        "agc2": {
+          "enabled": false,
+          "adaptiveDigitalEnabled": true,
+          "fixedGainDb": 0,
+          "headroomDb": 5,
+          "maxGainDb": 6,
+          "initialGainDb": 0,
+          "maxGainChangeDbPerSecond": 3,
+          "maxOutputNoiseLevelDbfs": -55
+        },
+        "vadGate": {
+          "enabled": true,
+          "threshold": 0.7,
+          "confirmationMs": 40,
+          "holdMs": 300,
+          "floorDb": -20,
+          "attackMs": 10,
+          "releaseMs": 150
+        },
+        "limiter": {
+          "ceilingDbfs": -1,
+          "releaseMs": 50
+        }
+      }
     },
     "endpoints": [
       {
@@ -409,7 +1108,9 @@
         "groupId": "speakers",
         "friendlyName": "Physical speakers",
         "flow": "render",
-        "defaultRoles": ["multimedia"]
+        "defaultRoles": [
+          "multimedia"
+        ]
       },
       {
         "platform": "windows",
@@ -425,7 +1126,9 @@
         "groupId": "read-side",
         "friendlyName": "Custom virtual output",
         "flow": "capture",
-        "defaultRoles": ["multimedia"]
+        "defaultRoles": [
+          "multimedia"
+        ]
       },
       {
         "platform": "windows",
@@ -455,7 +1158,44 @@
           "renderName": "Custom virtual input",
           "captureName": "Custom virtual output"
         }
-      ]
+      ],
+      "captureChannel": null,
+      "knownVbCablePair": null,
+      "degradedOutput": "silence",
+      "dsp": {
+        "aec": {
+          "enabled": true,
+          "preset": "natural",
+          "highPassFilterEnabled": true
+        },
+        "rnnoise": {
+          "enabled": true,
+          "mix": 1
+        },
+        "agc2": {
+          "enabled": false,
+          "adaptiveDigitalEnabled": true,
+          "fixedGainDb": 0,
+          "headroomDb": 5,
+          "maxGainDb": 6,
+          "initialGainDb": 0,
+          "maxGainChangeDbPerSecond": 3,
+          "maxOutputNoiseLevelDbfs": -55
+        },
+        "vadGate": {
+          "enabled": true,
+          "threshold": 0.7,
+          "confirmationMs": 40,
+          "holdMs": 300,
+          "floorDb": -20,
+          "attackMs": 10,
+          "releaseMs": 150
+        },
+        "limiter": {
+          "ceilingDbfs": -1,
+          "releaseMs": 50
+        }
+      }
     },
     "endpoints": [
       {
@@ -478,6 +1218,342 @@
     "expected": {
       "type": "physicalCaptureRequired",
       "virtualCaptureEndpointId": "virtual-capture"
+    }
+  },
+  {
+    "name": "a known VB-CABLE render ID reused by speakers is blocked",
+    "why": "A remembered ID is not sufficient when the endpoint is present under a non-standard physical-device identity, even with AEC disabled.",
+    "settings": {
+      "followDefaultRender": true,
+      "renderEndpointId": null,
+      "captureEndpointId": "microphone",
+      "outputEndpointId": "cable-input",
+      "virtualDeviceMode": "vbCable",
+      "virtualCaptureEndpointId": "cable-output",
+      "trustedVirtualAudioPairs": [],
+      "knownVbCablePair": {
+        "renderEndpointId": "cable-input",
+        "captureEndpointId": "cable-output"
+      },
+      "captureChannel": null,
+      "degradedOutput": "silence",
+      "dsp": {
+        "aec": {
+          "enabled": false,
+          "preset": "natural",
+          "highPassFilterEnabled": true
+        },
+        "rnnoise": {
+          "enabled": true,
+          "mix": 1
+        },
+        "agc2": {
+          "enabled": false,
+          "adaptiveDigitalEnabled": true,
+          "fixedGainDb": 0,
+          "headroomDb": 5,
+          "maxGainDb": 6,
+          "initialGainDb": 0,
+          "maxGainChangeDbPerSecond": 3,
+          "maxOutputNoiseLevelDbfs": -55
+        },
+        "vadGate": {
+          "enabled": true,
+          "threshold": 0.7,
+          "confirmationMs": 40,
+          "holdMs": 300,
+          "floorDb": -20,
+          "attackMs": 10,
+          "releaseMs": 150
+        },
+        "limiter": {
+          "ceilingDbfs": -1,
+          "releaseMs": 50
+        }
+      }
+    },
+    "endpoints": [
+      {
+        "platform": "windows",
+        "id": "cable-input",
+        "groupId": "physical-speakers",
+        "friendlyName": "Speakers",
+        "flow": "render",
+        "defaultRoles": [
+          "multimedia"
+        ]
+      }
+    ],
+    "expected": {
+      "type": "virtualDeviceRequired",
+      "reason": "vbCableUnavailable"
+    }
+  },
+  {
+    "name": "a known VB-CABLE capture ID reused by a physical microphone is blocked",
+    "why": "A capture endpoint that reuses a remembered cable ID but no longer has the standard VB-CABLE identity must not inherit trust.",
+    "settings": {
+      "followDefaultRender": true,
+      "renderEndpointId": null,
+      "captureEndpointId": "microphone",
+      "outputEndpointId": "cable-input",
+      "virtualDeviceMode": "vbCable",
+      "virtualCaptureEndpointId": "cable-output",
+      "trustedVirtualAudioPairs": [],
+      "knownVbCablePair": {
+        "renderEndpointId": "cable-input",
+        "captureEndpointId": "cable-output"
+      },
+      "captureChannel": null,
+      "degradedOutput": "silence",
+      "dsp": {
+        "aec": {
+          "enabled": true,
+          "preset": "natural",
+          "highPassFilterEnabled": true
+        },
+        "rnnoise": {
+          "enabled": true,
+          "mix": 1
+        },
+        "agc2": {
+          "enabled": false,
+          "adaptiveDigitalEnabled": true,
+          "fixedGainDb": 0,
+          "headroomDb": 5,
+          "maxGainDb": 6,
+          "initialGainDb": 0,
+          "maxGainChangeDbPerSecond": 3,
+          "maxOutputNoiseLevelDbfs": -55
+        },
+        "vadGate": {
+          "enabled": true,
+          "threshold": 0.7,
+          "confirmationMs": 40,
+          "holdMs": 300,
+          "floorDb": -20,
+          "attackMs": 10,
+          "releaseMs": 150
+        },
+        "limiter": {
+          "ceilingDbfs": -1,
+          "releaseMs": 50
+        }
+      }
+    },
+    "endpoints": [
+      {
+        "platform": "windows",
+        "id": "cable-output",
+        "groupId": "physical-microphone",
+        "friendlyName": "USB Microphone",
+        "flow": "capture",
+        "defaultRoles": [
+          "multimedia"
+        ]
+      }
+    ],
+    "expected": {
+      "type": "virtualDeviceRequired",
+      "reason": "vbCableUnavailable"
+    }
+  },
+  {
+    "name": "a trusted custom render ID reused by a physical output is unconfirmed",
+    "why": "A saved custom endpoint ID is not sufficient when the current render identity no longer matches the user-confirmed virtual pair.",
+    "settings": {
+      "followDefaultRender": true,
+      "renderEndpointId": null,
+      "captureEndpointId": "microphone",
+      "outputEndpointId": "virtual-render",
+      "virtualDeviceMode": "custom",
+      "virtualCaptureEndpointId": "virtual-capture",
+      "trustedVirtualAudioPairs": [
+        {
+          "renderEndpointId": "virtual-render",
+          "captureEndpointId": "virtual-capture",
+          "renderName": "Custom virtual input",
+          "captureName": "Custom virtual output"
+        }
+      ],
+      "captureChannel": null,
+      "knownVbCablePair": null,
+      "degradedOutput": "silence",
+      "dsp": {
+        "aec": {
+          "enabled": true,
+          "preset": "natural",
+          "highPassFilterEnabled": true
+        },
+        "rnnoise": {
+          "enabled": true,
+          "mix": 1
+        },
+        "agc2": {
+          "enabled": false,
+          "adaptiveDigitalEnabled": true,
+          "fixedGainDb": 0,
+          "headroomDb": 5,
+          "maxGainDb": 6,
+          "initialGainDb": 0,
+          "maxGainChangeDbPerSecond": 3,
+          "maxOutputNoiseLevelDbfs": -55
+        },
+        "vadGate": {
+          "enabled": true,
+          "threshold": 0.7,
+          "confirmationMs": 40,
+          "holdMs": 300,
+          "floorDb": -20,
+          "attackMs": 10,
+          "releaseMs": 150
+        },
+        "limiter": {
+          "ceilingDbfs": -1,
+          "releaseMs": 50
+        }
+      }
+    },
+    "endpoints": [
+      {
+        "platform": "windows",
+        "id": "speakers",
+        "groupId": "speakers",
+        "friendlyName": "Physical speakers",
+        "flow": "render",
+        "defaultRoles": [
+          "multimedia"
+        ]
+      },
+      {
+        "platform": "windows",
+        "id": "virtual-render",
+        "groupId": "reused-physical-output",
+        "friendlyName": "HDMI Speakers",
+        "flow": "render",
+        "defaultRoles": []
+      },
+      {
+        "platform": "windows",
+        "id": "virtual-capture",
+        "groupId": "read-side",
+        "friendlyName": "Custom virtual output",
+        "flow": "capture",
+        "defaultRoles": [
+          "multimedia"
+        ]
+      },
+      {
+        "platform": "windows",
+        "id": "microphone",
+        "groupId": "microphone",
+        "friendlyName": "Physical microphone",
+        "flow": "capture",
+        "defaultRoles": []
+      }
+    ],
+    "expected": {
+      "type": "virtualDeviceRequired",
+      "reason": "customPairUnconfirmed"
+    }
+  },
+  {
+    "name": "a trusted custom capture ID reused under a different identity is unconfirmed",
+    "why": "Both ends of a confirmed custom pair must retain the friendly identities the user approved.",
+    "settings": {
+      "followDefaultRender": true,
+      "renderEndpointId": null,
+      "captureEndpointId": "microphone",
+      "outputEndpointId": "virtual-render",
+      "virtualDeviceMode": "custom",
+      "virtualCaptureEndpointId": "virtual-capture",
+      "trustedVirtualAudioPairs": [
+        {
+          "renderEndpointId": "virtual-render",
+          "captureEndpointId": "virtual-capture",
+          "renderName": "Custom virtual input",
+          "captureName": "Custom virtual output"
+        }
+      ],
+      "captureChannel": null,
+      "knownVbCablePair": null,
+      "degradedOutput": "silence",
+      "dsp": {
+        "aec": {
+          "enabled": true,
+          "preset": "natural",
+          "highPassFilterEnabled": true
+        },
+        "rnnoise": {
+          "enabled": true,
+          "mix": 1
+        },
+        "agc2": {
+          "enabled": false,
+          "adaptiveDigitalEnabled": true,
+          "fixedGainDb": 0,
+          "headroomDb": 5,
+          "maxGainDb": 6,
+          "initialGainDb": 0,
+          "maxGainChangeDbPerSecond": 3,
+          "maxOutputNoiseLevelDbfs": -55
+        },
+        "vadGate": {
+          "enabled": true,
+          "threshold": 0.7,
+          "confirmationMs": 40,
+          "holdMs": 300,
+          "floorDb": -20,
+          "attackMs": 10,
+          "releaseMs": 150
+        },
+        "limiter": {
+          "ceilingDbfs": -1,
+          "releaseMs": 50
+        }
+      }
+    },
+    "endpoints": [
+      {
+        "platform": "windows",
+        "id": "speakers",
+        "groupId": "speakers",
+        "friendlyName": "Physical speakers",
+        "flow": "render",
+        "defaultRoles": [
+          "multimedia"
+        ]
+      },
+      {
+        "platform": "windows",
+        "id": "virtual-render",
+        "groupId": "write-side",
+        "friendlyName": "Custom virtual input",
+        "flow": "render",
+        "defaultRoles": []
+      },
+      {
+        "platform": "windows",
+        "id": "virtual-capture",
+        "groupId": "reused-physical-capture",
+        "friendlyName": "USB Microphone",
+        "flow": "capture",
+        "defaultRoles": [
+          "multimedia"
+        ]
+      },
+      {
+        "platform": "windows",
+        "id": "microphone",
+        "groupId": "microphone",
+        "friendlyName": "Physical microphone",
+        "flow": "capture",
+        "defaultRoles": []
+      }
+    ],
+    "expected": {
+      "type": "virtualDeviceRequired",
+      "reason": "customPairUnconfirmed"
     }
   }
 ]

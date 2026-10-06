@@ -29,7 +29,8 @@ use windows::{
 use xmic_platform_api::{DataFlow, EndpointDescriptor, PlatformError};
 
 use super::{
-    device_group_id, device_id, friendly_name, operation_error, AudioFormatDescriptor, ComApartment,
+    container_group_id, device_id, friendly_name, operation_error, AudioFormatDescriptor,
+    ComApartment,
 };
 
 const MAX_CAPTURE_DURATION: Duration = Duration::from_secs(120);
@@ -180,7 +181,7 @@ fn prepare_capture(
     let endpoint = EndpointDescriptor {
         platform: "windows".to_owned(),
         id: device_id(&device)?,
-        group_id: device_group_id(&device).ok(),
+        group_id: container_group_id(&device),
         friendly_name: friendly_name(&device)?,
         flow,
         default_roles: Vec::new(),

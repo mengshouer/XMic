@@ -25,7 +25,7 @@ use xmic_platform_api::{DataFlow, EndpointDescriptor, PlatformError};
 
 use crate::{
     capture::{select_endpoint, EventHandle, MmcssRegistration},
-    device_group_id, device_id, friendly_name, join_worker_with_timeout, operation_error,
+    container_group_id, device_id, friendly_name, join_audio_worker, operation_error,
     smoothed_sample, ComApartment, WORKER_START_TIMEOUT,
 };
 
@@ -142,24 +142,24 @@ impl OutputSinkStream {
 
     pub fn stop(mut self) -> Result<(), PlatformError> {
         self.request_stop();
-        self.join_worker()
+        self.join_audio_worker()
     }
 
     fn request_stop(&self) {
         self.stop.store(true, Ordering::Release);
     }
 
-    fn join_worker(&mut self) -> Result<(), PlatformError> {
-        self.worker.take().map_or(Ok(()), |worker| {
-            join_worker_with_timeout(worker, "WASAPI output worker")?
-        })
+    fn join_audio_worker(&mut self) -> Result<(), PlatformError> {
+        self.worker
+            .take()
+            .map_or(Ok(()), |worker| join_audio_worker(worker)?)
     }
 }
 
 impl Drop for OutputSinkStream {
     fn drop(&mut self) {
         self.request_stop();
-        let _ = self.join_worker();
+        let _ = self.join_audio_worker();
     }
 }
 
@@ -190,19 +190,19 @@ pub fn start_output_sink(request: OutputSinkRequest) -> Result<OutputSinkStream,
         Ok(Ok(info)) => info,
         Ok(Err(error)) => {
             stop.store(true, Ordering::Release);
-            drop(worker);
+            let _ = worker.join();
             return Err(PlatformError::Operation(error));
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {
             stop.store(true, Ordering::Release);
-            drop(worker);
+            let _ = worker.join();
             return Err(PlatformError::Operation(
                 "WASAPI output preparation timed out after 5 seconds".to_owned(),
             ));
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             stop.store(true, Ordering::Release);
-            drop(worker);
+            let _ = worker.join();
             return Err(PlatformError::WorkerStopped);
         }
     };
@@ -342,7 +342,7 @@ fn prepare_output(
     let endpoint = EndpointDescriptor {
         platform: "windows".to_owned(),
         id: device_id(&device)?,
-        group_id: device_group_id(&device).ok(),
+        group_id: container_group_id(&device),
         friendly_name: friendly_name(&device)?,
         flow: DataFlow::Render,
         default_roles: Vec::new(),

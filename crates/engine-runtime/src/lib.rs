@@ -2,6 +2,4 @@
 
 mod processor;
 
-pub use processor::{
-    processing_latency_frames, AlignedRawPath, DspFrameMetrics, DspProcessor, DspProcessorError,
-};
+pub use processor::{processing_latency_frames, DspFrameMetrics, DspProcessor, DspProcessorError};

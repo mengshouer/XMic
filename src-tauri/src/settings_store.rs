@@ -1,107 +1,111 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{fs, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 use xmic_engine_protocol::EngineSettings;
 
-/// Bumped whenever a stored file needs a one-shot rewrite. The version lives in the file but not in
-/// `EngineSettings`, so it never crosses the IPC or Tauri boundary.
-/// - 1: rewrote the superseded VAD gate defaults and repaired a pass-through AGC2.
-/// - 2: renamed `failurePolicy` to `unprocessedOutput`; `serde` aliases read the old key, and the
-///   rewrite is what makes the file stop carrying it.
-const SETTINGS_SCHEMA_VERSION: u16 = 2;
+/// This schema is intentionally a clean break. Files from earlier schemas are never guessed at or
+/// migrated; invalid files are rewritten to defaults with a reset latch that only explicit Apply clears.
+const SETTINGS_SCHEMA_VERSION: u16 = 3;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct StoredSettings {
-    #[serde(default)]
     schema_version: u16,
-    #[serde(flatten)]
     settings: EngineSettings,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-struct LegacyAudioRoute {
-    follow_default_render: bool,
-    render_endpoint_id: Option<String>,
-    capture_endpoint_id: Option<String>,
-    capture_channel: Option<usize>,
-    output_endpoint_id: Option<String>,
-}
-
-impl Default for LegacyAudioRoute {
-    fn default() -> Self {
-        Self {
-            follow_default_render: true,
-            render_endpoint_id: None,
-            capture_endpoint_id: None,
-            capture_channel: None,
-            output_endpoint_id: None,
-        }
-    }
-}
-
-impl LegacyAudioRoute {
-    fn apply_to(self, settings: &mut EngineSettings) {
-        settings.follow_default_render = self.follow_default_render;
-        settings.render_endpoint_id = self.render_endpoint_id;
-        settings.capture_endpoint_id = self.capture_endpoint_id;
-        settings.capture_channel = self.capture_channel;
-        settings.output_endpoint_id = self.output_endpoint_id;
-    }
+#[derive(Debug, Clone)]
+pub struct SettingsLoad {
+    pub settings: EngineSettings,
+    /// Present when an existing file was invalid and defaults remain pending explicit Apply.
+    pub reset_reason: Option<String>,
 }
 
 pub struct SettingsStore {
     path: PathBuf,
-    legacy_route_path: PathBuf,
 }
 
 impl SettingsStore {
-    pub fn new(path: PathBuf, legacy_route_path: PathBuf) -> Self {
-        Self {
-            path,
-            legacy_route_path,
-        }
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
     }
 
-    pub fn load(&self) -> EngineSettings {
-        if let Some(stored) = load_valid_settings(&self.path) {
-            return self.migrate(stored);
+    pub fn load(&self) -> SettingsLoad {
+        if !self.path.exists() {
+            return SettingsLoad {
+                settings: EngineSettings::default(),
+                reset_reason: self.read_reset_reason(),
+            };
         }
-        let mut settings = EngineSettings::default();
-        let Ok(contents) = fs::read_to_string(&self.legacy_route_path) else {
-            return settings;
-        };
-        let Ok(route) = serde_json::from_str::<LegacyAudioRoute>(&contents) else {
-            return settings;
-        };
-        route.apply_to(&mut settings);
-        if settings.validate().is_ok() {
-            settings
-        } else {
-            EngineSettings::default()
-        }
-    }
 
-    /// Applies the steps the stored version is missing and records the new one, so a value the user
-    /// later tunes back to an old default is never rewritten again.
-    fn migrate(&self, mut stored: StoredSettings) -> EngineSettings {
-        if stored.schema_version >= SETTINGS_SCHEMA_VERSION {
-            return stored.settings;
+        let loaded = fs::read_to_string(&self.path)
+            .map_err(|error| format!("read settings: {error}"))
+            .and_then(|contents| {
+                serde_json::from_str::<StoredSettings>(&contents)
+                    .map_err(|error| format!("parse settings: {error}"))
+            })
+            .and_then(|stored| {
+                if stored.schema_version != SETTINGS_SCHEMA_VERSION {
+                    return Err(format!(
+                        "settings schema {} is not supported by schema {}",
+                        stored.schema_version, SETTINGS_SCHEMA_VERSION
+                    ));
+                }
+                stored
+                    .settings
+                    .validate()
+                    .map_err(|error| format!("validate settings: {error}"))?;
+                Ok(stored.settings)
+            });
+
+        match loaded {
+            Ok(settings) => {
+                let reset_reason = self.read_reset_reason();
+                SettingsLoad {
+                    settings: if reset_reason.is_some() {
+                        EngineSettings::default()
+                    } else {
+                        settings
+                    },
+                    reset_reason,
+                }
+            }
+            Err(error) => {
+                let settings = EngineSettings::default();
+                let reason = format!("{error}; using accepted defaults until Apply");
+                // Replace the invalid file with the current defaults, but persist a sidecar latch so
+                // a helper restart cannot mistake those defaults for an acknowledged Apply. Only a
+                // successful `save()` removes the latch.
+                let marker_result = self.write_reset_marker(&reason);
+                if marker_result.is_ok() {
+                    let _ = self.write_settings_file(&settings);
+                }
+                SettingsLoad {
+                    settings,
+                    reset_reason: Some(match marker_result {
+                        Ok(()) => reason,
+                        Err(marker_error) => {
+                            format!("{reason}; could not persist reset latch: {marker_error}")
+                        }
+                    }),
+                }
+            }
         }
-        if stored.schema_version < 1 {
-            stored.settings.dsp.migrate_legacy_defaults();
-        }
-        if stored.settings.validate().is_ok() {
-            let _ = self.save(&stored.settings);
-        }
-        stored.settings
     }
 
     pub fn save(&self, settings: &EngineSettings) -> Result<(), String> {
+        settings.validate().map_err(|error| error.to_string())?;
+        self.write_settings_file(settings)?;
+        let marker = self.reset_marker_path();
+        if marker.exists() {
+            fs::remove_file(&marker).map_err(|error| {
+                format!("clear settings reset latch {}: {error}", marker.display())
+            })?;
+        }
+        Ok(())
+    }
+
+    fn write_settings_file(&self, settings: &EngineSettings) -> Result<(), String> {
         let parent = self
             .path
             .parent()
@@ -117,195 +121,242 @@ impl SettingsStore {
         fs::write(&self.path, contents)
             .map_err(|error| format!("write settings {}: {error}", self.path.display()))
     }
-}
 
-fn load_valid_settings(path: &Path) -> Option<StoredSettings> {
-    let contents = fs::read_to_string(path).ok()?;
-    let stored = serde_json::from_str::<StoredSettings>(&contents).ok()?;
-    stored.settings.validate().ok()?;
-    Some(stored)
+    fn reset_marker_path(&self) -> PathBuf {
+        let mut marker = self.path.as_os_str().to_os_string();
+        marker.push(".reset");
+        PathBuf::from(marker)
+    }
+
+    fn read_reset_reason(&self) -> Option<String> {
+        match fs::read_to_string(self.reset_marker_path()) {
+            Ok(reason) => {
+                let reason = reason.trim();
+                Some(if reason.contains("until Apply") {
+                    reason.to_owned()
+                } else {
+                    format!("{reason}; using accepted defaults until Apply")
+                })
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => Some(format!(
+                "settings reset latch could not be read ({error}); using accepted defaults until Apply"
+            )),
+        }
+    }
+
+    fn write_reset_marker(&self, reason: &str) -> Result<(), String> {
+        let marker = self.reset_marker_path();
+        let parent = marker
+            .parent()
+            .map(PathBuf::from)
+            .ok_or_else(|| "settings reset marker has no parent directory".to_owned())?;
+        fs::create_dir_all(&parent).map_err(|error| {
+            format!(
+                "create settings reset marker directory {}: {error}",
+                parent.display()
+            )
+        })?;
+        fs::write(&marker, reason)
+            .map_err(|error| format!("write settings reset marker {}: {error}", marker.display()))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xmic_engine_protocol::{
-        AecPreset, TrustedVirtualAudioPair, UnprocessedOutput, VirtualDeviceMode,
-        LEGACY_VAD_CONFIRMATION_MS, LEGACY_VAD_FLOOR_DB,
-    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use xmic_engine_protocol::DegradedOutput;
+
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
     fn temporary_store(name: &str) -> (PathBuf, SettingsStore) {
-        let directory =
-            std::env::temp_dir().join(format!("xmic-settings-{}-{name}", std::process::id()));
+        let directory = std::env::temp_dir().join(format!(
+            "xmic-settings-{}-{name}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
         let path = directory.join("settings.json");
-        let legacy = directory.join("audio-route.json");
-        (directory, SettingsStore::new(path, legacy))
+        (directory, SettingsStore::new(path))
     }
 
     #[test]
-    fn stored_settings_round_trip_with_the_schema_version() {
-        let mut settings = EngineSettings::default();
-        settings.dsp.vad_gate.threshold = 0.85;
-        let stored = StoredSettings {
-            schema_version: SETTINGS_SCHEMA_VERSION,
-            settings: settings.clone(),
-        };
-
-        let encoded = serde_json::to_string(&stored).unwrap();
-        let decoded: StoredSettings = serde_json::from_str(&encoded).unwrap();
-
-        assert!(encoded.contains("\"schemaVersion\""));
-        assert_eq!(decoded.schema_version, SETTINGS_SCHEMA_VERSION);
-        assert_eq!(decoded.settings, settings);
-    }
-
-    #[test]
-    fn versionless_settings_migrate_once_and_keep_every_other_field() {
-        let (directory, store) = temporary_store("migrate");
-        let mut legacy_defaults = EngineSettings {
-            follow_default_render: true,
-            capture_endpoint_id: Some("physical-capture".to_owned()),
-            capture_channel: Some(2),
-            output_endpoint_id: Some("cable-input".to_owned()),
-            virtual_device_mode: Some(VirtualDeviceMode::VbCable),
-            virtual_capture_endpoint_id: Some("cable-output".to_owned()),
-            trusted_virtual_audio_pairs: vec![TrustedVirtualAudioPair {
-                render_endpoint_id: "custom-render".to_owned(),
-                capture_endpoint_id: "custom-capture".to_owned(),
-                render_name: "Custom render".to_owned(),
-                capture_name: "Custom capture".to_owned(),
-            }],
-            unprocessed_output: UnprocessedOutput::Silence,
+    fn current_settings_round_trip() {
+        let (directory, store) = temporary_store("round-trip");
+        let settings = EngineSettings {
+            capture_channel: Some(3),
+            degraded_output: DegradedOutput::Raw,
             ..EngineSettings::default()
         };
-        legacy_defaults.dsp.vad_gate.confirmation_ms = LEGACY_VAD_CONFIRMATION_MS;
-        legacy_defaults.dsp.vad_gate.floor_db = LEGACY_VAD_FLOOR_DB;
-        legacy_defaults.dsp.agc2.adaptive_digital_enabled = false;
+
+        store.save(&settings).unwrap();
+        let loaded = store.load();
+
+        assert_eq!(loaded.settings, settings);
+        assert_eq!(loaded.reset_reason, None);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn old_schema_is_reset_and_the_reset_is_visible() {
+        let (directory, store) = temporary_store("old-schema");
         fs::create_dir_all(&directory).unwrap();
         fs::write(
             &store.path,
-            serde_json::to_string_pretty(&legacy_defaults).unwrap(),
+            serde_json::to_string_pretty(&StoredSettings {
+                schema_version: 2,
+                settings: EngineSettings::default(),
+            })
+            .unwrap(),
         )
         .unwrap();
 
-        let migrated = store.load();
+        let loaded = store.load();
 
-        assert_eq!(
-            migrated.dsp.vad_gate.confirmation_ms,
-            EngineSettings::default().dsp.vad_gate.confirmation_ms
-        );
-        assert_eq!(migrated.dsp.vad_gate.floor_db, -20.0);
-        assert!(migrated.dsp.agc2.adaptive_digital_enabled);
-        // The schema version envelope must not cost any routing field on the way through.
-        assert_eq!(
-            migrated.capture_endpoint_id.as_deref(),
-            Some("physical-capture")
-        );
-        assert_eq!(migrated.capture_channel, Some(2));
-        assert_eq!(migrated.output_endpoint_id.as_deref(), Some("cable-input"));
-        assert_eq!(
-            migrated.virtual_device_mode,
-            Some(VirtualDeviceMode::VbCable)
-        );
-        assert_eq!(
-            migrated.virtual_capture_endpoint_id.as_deref(),
-            Some("cable-output")
-        );
-        assert_eq!(
-            migrated.trusted_virtual_audio_pairs,
-            legacy_defaults.trusted_virtual_audio_pairs
-        );
-
-        // A value tuned back to an old default must survive because the version is now recorded.
-        let mut retuned = migrated.clone();
-        retuned.dsp.vad_gate.confirmation_ms = LEGACY_VAD_CONFIRMATION_MS;
-        store.save(&retuned).unwrap();
-
-        assert_eq!(
-            store.load().dsp.vad_gate.confirmation_ms,
-            LEGACY_VAD_CONFIRMATION_MS
-        );
+        assert_eq!(loaded.settings, EngineSettings::default());
+        assert!(loaded
+            .reset_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("not supported")));
+        let rewritten = fs::read_to_string(&store.path).unwrap();
+        assert!(rewritten.contains("\"schemaVersion\": 3"));
+        assert!(store.reset_marker_path().is_file());
+        let again = store.load();
+        assert!(again.reset_reason.is_some());
         let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
-    fn full_settings_round_trip_through_json() {
-        let mut settings = EngineSettings {
-            capture_channel: Some(3),
-            unprocessed_output: UnprocessedOutput::RawMicrophone,
-            ..EngineSettings::default()
-        };
-        settings.dsp.aec.preset = AecPreset::Strong;
-        settings.dsp.vad_gate.threshold = 0.85;
+    fn reset_latch_keeps_defaults_pending_across_a_valid_file_reload() {
+        let (directory, store) = temporary_store("reset-latch");
+        fs::create_dir_all(&directory).unwrap();
+        store.save(&EngineSettings::default()).unwrap();
+        fs::write(store.reset_marker_path(), "manual reset").unwrap();
 
-        let encoded = serde_json::to_string(&settings).unwrap();
-        let decoded: EngineSettings = serde_json::from_str(&encoded).unwrap();
+        let loaded = store.load();
 
-        assert_eq!(decoded, settings);
+        assert_eq!(loaded.settings, EngineSettings::default());
+        assert!(loaded.reset_reason.is_some());
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
-    fn legacy_route_only_replaces_routing_fields() {
-        let mut settings = EngineSettings::default();
-        settings.dsp.aec.preset = AecPreset::Strong;
-        let route = LegacyAudioRoute {
-            follow_default_render: false,
-            render_endpoint_id: Some("render-id".to_owned()),
-            capture_endpoint_id: Some("capture-id".to_owned()),
-            capture_channel: Some(1),
-            output_endpoint_id: Some("output-id".to_owned()),
-        };
+    fn missing_settings_file_does_not_clear_an_existing_reset_latch() {
+        let (directory, store) = temporary_store("missing-with-reset-latch");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(store.reset_marker_path(), "invalid settings were reset").unwrap();
 
-        route.apply_to(&mut settings);
+        let loaded = store.load();
 
-        assert_eq!(settings.dsp.aec.preset, AecPreset::Strong);
-        assert_eq!(settings.unprocessed_output, UnprocessedOutput::Silence);
-        assert_eq!(settings.capture_channel, Some(1));
-        assert_eq!(settings.render_endpoint_id.as_deref(), Some("render-id"));
+        assert_eq!(loaded.settings, EngineSettings::default());
+        assert!(loaded.reset_reason.is_some());
+        assert!(store.reset_marker_path().is_file());
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
-    fn a_schema_one_file_converges_to_the_new_key_without_retuning_dsp_values() {
-        let (directory, store) = temporary_store("rename");
-        let mut settings = EngineSettings {
-            unprocessed_output: UnprocessedOutput::RawMicrophone,
-            ..EngineSettings::default()
-        };
-        // A value the user deliberately tuned back to a superseded default: schema 1 already ran the
-        // DSP migration, so bumping to 2 must not touch it again.
-        settings.dsp.vad_gate.confirmation_ms = LEGACY_VAD_CONFIRMATION_MS;
-        let stored = serde_json::to_value(StoredSettings {
-            schema_version: 1,
-            settings,
+    fn applying_settings_acknowledges_and_clears_a_reset() {
+        let (directory, store) = temporary_store("reset-ack");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(&store.path, r#"{"schemaVersion":2}"#).unwrap();
+
+        assert!(store.load().reset_reason.is_some());
+        store.save(&EngineSettings::default()).unwrap();
+        assert_eq!(store.load().reset_reason, None);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn old_aliases_are_reset_instead_of_migrated() {
+        let (directory, store) = temporary_store("aliases");
+        fs::create_dir_all(&directory).unwrap();
+        let mut value = serde_json::to_value(StoredSettings {
+            schema_version: SETTINGS_SCHEMA_VERSION,
+            settings: EngineSettings::default(),
         })
         .unwrap();
-        let mut object = stored.as_object().unwrap().clone();
-        object.remove("unprocessedOutput");
-        object.insert("failurePolicy".to_owned(), "rawPassthrough".into());
-        fs::create_dir_all(&directory).unwrap();
-        fs::write(&store.path, serde_json::to_string_pretty(&object).unwrap()).unwrap();
+        value["settings"]["failurePolicy"] = "mute".into();
+        fs::write(&store.path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
 
-        let migrated = store.load();
+        let loaded = store.load();
 
-        assert_eq!(
-            migrated.unprocessed_output,
-            UnprocessedOutput::RawMicrophone
-        );
-        assert_eq!(
-            migrated.dsp.vad_gate.confirmation_ms,
-            LEGACY_VAD_CONFIRMATION_MS
-        );
-        let rewritten = fs::read_to_string(&store.path).unwrap();
-        assert!(rewritten.contains("\"unprocessedOutput\": \"rawMicrophone\""));
-        assert!(!rewritten.contains("failurePolicy"));
-        assert!(rewritten.contains("\"schemaVersion\": 2"));
+        assert_eq!(loaded.settings, EngineSettings::default());
+        assert!(loaded.reset_reason.is_some());
         let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
-    fn missing_legacy_fields_use_route_defaults() {
-        let route: LegacyAudioRoute = serde_json::from_str("{}").unwrap();
+    fn missing_current_schema_field_exposes_a_reset_and_uses_defaults() {
+        let (directory, store) = temporary_store("missing-field");
+        fs::create_dir_all(&directory).unwrap();
+        let mut value = serde_json::to_value(StoredSettings {
+            schema_version: SETTINGS_SCHEMA_VERSION,
+            settings: EngineSettings::default(),
+        })
+        .unwrap();
+        value["settings"]["dsp"]["vadGate"]
+            .as_object_mut()
+            .unwrap()
+            .remove("enabled");
+        fs::write(&store.path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
 
-        assert_eq!(route, LegacyAudioRoute::default());
+        let loaded = store.load();
+
+        assert_eq!(loaded.settings, EngineSettings::default());
+        assert!(loaded.reset_reason.is_some());
+        assert!(loaded.settings.dsp.vad_gate.enabled);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn missing_nullable_fields_reset_settings_until_apply() {
+        let defaults = serde_json::to_value(EngineSettings::default()).unwrap();
+        let settings = EngineSettings {
+            capture_endpoint_id: Some("selected-microphone".to_owned()),
+            degraded_output: DegradedOutput::Raw,
+            ..EngineSettings::default()
+        };
+        for (field, value) in defaults.as_object().unwrap() {
+            if !value.is_null() {
+                continue;
+            }
+            let (directory, store) = temporary_store(field);
+            store.save(&settings).unwrap();
+            let mut stored = serde_json::to_value(StoredSettings {
+                schema_version: SETTINGS_SCHEMA_VERSION,
+                settings: settings.clone(),
+            })
+            .unwrap();
+            stored["settings"].as_object_mut().unwrap().remove(field);
+            fs::write(&store.path, serde_json::to_string_pretty(&stored).unwrap()).unwrap();
+
+            let loaded = store.load();
+
+            assert_eq!(loaded.settings, EngineSettings::default());
+            assert!(loaded
+                .reset_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains(&format!("missing field `{field}`"))));
+            assert!(store.reset_marker_path().is_file());
+            let again = store.load();
+            assert_eq!(again.settings, EngineSettings::default());
+            assert_eq!(again.reset_reason, loaded.reset_reason);
+            store.save(&settings).unwrap();
+            let applied = store.load();
+            assert_eq!(applied.settings, settings);
+            assert_eq!(applied.reset_reason, None);
+            let _ = fs::remove_dir_all(directory);
+        }
+    }
+
+    #[test]
+    fn missing_file_uses_defaults_without_claiming_a_reset() {
+        let (directory, store) = temporary_store("missing");
+
+        let loaded = store.load();
+
+        assert_eq!(loaded.settings, EngineSettings::default());
+        assert_eq!(loaded.reset_reason, None);
+        let _ = fs::remove_dir_all(directory);
     }
 }

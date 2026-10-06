@@ -11,10 +11,7 @@ export type VirtualDeviceIssueReason =
   | "vbCableUnavailable"
   | "customPairIncomplete"
   | "customPairUnconfirmed";
-export type VirtualRouteConflictKind =
-  | "defaultRender"
-  | "fixedRender"
-  | "physicalCapture";
+export type VirtualRouteConflictKind = "defaultRender" | "fixedRender";
 
 export interface PhysicalCaptureRequiredIssue {
   type: "physicalCaptureRequired";
@@ -40,7 +37,7 @@ export type ConfigurationIssue =
 export interface EndpointDescriptor {
   platform: string;
   id: string;
-  groupId?: string | null;
+  groupId: string | null;
   friendlyName: string;
   flow: DataFlow;
   defaultRoles: DeviceRole[];
@@ -53,10 +50,15 @@ export interface TrustedVirtualAudioPair {
   captureName: string;
 }
 
+export interface KnownVbCablePair {
+  renderEndpointId: string;
+  captureEndpointId: string;
+}
+
 /**
  * The settings surface route validation actually reads — `EngineSettings` satisfies it structurally.
- * Keeping it narrow means the DSP settings do not have to live here, and it names exactly the fields
- * the shared fixture has to spell out.
+ * It names exactly the fields the shared fixture has to spell out; the optional AEC flag keeps the
+ * feedback-conflict rule aligned with runtime settings.
  */
 export interface RouteSettings {
   followDefaultRender: boolean;
@@ -66,6 +68,8 @@ export interface RouteSettings {
   virtualDeviceMode: VirtualDeviceMode | null;
   virtualCaptureEndpointId: string | null;
   trustedVirtualAudioPairs: TrustedVirtualAudioPair[];
+  knownVbCablePair: KnownVbCablePair | null;
+  dsp?: { aec: { enabled: boolean } };
 }
 
 export function getConfigurationIssue(
@@ -73,29 +77,20 @@ export function getConfigurationIssue(
   endpoints: EndpointDescriptor[],
 ): ConfigurationIssue | null {
   if (settings.virtualDeviceMode === "custom") {
-    if (!settings.captureEndpointId) {
-      return {
-        type: "physicalCaptureRequired",
-        virtualCaptureEndpointId: settings.virtualCaptureEndpointId,
-      };
-    }
     if (!settings.outputEndpointId || !settings.virtualCaptureEndpointId) {
       return {
         type: "virtualDeviceRequired",
         reason: "customPairIncomplete",
       };
     }
-    if (!activeCustomPairIsTrusted(settings)) {
+    const trustedPair = activeCustomPair(settings);
+    if (!trustedPair) {
       return {
         type: "virtualDeviceRequired",
         reason: "customPairUnconfirmed",
       };
     }
-    const physical = findEndpoint(
-      endpoints,
-      "capture",
-      settings.captureEndpointId,
-    );
+    const physical = selectedPhysicalCapture(settings, endpoints);
     const virtualRender = findEndpoint(
       endpoints,
       "render",
@@ -107,8 +102,21 @@ export function getConfigurationIssue(
       settings.virtualCaptureEndpointId,
     );
     if (
+      (virtualRender &&
+        !trustedNameMatches(trustedPair.renderName, virtualRender.friendlyName)) ||
+      (virtualCapture &&
+        !trustedNameMatches(trustedPair.captureName, virtualCapture.friendlyName))
+    ) {
+      return {
+        type: "virtualDeviceRequired",
+        reason: "customPairUnconfirmed",
+      };
+    }
+    if (
       physical &&
-      (sameEndpoint(physical, virtualRender) ||
+      (isStandardVbCableCapture(physical) ||
+        trustedVirtualCaptureNameMatches(settings, physical) ||
+        sameEndpoint(physical, virtualRender) ||
         sameEndpoint(physical, virtualCapture))
     ) {
       return {
@@ -123,18 +131,28 @@ export function getConfigurationIssue(
 
   const pair = findStandardVbCablePair(endpoints);
   if (!pair) {
+    // Only a pair previously recognised from standard VB-CABLE endpoint names may be temporarily
+    // absent. Arbitrary IDs remain a configuration block.
+    if (knownVbCablePairIsOffline(settings)) {
+      return knownOfflineVbCableSafetyIssue(settings, endpoints);
+    }
     return {
       type: "virtualDeviceRequired",
       reason: "vbCableUnavailable",
     };
   }
-  const capture = settings.captureEndpointId
-    ? findEndpoint(endpoints, "capture", settings.captureEndpointId)
-    : endpoints.find(
-        (endpoint) =>
-          endpoint.flow === "capture" &&
-          endpoint.defaultRoles.includes("multimedia"),
-      );
+  if (
+    (settings.virtualDeviceMode === "vbCable" ||
+      settings.outputEndpointId ||
+      settings.virtualCaptureEndpointId) &&
+    !configuredVbCablePairMatches(settings, pair)
+  ) {
+    return {
+      type: "virtualDeviceRequired",
+      reason: "vbCableUnavailable",
+    };
+  }
+  const capture = selectedPhysicalCapture(settings, endpoints);
   if (
     capture &&
     (sameEndpoint(capture, pair.capture) ||
@@ -149,11 +167,98 @@ export function getConfigurationIssue(
   return getVirtualRouteConflict(settings, endpoints, pair.render);
 }
 
+function configuredVbCablePairMatches(
+  settings: RouteSettings,
+  pair: { render: EndpointDescriptor; capture: EndpointDescriptor },
+) {
+  return (
+    settings.outputEndpointId === pair.render.id &&
+    settings.virtualCaptureEndpointId === pair.capture.id
+  );
+}
+
+function knownVbCablePairIsOffline(settings: RouteSettings) {
+  const known = settings.knownVbCablePair;
+  return Boolean(
+    known &&
+      settings.virtualDeviceMode === "vbCable" &&
+      settings.outputEndpointId === known.renderEndpointId &&
+      settings.virtualCaptureEndpointId === known.captureEndpointId,
+  );
+}
+
+function selectedPhysicalCapture(
+  settings: RouteSettings,
+  endpoints: EndpointDescriptor[],
+) {
+  return settings.captureEndpointId
+    ? findEndpoint(endpoints, "capture", settings.captureEndpointId)
+    : endpoints.find(
+        (endpoint) =>
+          endpoint.flow === "capture" &&
+          endpoint.defaultRoles.includes("multimedia"),
+      );
+}
+
+function knownOfflineVbCableSafetyIssue(
+  settings: RouteSettings,
+  endpoints: EndpointDescriptor[],
+): ConfigurationIssue | null {
+  if (knownVbCableIdentityWasReused(settings, endpoints)) {
+    return {
+      type: "virtualDeviceRequired",
+      reason: "vbCableUnavailable",
+    };
+  }
+  const physical = selectedPhysicalCapture(settings, endpoints);
+  const virtualRender = settings.outputEndpointId
+    ? findEndpoint(endpoints, "render", settings.outputEndpointId)
+    : undefined;
+  const virtualCapture = settings.virtualCaptureEndpointId
+    ? findEndpoint(endpoints, "capture", settings.virtualCaptureEndpointId)
+    : undefined;
+  if (
+    physical &&
+    (isStandardVbCableCapture(physical) ||
+      trustedVirtualCaptureNameMatches(settings, physical) ||
+      sameEndpoint(physical, virtualRender) ||
+      sameEndpoint(physical, virtualCapture) ||
+      physical.id === settings.virtualCaptureEndpointId)
+  ) {
+    return {
+      type: "physicalCaptureRequired",
+      virtualCaptureEndpointId: physical.id,
+    };
+  }
+  return virtualRender
+    ? getVirtualRouteConflict(settings, endpoints, virtualRender)
+    : null;
+}
+
+function knownVbCableIdentityWasReused(
+  settings: RouteSettings,
+  endpoints: EndpointDescriptor[],
+) {
+  const known = settings.knownVbCablePair;
+  if (!known) return false;
+  const render = endpoints.find(
+    (endpoint) => endpoint.id === known.renderEndpointId,
+  );
+  const capture = endpoints.find(
+    (endpoint) => endpoint.id === known.captureEndpointId,
+  );
+  return Boolean(
+    (render && !isStandardVbCableRender(render)) ||
+      (capture && !isStandardVbCableCapture(capture)),
+  );
+}
+
 function getVirtualRouteConflict(
   settings: RouteSettings,
   endpoints: EndpointDescriptor[],
   output: EndpointDescriptor,
 ): VirtualRouteConflictIssue | null {
+  if (settings.dsp?.aec.enabled === false) return null;
   const render = settings.followDefaultRender
     ? endpoints.find(
         (endpoint) =>
@@ -240,6 +345,7 @@ export function isConfiguredVirtualCapture(
 ) {
   if (isStandardVbCableCapture(endpoint)) return true;
   if (!settings?.virtualCaptureEndpointId) return false;
+  if (trustedVirtualCaptureNameMatches(settings, endpoint)) return true;
   const configured = findEndpoint(
     endpoints,
     "capture",
@@ -248,19 +354,44 @@ export function isConfiguredVirtualCapture(
   return sameEndpoint(endpoint, configured);
 }
 
-export function activeCustomPairIsTrusted(settings: RouteSettings) {
+export function trustedVirtualCaptureNameMatches(
+  settings: RouteSettings,
+  capture: EndpointDescriptor,
+) {
+  return Boolean(
+    settings.virtualCaptureEndpointId &&
+      settings.trustedVirtualAudioPairs.some(
+        (pair) =>
+          pair.captureEndpointId === settings.virtualCaptureEndpointId &&
+          trustedNameMatches(pair.captureName, capture.friendlyName),
+      ),
+  );
+}
+
+function activeCustomPair(settings: RouteSettings) {
   if (
     settings.virtualDeviceMode !== "custom" ||
     !settings.outputEndpointId ||
     !settings.virtualCaptureEndpointId
   ) {
-    return false;
+    return undefined;
   }
-  return settings.trustedVirtualAudioPairs.some(
+  return settings.trustedVirtualAudioPairs.find(
     (pair) =>
       pair.renderEndpointId === settings.outputEndpointId &&
       pair.captureEndpointId === settings.virtualCaptureEndpointId,
   );
+}
+
+function trustedNameMatches(expected: string, actual: string) {
+  return (
+    expected.trim().length > 0 &&
+    expected.trim().toLowerCase() === actual.trim().toLowerCase()
+  );
+}
+
+export function activeCustomPairIsTrusted(settings: RouteSettings) {
+  return Boolean(activeCustomPair(settings));
 }
 
 export function inferPairedCapture(

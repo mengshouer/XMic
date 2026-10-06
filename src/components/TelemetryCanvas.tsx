@@ -51,11 +51,11 @@ function drawLine(
 
 export function TelemetryCanvas({
   metrics,
-  running,
+  active,
   label,
 }: {
   metrics: TelemetryMetrics;
-  running: boolean;
+  active: boolean;
   label: string;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -148,7 +148,7 @@ export function TelemetryCanvas({
   }, [draw]);
 
   useEffect(() => {
-    if (!running || lastBlock.current === metrics.processedBlocks) return;
+    if (!active || lastBlock.current === metrics.processedBlocks) return;
     lastBlock.current = metrics.processedBlocks;
     samples.current = [
       ...samples.current,
@@ -169,15 +169,15 @@ export function TelemetryCanvas({
     metrics.processedBlocks,
     metrics.vadGateOpen,
     metrics.vadProbability,
-    running,
+    active,
   ]);
 
   useEffect(() => {
-    if (running) return;
+    if (active) return;
     lastBlock.current = null;
     samples.current = [];
     draw();
-  }, [draw, running]);
+  }, [active, draw]);
 
   return <canvas ref={canvasRef} className="telemetry-canvas" role="img" aria-label={label} />;
 }

@@ -1,12 +1,10 @@
-//! The processing-load ladder: how a session decides it cannot keep up, and what it gives up.
+//! Realtime load measurement and the single overload transition.
 //!
-//! Only this process own lateness escalates the ladder. Device-side events are deliberately
-//! excluded and reported as device instability instead, because no amount of bypassed DSP makes
-//! a stalling device deliver audio on time. See `dsp_backlog_events` in the parent module.
+//! The previous three-step ladder temporarily bypassed AGC2 before falling back. A degraded path is
+//! now all-or-nothing: either the configured DSP chain runs in order, or the session hands off to the
+//! configured raw/silence fallback with every DSP stage bypassed.
 
 use std::time::Duration;
-
-use xmic_engine_protocol::ProcessingLoadMode;
 
 const PROCESSING_DEADLINE_US: u64 = 10_000;
 pub(super) const PROCESSING_BUDGET_US: u64 = 4_000;
@@ -16,49 +14,29 @@ const OVERLOAD_WINDOW_FRAMES: u32 = 200;
 const OVERLOAD_BUDGET_BLOCKS_PER_WINDOW: u32 = 10;
 const OVERLOAD_DEADLINES_PER_WINDOW: u32 = 2;
 const OVERLOAD_BACKLOG_EVENTS_PER_WINDOW: u32 = 2;
-const OVERLOAD_WINDOWS_TO_ESCALATE: u32 = 2;
-const STABLE_WINDOWS_TO_RECOVER: u32 = 5;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ProcessingLoadTransition {
-    pub(super) previous: ProcessingLoadMode,
-    pub(super) current: ProcessingLoadMode,
-}
+const OVERLOAD_WINDOWS_TO_FALLBACK: u32 = 2;
 
 pub(super) struct ProcessingOverloadController {
-    mode: ProcessingLoadMode,
-    reduced_stage_available: bool,
     window_frames: u32,
     budget_exceeded: u32,
     deadline_misses: u32,
     backlog_events: u32,
     overloaded_windows: u32,
-    stable_windows: u32,
 }
 
 impl ProcessingOverloadController {
-    pub(super) fn new(reduced_stage_available: bool) -> Self {
+    pub(super) fn new() -> Self {
         Self {
-            mode: ProcessingLoadMode::Full,
-            reduced_stage_available,
             window_frames: 0,
             budget_exceeded: 0,
             deadline_misses: 0,
             backlog_events: 0,
             overloaded_windows: 0,
-            stable_windows: 0,
         }
     }
 
-    pub(super) fn mode(&self) -> ProcessingLoadMode {
-        self.mode
-    }
-
-    pub(super) fn observe(
-        &mut self,
-        processing_time: Duration,
-        backlog_event: bool,
-    ) -> Option<ProcessingLoadTransition> {
+    /// Returns true once, when sustained overload requires a complete fallback handoff.
+    pub(super) fn observe(&mut self, processing_time: Duration, backlog_event: bool) -> bool {
         let processing_us = u64::try_from(processing_time.as_micros()).unwrap_or(u64::MAX);
         self.window_frames = self.window_frames.saturating_add(1);
         if processing_us > PROCESSING_BUDGET_US {
@@ -71,57 +49,22 @@ impl ProcessingOverloadController {
             self.backlog_events = self.backlog_events.saturating_add(1);
         }
         if self.window_frames < OVERLOAD_WINDOW_FRAMES {
-            return None;
+            return false;
         }
 
         let overloaded = self.budget_exceeded >= OVERLOAD_BUDGET_BLOCKS_PER_WINDOW
             || self.deadline_misses >= OVERLOAD_DEADLINES_PER_WINDOW
             || self.backlog_events >= OVERLOAD_BACKLOG_EVENTS_PER_WINDOW;
-        let stable =
-            self.budget_exceeded == 0 && self.deadline_misses == 0 && self.backlog_events == 0;
         self.window_frames = 0;
         self.budget_exceeded = 0;
         self.deadline_misses = 0;
         self.backlog_events = 0;
-
-        if overloaded {
-            self.overloaded_windows = self.overloaded_windows.saturating_add(1);
-            self.stable_windows = 0;
-        } else if stable {
-            self.stable_windows = self.stable_windows.saturating_add(1);
-            self.overloaded_windows = 0;
+        self.overloaded_windows = if overloaded {
+            self.overloaded_windows.saturating_add(1)
         } else {
-            self.overloaded_windows = 0;
-            self.stable_windows = 0;
-        }
-
-        let previous = self.mode;
-        if self.overloaded_windows >= OVERLOAD_WINDOWS_TO_ESCALATE {
-            self.mode = match self.mode {
-                ProcessingLoadMode::Full if self.reduced_stage_available => {
-                    ProcessingLoadMode::Reduced
-                }
-                ProcessingLoadMode::Full => ProcessingLoadMode::Protection,
-                ProcessingLoadMode::Reduced | ProcessingLoadMode::Protection => {
-                    ProcessingLoadMode::Protection
-                }
-            };
-            self.overloaded_windows = 0;
-        } else if self.stable_windows >= STABLE_WINDOWS_TO_RECOVER {
-            self.mode = match self.mode {
-                ProcessingLoadMode::Protection if self.reduced_stage_available => {
-                    ProcessingLoadMode::Reduced
-                }
-                ProcessingLoadMode::Protection => ProcessingLoadMode::Full,
-                ProcessingLoadMode::Reduced | ProcessingLoadMode::Full => ProcessingLoadMode::Full,
-            };
-            self.stable_windows = 0;
-        }
-
-        (self.mode != previous).then_some(ProcessingLoadTransition {
-            previous,
-            current: self.mode,
-        })
+            0
+        };
+        self.overloaded_windows >= OVERLOAD_WINDOWS_TO_FALLBACK
     }
 }
 
@@ -185,94 +128,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn processing_histogram_reports_tail_without_allocations() {
-        let mut histogram = ProcessingHistogram::default();
-        for _ in 0..99 {
-            histogram.observe(Duration::from_micros(100));
+    fn sustained_overload_requests_one_complete_fallback() {
+        let mut controller = ProcessingOverloadController::new();
+        for _ in 0..(OVERLOAD_WINDOW_FRAMES * OVERLOAD_WINDOWS_TO_FALLBACK - 1) {
+            assert!(!controller.observe(Duration::from_millis(5), false));
         }
-        histogram.observe(Duration::from_micros(500));
-
-        assert_eq!(histogram.p99_us(), 100.0);
-        assert_eq!(histogram.max_us(), 500);
-        assert_eq!(histogram.deadline_misses(), 0);
+        assert!(controller.observe(Duration::from_millis(5), false));
     }
 
     #[test]
-    fn processing_histogram_reports_deadline_misses_beyond_ten_ms() {
-        let mut histogram = ProcessingHistogram::default();
-        histogram.observe(Duration::from_micros(18_750));
-
-        assert_eq!(histogram.p99_us(), 18_750.0);
-        assert_eq!(histogram.max_us(), 18_750);
-        assert_eq!(histogram.deadline_misses(), 1);
-    }
-
-    #[test]
-    fn sustained_overload_escalates_and_stable_windows_recover() {
-        let mut controller = ProcessingOverloadController::new(true);
-
-        for _ in 0..(OVERLOAD_WINDOW_FRAMES * OVERLOAD_WINDOWS_TO_ESCALATE) {
-            controller.observe(Duration::from_millis(5), false);
-        }
-        assert_eq!(controller.mode(), ProcessingLoadMode::Reduced);
-
-        for _ in 0..(OVERLOAD_WINDOW_FRAMES * OVERLOAD_WINDOWS_TO_ESCALATE) {
-            controller.observe(Duration::from_millis(5), false);
-        }
-        assert_eq!(controller.mode(), ProcessingLoadMode::Protection);
-
-        for _ in 0..(OVERLOAD_WINDOW_FRAMES * STABLE_WINDOWS_TO_RECOVER) {
-            controller.observe(Duration::from_micros(200), false);
-        }
-        assert_eq!(controller.mode(), ProcessingLoadMode::Reduced);
-
-        for _ in 0..(OVERLOAD_WINDOW_FRAMES * STABLE_WINDOWS_TO_RECOVER) {
-            controller.observe(Duration::from_micros(200), false);
-        }
-        assert_eq!(controller.mode(), ProcessingLoadMode::Full);
-    }
-
-    #[test]
-    fn isolated_slow_frames_do_not_trigger_degradation() {
-        let mut controller = ProcessingOverloadController::new(true);
+    fn isolated_slow_frames_do_not_trigger_fallback() {
+        let mut controller = ProcessingOverloadController::new();
         for frame in 0..(OVERLOAD_WINDOW_FRAMES * 4) {
             let duration = if frame % OVERLOAD_WINDOW_FRAMES == 0 {
                 Duration::from_millis(5)
             } else {
                 Duration::from_micros(200)
             };
-            controller.observe(duration, false);
+            assert!(!controller.observe(duration, false));
         }
-
-        assert_eq!(controller.mode(), ProcessingLoadMode::Full);
     }
 
     #[test]
-    fn overload_skips_the_reduced_stage_when_agc2_is_disabled() {
-        let mut controller = ProcessingOverloadController::new(false);
-
-        for _ in 0..(OVERLOAD_WINDOW_FRAMES * OVERLOAD_WINDOWS_TO_ESCALATE) {
-            controller.observe(Duration::from_millis(5), false);
+    fn processing_histogram_reports_tail_and_deadlines() {
+        let mut histogram = ProcessingHistogram::default();
+        for _ in 0..99 {
+            histogram.observe(Duration::from_micros(100));
         }
-        assert_eq!(controller.mode(), ProcessingLoadMode::Protection);
-
-        for _ in 0..(OVERLOAD_WINDOW_FRAMES * STABLE_WINDOWS_TO_RECOVER) {
-            controller.observe(Duration::from_micros(200), false);
-        }
-        assert_eq!(controller.mode(), ProcessingLoadMode::Full);
-    }
-
-    #[test]
-    fn a_dropping_device_does_not_degrade_the_dsp() {
-        let mut controller = ProcessingOverloadController::new(true);
-
-        // A device that drops packets and starves the output every single frame, while processing
-        // itself stays far inside its budget: the ladder must not move, because bypassing AGC2 or the
-        // whole chain cannot make the device deliver audio on time.
-        for _ in 0..(OVERLOAD_WINDOW_FRAMES * OVERLOAD_WINDOWS_TO_ESCALATE * 4) {
-            controller.observe(Duration::from_micros(200), false);
-        }
-
-        assert_eq!(controller.mode(), ProcessingLoadMode::Full);
+        histogram.observe(Duration::from_micros(18_750));
+        assert_eq!(histogram.p99_us(), 100.0);
+        assert_eq!(histogram.max_us(), 18_750);
+        assert_eq!(histogram.deadline_misses(), 1);
     }
 }
