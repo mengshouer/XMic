@@ -12,6 +12,13 @@ type TranslationShape<T> = T extends (...args: infer Args) => unknown
 const zhCN = {
   common: {
     language: "界面语言",
+    theme: "外观主题",
+    themeSystem: "自动",
+    themeLight: "浅色",
+    themeDark: "深色",
+    liveIoMeter: "LIVE I/O",
+    inputShort: "IN",
+    outputShort: "OUT",
     loading: "正在读取音频设备",
     start: "启动",
     stop: "停止",
@@ -42,7 +49,6 @@ const zhCN = {
     monitor: {
       eyebrow: "REAL-TIME ENGINE",
       title: "实时声音监控",
-      subtitle: "在一处观察回声消除、语音检测与整条音频链路",
       telemetryTitle: "信号遥测",
       telemetrySubtitle: "最近 72 个状态采样",
       telemetryAria: "VAD 概率与 AEC3 回声衰减时间序列",
@@ -85,9 +91,10 @@ const zhCN = {
     routing: {
       eyebrow: "DEVICES & RUNTIME",
       title: "设备与运行",
-      subtitle: "配置音频设备、故障保护与后台运行方式",
-      configuration: "设备配置",
-      configurationSubtitle: "输入、参考与输出端点",
+      configuration: "物理设备与参考源",
+      configurationSubtitle: "输入、参考与声道选择",
+      virtualBridge: "虚拟麦克风桥接",
+      virtualBridgeSubtitle: "将处理后音频送入语音或游戏软件",
       active: "当前活动路由",
       activeSubtitle: "引擎实际使用的端点",
       safety: "降级输出",
@@ -98,7 +105,6 @@ const zhCN = {
     processing: {
       eyebrow: "DSP WORKBENCH",
       title: "处理链路",
-      subtitle: "按信号顺序精调回声消除、降噪、增益与语音门限",
       pipelineAria: "DSP 处理模块",
       editorLabel: "当前模块",
       alwaysOn: "处理输出中始终启用",
@@ -108,7 +114,6 @@ const zhCN = {
     about: {
       eyebrow: "ABOUT & DIAGNOSTICS",
       title: "关于 XMic",
-      subtitle: "查看版本、运行路径、DSP 来源与内嵌许可信息",
     },
   },
   about: {
@@ -371,7 +376,7 @@ const zhCN = {
     rnnoiseSubtitle: "噪声抑制",
     agc2Subtitle: "自动增益控制",
     vadSubtitle: "语音活动门限",
-    limiterSubtitle: "输出峰值限制",
+    limiterSubtitle: "增益与峰值限制",
     aec: {
       enabled: "启用 AEC3",
       enabledHelp:
@@ -432,9 +437,9 @@ const zhCN = {
         "AEC 前后帧能量的平滑比值。负值越小表示该声音被 AEC 判定并衰减得越多。",
       inputPeak: "麦克风输入峰值",
       inputPeakHelp:
-        "本次启动以来物理麦克风输入的最高峰值；接近 0 dBFS 且 clipping 增长表示输入端已经削波。",
+        "最近 1 秒统计窗口内物理麦克风原始输入的最高采样峰值；接近 0 dBFS 且 clipping 增长表示输入端已经削波。",
       outputPeak: "处理后输出峰值",
-      outputPeakHelp: "本次启动以来 DSP 最终输出的最高峰值。",
+      outputPeakHelp: "最近 1 秒统计窗口内 DSP 最终输出的最高采样峰值。",
       inputClipping: "输入削波样本",
       inputClippingHelp:
         "物理麦克风输入绝对幅度达到 0.999 以上的样本累计数；持续增长通常表示输入增益过高。",
@@ -471,6 +476,9 @@ const zhCN = {
       echoGuardReleases: "EchoGuard 放行次数",
       echoGuardReleasesHelp:
         "近端候选同时满足 VAD、AEC 瞬时/平滑衰减和低回声概率，并连续维持 60 ms 后，Echo guard 实际释放的累计次数；纯播放测试中应为 0。",
+      groupLatency: "链路延迟分解",
+      groupCalibration: "主机时钟与回声路径校准",
+      groupEchoAndGate: "回声抑制、电平峰值与 VAD 协同",
     },
     rnnoise: {
       enabled: "启用 RNNoise",
@@ -534,6 +542,10 @@ const zhCN = {
         "Hold 结束后从正常音量降到 Floor 的淡出时间。越长关闭越自然，但残余噪声持续更久。",
     },
     limiter: {
+      gain: "麦克风增益（加强）",
+      gainHelp:
+        "在回声消除、降噪与语音门限之后对干净人声调整固定 dB 增益（-12 至 +30 dB），并由下方 Limiter 峰值上限自动防止破音削波。0 dB 时完全直通。",
+      gainPresets: "快捷档位",
       ceiling: "Limiter 输出峰值上限",
       ceilingHelp:
         "最终输出允许达到的最高峰值。保持低于 0 dBFS 可防止削波；-1 dBFS 通常兼顾响度和安全余量。",
@@ -549,6 +561,13 @@ export type Translation = TranslationShape<typeof zhCN>;
 const en = {
   common: {
     language: "Interface language",
+    theme: "Appearance theme",
+    themeSystem: "Auto",
+    themeLight: "Light",
+    themeDark: "Dark",
+    liveIoMeter: "LIVE I/O",
+    inputShort: "IN",
+    outputShort: "OUT",
     loading: "Reading audio devices",
     start: "Start",
     stop: "Stop",
@@ -580,7 +599,6 @@ const en = {
     monitor: {
       eyebrow: "REAL-TIME ENGINE",
       title: "Live audio monitor",
-      subtitle: "Observe echo cancellation, voice detection, and the complete audio path",
       telemetryTitle: "Signal telemetry",
       telemetrySubtitle: "Latest 72 status samples",
       telemetryAria: "Time series of VAD probability and AEC3 echo attenuation",
@@ -623,9 +641,10 @@ const en = {
     routing: {
       eyebrow: "DEVICES & RUNTIME",
       title: "Devices & runtime",
-      subtitle: "Configure audio devices, failure protection, and background behavior",
-      configuration: "Device configuration",
-      configurationSubtitle: "Input, reference, and output endpoints",
+      configuration: "Physical devices & reference",
+      configurationSubtitle: "Input, reference, and channel selection",
+      virtualBridge: "Virtual microphone bridge",
+      virtualBridgeSubtitle: "Send processed audio to voice or game apps",
       active: "Current active route",
       activeSubtitle: "Endpoints used by the engine",
       safety: "Degraded output",
@@ -636,7 +655,6 @@ const en = {
     processing: {
       eyebrow: "DSP WORKBENCH",
       title: "Processing chain",
-      subtitle: "Tune echo cancellation, noise suppression, gain, and voice gating in signal order",
       pipelineAria: "DSP processing modules",
       editorLabel: "Selected module",
       alwaysOn: "Always on for processed output",
@@ -646,7 +664,6 @@ const en = {
     about: {
       eyebrow: "ABOUT & DIAGNOSTICS",
       title: "About XMic",
-      subtitle: "View version, runtime paths, DSP source, and embedded license information",
     },
   },
   about: {
@@ -914,7 +931,7 @@ const en = {
     rnnoiseSubtitle: "Noise suppression",
     agc2Subtitle: "Automatic gain control",
     vadSubtitle: "Voice activity gate",
-    limiterSubtitle: "Output ceiling",
+    limiterSubtitle: "Gain & output ceiling",
     aec: {
       enabled: "Enable AEC3",
       enabledHelp:
@@ -975,9 +992,10 @@ const en = {
         "Smoothed ratio of frame energy before and after AEC. More negative values mean AEC classified and attenuated more of the sound.",
       inputPeak: "Microphone input peak",
       inputPeakHelp:
-        "Highest physical microphone input peak during this run. Values near 0 dBFS with a rising clipping count indicate input clipping.",
+        "Highest raw physical microphone sample peak in the latest 1-second window. Values near 0 dBFS with a rising clipping count indicate input clipping.",
       outputPeak: "Processed output peak",
-      outputPeakHelp: "Highest final DSP output peak during this run.",
+      outputPeakHelp:
+        "Highest final DSP output sample peak in the latest 1-second window.",
       inputClipping: "Input clipped samples",
       inputClippingHelp:
         "Number of physical microphone samples with absolute amplitude at or above 0.999. Sustained growth usually means the input gain is too high.",
@@ -1014,6 +1032,9 @@ const en = {
       echoGuardReleases: "EchoGuard release events",
       echoGuardReleasesHelp:
         "Number of candidates released after simultaneously meeting VAD, instantaneous and smoothed AEC attenuation, and low echo probability requirements for 60 ms. This should remain 0 in playback-only tests.",
+      groupLatency: "Pipeline latency breakdown",
+      groupCalibration: "Host clock & echo path calibration",
+      groupEchoAndGate: "Echo suppression, peaks & EchoGuard",
     },
     rnnoise: {
       enabled: "Enable RNNoise",
@@ -1077,6 +1098,10 @@ const en = {
         "Fade from normal volume to Floor after Hold ends. Longer times close more naturally but retain residual noise for longer.",
     },
     limiter: {
+      gain: "Microphone gain (boost)",
+      gainHelp:
+        "Apply fixed dB gain (-12 to +30 dB) to clean speech after echo cancellation, noise suppression, and VAD gating, while the Limiter ceiling below prevents clipping. 0 dB is bit-transparent.",
+      gainPresets: "Quick boost",
       ceiling: "Limiter output ceiling",
       ceilingHelp:
         "Highest permitted final output peak. Keep this below 0 dBFS to prevent clipping; -1 dBFS usually balances loudness and safety margin.",

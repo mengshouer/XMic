@@ -468,6 +468,7 @@ impl VadGate {
 
 #[derive(Debug, Clone, Copy)]
 pub struct SafetyLimiterConfig {
+    pub gain_db: f32,
     pub ceiling_dbfs: f32,
     pub release_ms: f32,
 }
@@ -475,6 +476,7 @@ pub struct SafetyLimiterConfig {
 impl Default for SafetyLimiterConfig {
     fn default() -> Self {
         Self {
+            gain_db: 0.0,
             ceiling_dbfs: -1.0,
             release_ms: 50.0,
         }
@@ -488,6 +490,7 @@ pub struct LimiterFrameMetrics {
 }
 
 pub struct SafetyLimiter {
+    pre_gain: f32,
     ceiling: f32,
     release_coefficient: f32,
     gain: f32,
@@ -495,6 +498,9 @@ pub struct SafetyLimiter {
 
 impl SafetyLimiter {
     pub fn new(config: SafetyLimiterConfig) -> Result<Self, PostProcessConfigError> {
+        if !config.gain_db.is_finite() || !(-12.0..=30.0).contains(&config.gain_db) {
+            return Err(PostProcessConfigError::InvalidLimiterGain);
+        }
         if !config.ceiling_dbfs.is_finite() || !(-30.0..=0.0).contains(&config.ceiling_dbfs) {
             return Err(PostProcessConfigError::InvalidLimiterCeiling);
         }
@@ -502,6 +508,11 @@ impl SafetyLimiter {
             return Err(PostProcessConfigError::InvalidLimiterRelease);
         }
         Ok(Self {
+            pre_gain: if config.gain_db == 0.0 {
+                1.0
+            } else {
+                db_to_gain(config.gain_db)
+            },
             ceiling: db_to_gain(config.ceiling_dbfs),
             release_coefficient: smoothing_coefficient(config.release_ms),
             gain: 1.0,
@@ -520,7 +531,7 @@ impl SafetyLimiter {
         let mut limited_samples = 0usize;
         let mut minimum_gain = self.gain;
         for sample in samples {
-            let sample_value = sanitize_sample(*sample);
+            let sample_value = sanitize_sample(*sample) * self.pre_gain;
             let peak = sample_value.abs();
             let required_gain = if peak > self.ceiling {
                 self.ceiling / peak
@@ -600,6 +611,8 @@ pub enum PostProcessConfigError {
     InvalidVadFloor,
     #[error("invalid VAD attack or release")]
     InvalidVadTiming,
+    #[error("invalid limiter gain")]
+    InvalidLimiterGain,
     #[error("invalid limiter ceiling")]
     InvalidLimiterCeiling,
     #[error("invalid limiter release")]
@@ -621,6 +634,43 @@ mod tests {
 
         assert!(metrics.limited_samples > 0);
         assert!(samples.iter().all(|sample| sample.abs() <= ceiling));
+    }
+
+    #[test]
+    fn limiter_boost_gain_amplifies_quiet_signal_and_clamps_peaks_at_ceiling() {
+        let mut boosted = SafetyLimiter::new(SafetyLimiterConfig {
+            gain_db: 20.0,
+            ceiling_dbfs: -1.0,
+            release_ms: 50.0,
+        })
+        .unwrap();
+        let mut quiet = [0.05; DSP_SAMPLES_PER_FRAME];
+        let quiet_metrics = boosted.process_frame(&mut quiet).unwrap();
+        assert_eq!(quiet_metrics.limited_samples, 0);
+        assert!((quiet[0] - 0.5).abs() < 1.0e-5);
+
+        let mut loud = [0.2; DSP_SAMPLES_PER_FRAME];
+        let loud_metrics = boosted.process_frame(&mut loud).unwrap();
+        let ceiling = db_to_gain(-1.0);
+        assert!(loud_metrics.limited_samples > 0);
+        assert!(loud.iter().all(|sample| sample.abs() <= ceiling));
+
+        assert_eq!(
+            SafetyLimiter::new(SafetyLimiterConfig {
+                gain_db: 31.0,
+                ..SafetyLimiterConfig::default()
+            })
+            .err(),
+            Some(PostProcessConfigError::InvalidLimiterGain)
+        );
+        assert_eq!(
+            SafetyLimiter::new(SafetyLimiterConfig {
+                gain_db: -13.0,
+                ..SafetyLimiterConfig::default()
+            })
+            .err(),
+            Some(PostProcessConfigError::InvalidLimiterGain)
+        );
     }
 
     #[test]

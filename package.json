@@ -1,7 +1,7 @@
 {
   "name": "xmic",
   "private": true,
-  "version": "0.3.6",
+  "version": "0.4.0",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -21,6 +21,7 @@
     "test": "npm run test:web && npm run test:licenses",
     "test:web": "vitest run",
     "test:licenses": "node --test scripts/license-utils.test.mjs",
+    "version:bump": "node scripts/bump-release-version.mjs",
     "version:check": "node scripts/check-release-version.mjs",
     "tauri": "tauri"
   },

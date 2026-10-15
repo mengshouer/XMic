@@ -15,15 +15,34 @@ interface TelemetrySample {
 }
 
 const SAMPLE_LIMIT = 72;
-const COLORS = {
-  background: "#101411",
-  grid: "#273029",
-  baseline: "#3a463d",
-  vad: "#b7ff3c",
-  attenuation: "#48d8d2",
-  gate: "rgba(244, 184, 96, 0.16)",
-  empty: "#6e7b72",
+const DEFAULT_COLORS = {
+  background: "#0b0f17",
+  grid: "#233046",
+  baseline: "#314361",
+  vad: "#38bdf8",
+  attenuation: "#34d399",
+  gate: "rgba(251, 191, 36, 0.14)",
+  empty: "#7e91ab",
 };
+
+function resolveThemeColors() {
+  const styles = window.getComputedStyle(document.documentElement);
+  return {
+    background:
+      styles.getPropertyValue("--canvas").trim() || DEFAULT_COLORS.background,
+    grid: styles.getPropertyValue("--line").trim() || DEFAULT_COLORS.grid,
+    baseline:
+      styles.getPropertyValue("--line-strong").trim() ||
+      DEFAULT_COLORS.baseline,
+    vad: styles.getPropertyValue("--accent").trim() || DEFAULT_COLORS.vad,
+    attenuation:
+      styles.getPropertyValue("--cyan").trim() || DEFAULT_COLORS.attenuation,
+    gate:
+      styles.getPropertyValue("--gate-fill").trim() || DEFAULT_COLORS.gate,
+    empty:
+      styles.getPropertyValue("--text-muted").trim() || DEFAULT_COLORS.empty,
+  };
+}
 
 function drawLine(
   context: CanvasRenderingContext2D,
@@ -60,6 +79,7 @@ export function TelemetryCanvas({
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const lastBlock = useRef<number | null>(null);
+  const themeColors = useRef(DEFAULT_COLORS);
   // A ref rather than state: the samples are only ever drawn onto the canvas, never rendered as JSX.
   // Holding them in state made every sample a React render, and re-ran the effect that owned the
   // ResizeObserver, so the observer was torn down and rebuilt once a second.
@@ -69,23 +89,27 @@ export function TelemetryCanvas({
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
+    const colors = themeColors.current;
     const current = samples.current;
     const bounds = canvas.getBoundingClientRect();
     const ratio = Math.min(window.devicePixelRatio || 1, 2);
     const width = Math.max(1, Math.round(bounds.width));
     const height = Math.max(1, Math.round(bounds.height));
-    // Assigning the size also clears the canvas and resets the transform below.
-    canvas.width = Math.round(width * ratio);
-    canvas.height = Math.round(height * ratio);
+    const targetWidth = Math.round(width * ratio);
+    const targetHeight = Math.round(height * ratio);
+    if (canvas.width !== targetWidth || canvas.height !== targetHeight) {
+      canvas.width = targetWidth;
+      canvas.height = targetHeight;
+    }
 
     const context = canvas.getContext("2d");
     if (!context) return;
-    context.scale(ratio, ratio);
-    context.fillStyle = COLORS.background;
+    context.setTransform(ratio, 0, 0, ratio, 0, 0);
+    context.fillStyle = colors.background;
     context.fillRect(0, 0, width, height);
 
     context.lineWidth = 1;
-    context.strokeStyle = COLORS.grid;
+    context.strokeStyle = colors.grid;
     for (let row = 1; row < 4; row += 1) {
       const y = Math.round((height / 4) * row) + 0.5;
       context.beginPath();
@@ -102,7 +126,7 @@ export function TelemetryCanvas({
     }
 
     if (current.length === 0) {
-      context.strokeStyle = COLORS.baseline;
+      context.strokeStyle = colors.baseline;
       context.setLineDash([5, 7]);
       context.beginPath();
       context.moveTo(0, height / 2 + 0.5);
@@ -115,22 +139,22 @@ export function TelemetryCanvas({
     const step = width / (SAMPLE_LIMIT - 1);
     current.forEach((sample, index) => {
       if (!sample.gateOpen) return;
-      context.fillStyle = COLORS.gate;
+      context.fillStyle = colors.gate;
       context.fillRect(index * step - step / 2, 0, Math.max(2, step), height);
     });
 
-    drawLine(context, current, width, height, (sample) => sample.vad, COLORS.vad);
+    drawLine(context, current, width, height, (sample) => sample.vad, colors.vad);
     drawLine(
       context,
       current,
       width,
       height,
       (sample) => sample.attenuation,
-      COLORS.attenuation,
+      colors.attenuation,
     );
 
     const lastX = ((current.length - 1) / (SAMPLE_LIMIT - 1)) * width;
-    context.strokeStyle = COLORS.empty;
+    context.strokeStyle = colors.empty;
     context.beginPath();
     context.moveTo(lastX + 0.5, 0);
     context.lineTo(lastX + 0.5, height);
@@ -141,10 +165,22 @@ export function TelemetryCanvas({
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    draw();
+    const syncThemeAndDraw = () => {
+      themeColors.current = resolveThemeColors();
+      draw();
+    };
+    syncThemeAndDraw();
     const observer = new ResizeObserver(draw);
     observer.observe(canvas);
-    return () => observer.disconnect();
+    const themeObserver = new MutationObserver(syncThemeAndDraw);
+    themeObserver.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["data-resolved-theme"],
+    });
+    return () => {
+      observer.disconnect();
+      themeObserver.disconnect();
+    };
   }, [draw]);
 
   useEffect(() => {

@@ -32,6 +32,7 @@ import {
   SlidersHorizontal,
   Speaker,
   Square,
+  SunMoon,
   Trash2,
   Waves,
   X,
@@ -69,6 +70,7 @@ import {
   type Translation,
   translations,
 } from "./i18n";
+import { meterFillPercent } from "./levelMeter";
 import {
   activeCustomPairIsTrusted,
   type ConfigurationIssue,
@@ -88,6 +90,13 @@ import {
   createSettingsDraft,
   editSettingsDraft,
 } from "./settingsDraft";
+import {
+  applyThemeToDocument,
+  readStoredThemePreference,
+  storeThemePreference,
+  systemPrefersDarkScheme,
+  type ThemePreference,
+} from "./theme";
 
 type AecPreset = "natural" | "balanced" | "strong";
 type DegradedOutput = "raw" | "silence";
@@ -128,6 +137,7 @@ interface VadGateSettings {
 }
 
 interface LimiterSettings {
+  gainDb: number;
   ceilingDbfs: number;
   releaseMs: number;
 }
@@ -215,12 +225,19 @@ interface EngineMetrics {
   echoGuardReleaseEvents: number;
 }
 
+interface DspLibraryValidation {
+  expectedAbi: number;
+  actualAbi: number | null;
+  error: string | null;
+}
+
 interface EngineStatus {
   protocolVersion: number;
   desiredEnabled: boolean;
   state: EngineState;
   output: EngineOutput;
   primaryReason: PrimaryReason | null;
+  dspValidation?: DspLibraryValidation;
   endpoints: EndpointDescriptor[];
   settings: EngineSettings;
   activeRoute: ActiveRoute | null;
@@ -258,6 +275,7 @@ const CAPTURE_CHANNEL_OPTIONS = Array.from(
   { length: 16 },
   (_, channel) => channel,
 );
+const GAIN_BOOST_PRESETS = [0, 10, 20, 30] as const;
 
 function estimatedDspLatencyMs(dsp: DspSettings) {
   const confirmationFrames = Math.ceil(
@@ -279,6 +297,12 @@ function estimatedDspLatencyMs(dsp: DspSettings) {
 
 function App() {
   const [language, setLanguage] = useState<Language>(readStoredLanguage);
+  const [themePreference, setThemePreference] = useState<ThemePreference>(
+    readStoredThemePreference,
+  );
+  const [systemPrefersDark, setSystemPrefersDark] = useState(
+    systemPrefersDarkScheme,
+  );
   const [activeView, setActiveView] = useState<ViewId>("monitor");
   const [activeDspStage, setActiveDspStage] = useState<DspStageId>("aec");
   const [status, setStatus] = useState<EngineStatus | null>(null);
@@ -363,6 +387,23 @@ function App() {
       setError(String(reason)),
     );
   }, [language]);
+
+  useEffect(() => {
+    const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
+    const handleChange = (event: MediaQueryListEvent) =>
+      setSystemPrefersDark(event.matches);
+    mediaQuery.addEventListener("change", handleChange);
+    return () => mediaQuery.removeEventListener("change", handleChange);
+  }, []);
+
+  useEffect(() => {
+    applyThemeToDocument(themePreference, systemPrefersDark);
+  }, [systemPrefersDark, themePreference]);
+
+  const changeThemePreference = (preference: ThemePreference) => {
+    setThemePreference(preference);
+    storeThemePreference(preference);
+  };
 
   const acceptStatus = useCallback(
     (next: EngineStatus, forceSettings = false) => {
@@ -930,6 +971,14 @@ function App() {
   const activeCaptureLabel = activeCapture.followsDefault
     ? copy.routing.resolvedDefaultCapture(activeCaptureName)
     : activeCaptureName;
+  const liveVadText =
+    engineSessionActive && status.metrics.vadProbability != null
+      ? `${Math.round(status.metrics.vadProbability * 100)}%`
+      : "--";
+  const formatLivePeak = (peakDbfs: number | null) =>
+    engineSessionActive && peakDbfs != null ? peakDbfs.toFixed(1) : "--";
+  const liveInputPeakText = formatLivePeak(status.metrics.inputPeakDbfs);
+  const liveOutputPeakText = formatLivePeak(status.metrics.outputPeakDbfs);
   const stageEnabled: Record<DspStageId, boolean> = {
     aec: draft.dsp.aec.enabled,
     rnnoise: draft.dsp.rnnoise.enabled,
@@ -966,12 +1015,14 @@ function App() {
           <span className="brand-mark">
             <AudioWaveform size={22} strokeWidth={2.4} aria-hidden="true" />
           </span>
-          <span className="brand-name">XMic</span>
-          {appVersion && (
-            <span className="brand-version" title={copy.about.version}>
-              v{appVersion}
-            </span>
-          )}
+          <span className="brand-copy">
+            <span className="brand-name">XMic</span>
+            {appVersion && (
+              <span className="brand-version" title={copy.about.version}>
+                v{appVersion}
+              </span>
+            )}
+          </span>
         </div>
 
         <nav
@@ -1007,8 +1058,40 @@ function App() {
 
         <div className="sidebar-spacer" />
 
+        <section
+          className="sidebar-live-meters"
+          aria-label={copy.common.liveIoMeter}
+          title={`${copy.common.liveIoMeter} · VAD ${liveVadText} · ${copy.common.inputShort} ${liveInputPeakText} · ${copy.common.outputShort} ${liveOutputPeakText}`}
+        >
+          <div className="sidebar-meter-head">
+            <span>{copy.common.liveIoMeter}</span>
+            <strong>{liveVadText}</strong>
+          </div>
+          <SidebarMeterRow
+            kind="in"
+            label={copy.common.inputShort}
+            fillPercent={meterFillPercent(
+              status.metrics.inputPeakDbfs,
+              engineSessionActive,
+            )}
+            valueText={liveInputPeakText}
+          />
+          <SidebarMeterRow
+            kind="out"
+            label={copy.common.outputShort}
+            fillPercent={meterFillPercent(
+              status.metrics.outputPeakDbfs,
+              engineSessionActive,
+            )}
+            valueText={liveOutputPeakText}
+          />
+        </section>
+
         <section className="sidebar-engine" aria-label={copy.status.title}>
-          <div className="sidebar-state">
+          <div
+            className="sidebar-state"
+            title={`${copy.status.title}: ${copy.engineStates[status.state]}`}
+          >
             <span className="state-symbol" data-state={status.state}>
               <Activity size={15} aria-hidden="true" />
             </span>
@@ -1024,18 +1107,54 @@ function App() {
             disabled={
               busy || (!engineDesiredOn && (dirty || settingsResetPending))
             }
+            aria-label={engineDesiredOn ? copy.common.stop : copy.common.start}
             title={
               !engineDesiredOn && (dirty || settingsResetPending)
                 ? copy.common.applyBeforeStart
-                : undefined
+                : engineDesiredOn
+                  ? copy.common.stop
+                  : copy.common.start
             }
           >
-            {engineDesiredOn ? <Square size={15} /> : <Play size={16} />}
+            {engineDesiredOn ? (
+              <Square size={15} aria-hidden="true" />
+            ) : (
+              <Play size={16} aria-hidden="true" />
+            )}
             <span>
               {engineDesiredOn ? copy.common.stop : copy.common.start}
             </span>
           </button>
         </section>
+
+        <fieldset
+          className="theme-mode-switch"
+          aria-label={copy.common.theme}
+          title={copy.common.theme}
+        >
+          <SunMoon size={14} aria-hidden="true" />
+          <button
+            type="button"
+            aria-pressed={themePreference === "system"}
+            onClick={() => changeThemePreference("system")}
+          >
+            {copy.common.themeSystem}
+          </button>
+          <button
+            type="button"
+            aria-pressed={themePreference === "light"}
+            onClick={() => changeThemePreference("light")}
+          >
+            {copy.common.themeLight}
+          </button>
+          <button
+            type="button"
+            aria-pressed={themePreference === "dark"}
+            onClick={() => changeThemePreference("dark")}
+          >
+            {copy.common.themeDark}
+          </button>
+        </fieldset>
 
         <fieldset
           className="language-switch"
@@ -1157,10 +1276,9 @@ function App() {
               icon={<LayoutDashboard size={18} />}
               eyebrow={copy.views.monitor.eyebrow}
               title={copy.views.monitor.title}
-              subtitle={copy.views.monitor.subtitle}
             />
-            <div className="monitor-view">
-              <div className="monitor-grid">
+            <div className="monitor-view monitor-bento-layout">
+              <div className="bento-top-split">
                 <section className="surface telemetry-panel">
                   <PanelHeading
                     icon={<Radio size={16} />}
@@ -1234,8 +1352,10 @@ function App() {
                   />
                   <div className="state-readout" data-state={status.state}>
                     <span>{copy.status.title}</span>
-                    <strong>{copy.engineStates[status.state]}</strong>
-                    <small>{primaryReasonText}</small>
+                    <strong title={copy.engineStates[status.state]}>
+                      {copy.engineStates[status.state]}
+                    </strong>
+                    <small title={primaryReasonText}>{primaryReasonText}</small>
                   </div>
                   <div className="snapshot-list">
                     <SnapshotItem
@@ -1357,136 +1477,134 @@ function App() {
                 </div>
               </section>
 
-              <div className="monitor-bottom-grid">
-                <section className="surface chain-overview">
-                  <PanelHeading
-                    icon={<SlidersHorizontal size={16} />}
-                    title={copy.views.monitor.chainTitle}
-                    subtitle={copy.views.monitor.chainSubtitle}
+              <section className="surface health-panel">
+                <PanelHeading
+                  icon={<Activity size={16} />}
+                  title={copy.views.monitor.healthTitle}
+                  subtitle={copy.views.monitor.healthSubtitle}
+                />
+                <div className="health-grid">
+                  <MetricReadout
+                    label={copy.status.processedBlocks}
+                    value={status.metrics.processedBlocks.toLocaleString(
+                      language,
+                    )}
                   />
-                  <section
-                    className="dsp-quick-grid"
-                    aria-label={copy.views.monitor.quickControlsAria}
-                  >
-                    <QuickDspControl
-                      label="AEC3"
-                      description={copy.views.monitor.aecQuickDescription}
-                      icon={<Waves size={15} />}
-                      enabled={quickDsp.aec.enabled}
-                      status={quickDspStatus(quickDsp.aec.enabled, copy)}
-                      controlsLocked={quickControlsLocked}
-                      onOpen={() => openProcessor("aec")}
-                      onToggle={(enabled) => updateAec({ enabled })}
-                      copy={copy}
-                    />
-                    <QuickDspControl
-                      label="RNNoise"
-                      description={copy.views.monitor.rnnoiseQuickDescription}
-                      icon={<AudioLines size={15} />}
-                      enabled={quickDsp.rnnoise.enabled}
-                      status={quickDspStatus(quickDsp.rnnoise.enabled, copy)}
-                      controlsLocked={quickControlsLocked}
-                      disabledReason={
-                        quickDsp.rnnoise.enabled && quickDsp.vadGate.enabled
-                          ? copy.views.monitor.rnnoiseRequiredByVad
-                          : undefined
-                      }
-                      onOpen={() => openProcessor("rnnoise")}
-                      onToggle={(enabled) => updateRnnoise({ enabled })}
-                      copy={copy}
-                    />
-                    <QuickDspControl
-                      label="AGC2"
-                      description={copy.views.monitor.agc2QuickDescription}
-                      icon={<Gauge size={15} />}
-                      enabled={quickDsp.agc2.enabled}
-                      status={quickDspStatus(quickDsp.agc2.enabled, copy)}
-                      controlsLocked={quickControlsLocked}
-                      onOpen={() => openProcessor("agc2")}
-                      onToggle={enableAgc2}
-                      copy={copy}
-                    />
-                    <QuickDspControl
-                      label="VAD Gate"
-                      description={copy.views.monitor.vadQuickDescription}
-                      icon={<Mic2 size={15} />}
-                      enabled={quickDsp.vadGate.enabled}
-                      status={quickDspStatus(quickDsp.vadGate.enabled, copy)}
-                      controlsLocked={quickControlsLocked}
-                      disabledReason={
-                        !quickDsp.vadGate.enabled && !quickDsp.rnnoise.enabled
-                          ? copy.views.monitor.vadRequiresRnnoise
-                          : undefined
-                      }
-                      onOpen={() => openProcessor("vad")}
-                      onToggle={(enabled) => updateVad({ enabled })}
-                      copy={copy}
-                    />
-                    <QuickDspControl
-                      label="Limiter"
-                      description={copy.views.monitor.limiterQuickDescription}
-                      icon={<ShieldCheck size={15} />}
-                      enabled
-                      status={copy.views.monitor.alwaysEnabled}
-                      locked
-                      controlsLocked={quickControlsLocked}
-                      onOpen={() => openProcessor("limiter")}
-                      copy={copy}
-                    />
-                  </section>
-                </section>
+                  <MetricReadout
+                    label={copy.status.deviceRestarts}
+                    value={status.metrics.deviceRestarts.toLocaleString(
+                      language,
+                    )}
+                  />
+                  <MetricReadout
+                    label={copy.status.outputQueue}
+                    value={`${status.metrics.outputQueueDepthMs.toFixed(1)} ms`}
+                    title={copy.status.outputQueueHelp}
+                  />
+                  <MetricReadout
+                    label={copy.status.audioAnomalies}
+                    value={audioAnomalyTotal(status.metrics).toLocaleString(
+                      language,
+                    )}
+                    title={copy.status.audioAnomaliesHelp}
+                  />
+                  <MetricReadout
+                    label={copy.status.dspP99}
+                    value={`${status.metrics.processingTimeP99Us.toFixed(0)} µs`}
+                    title={copy.status.dspP99Title(
+                      status.metrics.processingTimeMaxUs.toFixed(0),
+                      status.metrics.processingDeadlineMisses.toLocaleString(
+                        language,
+                      ),
+                    )}
+                  />
+                  <MetricReadout
+                    label={copy.status.deviceDiscontinuities}
+                    value={status.metrics.deviceDiscontinuities.toLocaleString(
+                      language,
+                    )}
+                    title={copy.status.deviceDiscontinuitiesHelp}
+                  />
+                </div>
+              </section>
 
-                <section className="surface health-panel">
-                  <PanelHeading
-                    icon={<Activity size={16} />}
-                    title={copy.views.monitor.healthTitle}
-                    subtitle={copy.views.monitor.healthSubtitle}
+              <section className="surface chain-overview">
+                <PanelHeading
+                  icon={<SlidersHorizontal size={16} />}
+                  title={copy.views.monitor.chainTitle}
+                  subtitle={copy.views.monitor.chainSubtitle}
+                />
+                <section
+                  className="dsp-quick-grid"
+                  aria-label={copy.views.monitor.quickControlsAria}
+                >
+                  <QuickDspControl
+                    label="AEC3"
+                    description={copy.views.monitor.aecQuickDescription}
+                    icon={<Waves size={15} />}
+                    enabled={quickDsp.aec.enabled}
+                    status={quickDspStatus(quickDsp.aec.enabled, copy)}
+                    controlsLocked={quickControlsLocked}
+                    onOpen={() => openProcessor("aec")}
+                    onToggle={(enabled) => updateAec({ enabled })}
+                    copy={copy}
                   />
-                  <div className="health-grid">
-                    <MetricReadout
-                      label={copy.status.processedBlocks}
-                      value={status.metrics.processedBlocks.toLocaleString(
-                        language,
-                      )}
-                    />
-                    <MetricReadout
-                      label={copy.status.deviceRestarts}
-                      value={status.metrics.deviceRestarts.toLocaleString(
-                        language,
-                      )}
-                    />
-                    <MetricReadout
-                      label={copy.status.outputQueue}
-                      value={`${status.metrics.outputQueueDepthMs.toFixed(1)} ms`}
-                      title={copy.status.outputQueueHelp}
-                    />
-                    <MetricReadout
-                      label={copy.status.audioAnomalies}
-                      value={audioAnomalyTotal(status.metrics).toLocaleString(
-                        language,
-                      )}
-                      title={copy.status.audioAnomaliesHelp}
-                    />
-                    <MetricReadout
-                      label={copy.status.dspP99}
-                      value={`${status.metrics.processingTimeP99Us.toFixed(0)} µs`}
-                      title={copy.status.dspP99Title(
-                        status.metrics.processingTimeMaxUs.toFixed(0),
-                        status.metrics.processingDeadlineMisses.toLocaleString(
-                          language,
-                        ),
-                      )}
-                    />
-                    <MetricReadout
-                      label={copy.status.deviceDiscontinuities}
-                      value={status.metrics.deviceDiscontinuities.toLocaleString(
-                        language,
-                      )}
-                      title={copy.status.deviceDiscontinuitiesHelp}
-                    />
-                  </div>
+                  <QuickDspControl
+                    label="RNNoise"
+                    description={copy.views.monitor.rnnoiseQuickDescription}
+                    icon={<AudioLines size={15} />}
+                    enabled={quickDsp.rnnoise.enabled}
+                    status={quickDspStatus(quickDsp.rnnoise.enabled, copy)}
+                    controlsLocked={quickControlsLocked}
+                    disabledReason={
+                      quickDsp.rnnoise.enabled && quickDsp.vadGate.enabled
+                        ? copy.views.monitor.rnnoiseRequiredByVad
+                        : undefined
+                    }
+                    onOpen={() => openProcessor("rnnoise")}
+                    onToggle={(enabled) => updateRnnoise({ enabled })}
+                    copy={copy}
+                  />
+                  <QuickDspControl
+                    label="AGC2"
+                    description={copy.views.monitor.agc2QuickDescription}
+                    icon={<Gauge size={15} />}
+                    enabled={quickDsp.agc2.enabled}
+                    status={quickDspStatus(quickDsp.agc2.enabled, copy)}
+                    controlsLocked={quickControlsLocked}
+                    onOpen={() => openProcessor("agc2")}
+                    onToggle={enableAgc2}
+                    copy={copy}
+                  />
+                  <QuickDspControl
+                    label="VAD Gate"
+                    description={copy.views.monitor.vadQuickDescription}
+                    icon={<Mic2 size={15} />}
+                    enabled={quickDsp.vadGate.enabled}
+                    status={quickDspStatus(quickDsp.vadGate.enabled, copy)}
+                    controlsLocked={quickControlsLocked}
+                    disabledReason={
+                      !quickDsp.vadGate.enabled && !quickDsp.rnnoise.enabled
+                        ? copy.views.monitor.vadRequiresRnnoise
+                        : undefined
+                    }
+                    onOpen={() => openProcessor("vad")}
+                    onToggle={(enabled) => updateVad({ enabled })}
+                    copy={copy}
+                  />
+                  <QuickDspControl
+                    label="Limiter"
+                    description={copy.views.monitor.limiterQuickDescription}
+                    icon={<ShieldCheck size={15} />}
+                    enabled
+                    status={copy.views.monitor.alwaysEnabled}
+                    locked
+                    controlsLocked={quickControlsLocked}
+                    onOpen={() => openProcessor("limiter")}
+                    copy={copy}
+                  />
                 </section>
-              </div>
+              </section>
             </div>
           </section>
 
@@ -1500,528 +1618,562 @@ function App() {
               icon={<Route size={18} />}
               eyebrow={copy.views.routing.eyebrow}
               title={copy.views.routing.title}
-              subtitle={copy.views.routing.subtitle}
             />
-            <div className="routing-view">
-              <section className="surface route-config-panel">
+            <div className="routing-view routing-bento-layout">
+              <section className="surface current-route-panel">
                 <PanelHeading
-                  icon={<Route size={16} />}
-                  title={copy.views.routing.configuration}
-                  subtitle={copy.views.routing.configurationSubtitle}
-                  trailing={
-                    <button
-                      className="icon-button"
-                      type="button"
-                      title={copy.routing.refresh}
-                      aria-label={copy.routing.refresh}
-                      onClick={refresh}
-                      disabled={busy}
-                    >
-                      <RefreshCw size={15} />
-                    </button>
-                  }
+                  icon={<Network size={16} />}
+                  title={copy.views.routing.active}
+                  subtitle={copy.views.routing.activeSubtitle}
                 />
-                <div className="routing-controls">
-                  <div
-                    className="playback-reference-configuration"
-                    id="playback-reference-configuration"
-                  >
-                    <Toggle
-                      label={copy.routing.followDefaultRender}
-                      help={copy.routing.followDefaultRenderHelp}
-                      checked={draft.followDefaultRender}
-                      disabled={controlsDisabled || !draft.dsp.aec.enabled}
-                      onChange={(checked) =>
-                        changeSettings((current) => ({
-                          ...current,
-                          followDefaultRender: checked,
-                          renderEndpointId: checked
-                            ? null
-                            : (current.renderEndpointId ??
-                              defaultRender?.id ??
-                              null),
-                        }))
-                      }
-                    />
-
-                    {!draft.followDefaultRender && (
-                      <SelectControl
-                        label={copy.routing.renderReference}
-                        help={copy.routing.renderReferenceHelp}
-                        value={draft.renderEndpointId ?? ""}
-                        disabled={controlsDisabled || !draft.dsp.aec.enabled}
-                        onChange={(value) =>
-                          changeSettings((current) => ({
-                            ...current,
-                            renderEndpointId: value || null,
-                          }))
-                        }
-                      >
-                        <option value="">{copy.routing.selectRender}</option>
-                        {draft.renderEndpointId &&
-                          !renderEndpoints.some(
-                            (endpoint) =>
-                              endpoint.id === draft.renderEndpointId,
-                          ) && (
-                            <option value={draft.renderEndpointId}>
-                              {copy.routing.savedRenderUnavailable}
-                            </option>
-                          )}
-                        {renderEndpoints.map((endpoint) => (
-                          <option key={endpoint.id} value={endpoint.id}>
-                            {endpoint.friendlyName}
-                          </option>
-                        ))}
-                      </SelectControl>
+                <div className="route-lines">
+                  <RouteLine
+                    icon={<Speaker size={14} />}
+                    label={copy.routing.render}
+                    value={routeName(
+                      status.activeRoute?.renderEndpointId,
+                      status.endpoints,
+                      status.activeRoute
+                        ? copy.routing.notInUse
+                        : copy.engineOutputs.inactive,
                     )}
-                  </div>
-
-                  <SelectControl
-                    label={copy.routing.captureInput}
-                    help={copy.routing.captureInputHelp}
-                    value={draft.captureEndpointId ?? ""}
-                    disabled={controlsDisabled}
-                    invalid={captureConfigurationIssue !== null}
-                    ariaDescribedBy={
-                      captureConfigurationIssue
-                        ? "physical-capture-required"
-                        : undefined
-                    }
-                    selectRef={captureSelectRef}
-                    onChange={(value) =>
-                      changeSettings((current) => ({
-                        ...current,
-                        captureEndpointId: value || null,
-                      }))
-                    }
-                  >
-                    <option value="" disabled={followDefaultCaptureBlocked}>
-                      {copy.routing.followDefaultCapture}
-                    </option>
-                    {draft.captureEndpointId &&
-                      !captureEndpoints.some(
-                        (endpoint) => endpoint.id === draft.captureEndpointId,
-                      ) && (
-                        <option value={draft.captureEndpointId}>
-                          {copy.routing.savedCaptureUnavailable}
-                        </option>
-                      )}
-                    {captureEndpoints.map((endpoint) => (
-                      <option key={endpoint.id} value={endpoint.id}>
-                        {endpoint.friendlyName}
-                      </option>
-                    ))}
-                  </SelectControl>
-
-                  {captureConfigurationIssue && (
-                    <button
-                      id="physical-capture-required"
-                      className="configuration-blocker"
-                      type="button"
-                      onClick={focusPhysicalCapture}
-                    >
-                      <AlertTriangle size={15} aria-hidden="true" />
-                      <span>
-                        <strong>{copy.routing.physicalCaptureRequired}</strong>
-                        <small>
-                          {copy.routing.physicalCaptureRequiredHelp(
-                            routeName(
-                              captureConfigurationIssue.virtualCaptureEndpointId ??
-                                undefined,
-                              status.endpoints,
-                            ),
-                          )}
-                        </small>
-                      </span>
-                      <ChevronRight size={15} aria-hidden="true" />
-                    </button>
-                  )}
-
-                  <SelectControl
-                    label={copy.routing.captureChannel}
-                    help={copy.routing.captureChannelHelp}
-                    value={
-                      draft.captureChannel == null
-                        ? "auto"
-                        : String(draft.captureChannel)
-                    }
-                    disabled={controlsDisabled}
-                    onChange={(value) =>
-                      changeSettings((current) => ({
-                        ...current,
-                        captureChannel: value === "auto" ? null : Number(value),
-                      }))
-                    }
-                  >
-                    <option value="auto">Auto</option>
-                    {draft.captureChannel != null &&
-                      draft.captureChannel >= 16 && (
-                        <option value={draft.captureChannel}>
-                          {copy.routing.savedChannel(draft.captureChannel + 1)}
-                        </option>
-                      )}
-                    {CAPTURE_CHANNEL_OPTIONS.map((channel) => (
-                      <option key={channel} value={channel}>
-                        Channel {channel + 1}
-                      </option>
-                    ))}
-                  </SelectControl>
-
-                  <div
-                    className="virtual-device-configuration"
-                    id="virtual-device-configuration"
-                  >
-                    <div className="field-heading">
-                      <ControlLabel
-                        label={copy.routing.virtualDeviceMode}
-                        help={copy.routing.virtualDeviceModeHelp}
-                      />
-                    </div>
-                    <div className="segmented-control virtual-mode-control">
-                      <button
-                        type="button"
-                        aria-pressed={effectiveVirtualMode === "vbCable"}
-                        disabled={controlsDisabled || !vbCablePair}
-                        onClick={() => selectVirtualMode("vbCable")}
-                      >
-                        {copy.routing.vbCableMode}
-                      </button>
-                      <button
-                        type="button"
-                        aria-pressed={effectiveVirtualMode === "custom"}
-                        disabled={controlsDisabled}
-                        onClick={() => selectVirtualMode("custom")}
-                      >
-                        {copy.routing.customVirtualMode}
-                      </button>
-                    </div>
-
-                    {(customPairOffline || !vbCablePair) && (
-                      <div
-                        className={`virtual-device-notice${
-                          customPairTrusted || knownVbCableOffline
-                            ? " is-advisory"
-                            : ""
-                        }`}
-                        role={
-                          customPairTrusted || knownVbCableOffline
-                            ? "status"
-                            : "alert"
-                        }
-                      >
-                        <AlertTriangle size={17} aria-hidden="true" />
-                        <div>
-                          <strong>
-                            {knownVbCableOffline
-                              ? copy.routing.vbCableWaiting
-                              : customPairOffline
-                                ? copy.routing.customDeviceWaiting
-                                : customPairTrusted
-                                  ? copy.routing.customDeviceActive
-                                  : copy.routing.vbCableMissing}
-                          </strong>
-                          <p>
-                            {knownVbCableOffline
-                              ? copy.routing.vbCableWaitingHelp
-                              : customPairOffline
-                                ? copy.routing.customDeviceWaitingHelp
-                                : customPairTrusted
-                                  ? copy.routing.customDeviceActiveHelp
-                                  : copy.routing.vbCableMissingHelp}
-                          </p>
-                          {!customPairTrusted && !knownVbCableOffline && (
-                            <ol>
-                              <li>{copy.routing.vbCableInstallStepDownload}</li>
-                              <li>{copy.routing.vbCableInstallStepAdmin}</li>
-                              <li>{copy.routing.vbCableInstallStepRefresh}</li>
-                            </ol>
-                          )}
-                          <div className="inline-actions">
-                            {!customPairTrusted && !knownVbCableOffline && (
-                              <button
-                                type="button"
-                                onClick={openVbCableDownload}
-                              >
-                                <ExternalLink size={14} aria-hidden="true" />
-                                {copy.routing.openVbCableDownload}
-                              </button>
-                            )}
-                            <button
-                              type="button"
-                              onClick={copyDeviceDiagnostics}
-                            >
-                              {diagnosticsCopied ? (
-                                <CircleCheck size={14} aria-hidden="true" />
-                              ) : (
-                                <Copy size={14} aria-hidden="true" />
-                              )}
-                              {diagnosticsCopied
-                                ? copy.routing.diagnosticsCopied
-                                : copy.routing.copyDeviceDiagnostics}
-                            </button>
-                          </div>
-                        </div>
-                      </div>
+                  />
+                  <RouteLine
+                    icon={<Mic2 size={14} />}
+                    label={copy.routing.windowsDefaultCapture}
+                    value={defaultCapture?.friendlyName ?? "-"}
+                  />
+                  <RouteLine
+                    icon={<Mic2 size={14} />}
+                    label={copy.routing.xmicPhysicalCapture}
+                    value={activeCaptureLabel}
+                  />
+                  <RouteLine
+                    icon={<Cable size={14} />}
+                    label={copy.routing.output}
+                    value={routeName(
+                      status.activeRoute?.outputEndpointId,
+                      status.endpoints,
+                      copy.engineOutputs.inactive,
                     )}
-
-                    {effectiveVirtualMode === "vbCable" ? (
-                      <div
-                        className={`detected-device-pair${vbCablePair ? "" : " is-waiting"}`}
-                      >
-                        {vbCablePair ? (
-                          <CircleCheck size={17} aria-hidden="true" />
-                        ) : (
-                          <AlertTriangle size={17} aria-hidden="true" />
-                        )}
-                        <div>
-                          <strong>
-                            {vbCablePair
-                              ? copy.routing.vbCableDetected
-                              : copy.routing.vbCableWaiting}
-                          </strong>
-                          <span>
-                            {vbCablePair
-                              ? vbCablePair.render.friendlyName
-                              : (draft.outputEndpointId ??
-                                copy.routing.savedOutputUnavailable)}
-                            <ArrowRight size={13} aria-hidden="true" />
-                            {vbCablePair
-                              ? vbCablePair.capture.friendlyName
-                              : (draft.virtualCaptureEndpointId ??
-                                copy.routing.savedVirtualCaptureUnavailable)}
-                          </span>
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="custom-virtual-pair">
-                        <SelectControl
-                          label={copy.routing.customVirtualRender}
-                          help={copy.routing.customVirtualRenderHelp}
-                          value={
-                            draft.virtualDeviceMode === "custom"
-                              ? (draft.outputEndpointId ?? "")
-                              : ""
-                          }
-                          disabled={controlsDisabled}
-                          invalid={
-                            virtualConfigurationIssue?.reason ===
-                            "customPairIncomplete"
-                          }
-                          selectRef={virtualOutputSelectRef}
-                          onChange={(value) => {
-                            const output = renderEndpoints.find(
-                              (endpoint) => endpoint.id === value,
-                            );
-                            const inferredCapture = output
-                              ? inferPairedCapture(
-                                  output,
-                                  customCaptureEndpoints,
-                                )
-                              : undefined;
-                            changeSettings((current) => ({
-                              ...current,
-                              virtualDeviceMode: "custom",
-                              outputEndpointId: value || null,
-                              virtualCaptureEndpointId:
-                                inferredCapture?.id ??
-                                (current.virtualDeviceMode === "custom"
-                                  ? current.virtualCaptureEndpointId
-                                  : null),
-                            }));
-                          }}
-                        >
-                          <option value="">
-                            {copy.routing.selectCustomVirtualRender}
-                          </option>
-                          {draft.virtualDeviceMode === "custom" &&
-                            draft.outputEndpointId &&
-                            !renderEndpoints.some(
-                              (endpoint) =>
-                                endpoint.id === draft.outputEndpointId,
-                            ) && (
-                              <option value={draft.outputEndpointId}>
-                                {copy.routing.savedOutputUnavailable}
-                              </option>
-                            )}
-                          {otherOutputs.map((endpoint) => (
-                            <option key={endpoint.id} value={endpoint.id}>
-                              {endpoint.friendlyName}
-                            </option>
-                          ))}
-                        </SelectControl>
-
-                        <SelectControl
-                          label={copy.routing.customVirtualCapture}
-                          help={copy.routing.customVirtualCaptureHelp}
-                          value={
-                            draft.virtualDeviceMode === "custom"
-                              ? (draft.virtualCaptureEndpointId ?? "")
-                              : ""
-                          }
-                          disabled={controlsDisabled}
-                          invalid={
-                            virtualConfigurationIssue?.reason ===
-                            "customPairIncomplete"
-                          }
-                          onChange={(value) =>
-                            changeSettings((current) => ({
-                              ...current,
-                              virtualDeviceMode: "custom",
-                              virtualCaptureEndpointId: value || null,
-                            }))
-                          }
-                        >
-                          <option value="">
-                            {copy.routing.selectCustomVirtualCapture}
-                          </option>
-                          {draft.virtualDeviceMode === "custom" &&
-                            draft.virtualCaptureEndpointId &&
-                            !allCaptureEndpoints.some(
-                              (endpoint) =>
-                                endpoint.id === draft.virtualCaptureEndpointId,
-                            ) && (
-                              <option value={draft.virtualCaptureEndpointId}>
-                                {copy.routing.savedVirtualCaptureUnavailable}
-                              </option>
-                            )}
-                          {customCaptureEndpoints.map((endpoint) => (
-                            <option key={endpoint.id} value={endpoint.id}>
-                              {endpoint.friendlyName}
-                            </option>
-                          ))}
-                        </SelectControl>
-
-                        <label
-                          className={`custom-pair-confirmation${
-                            customPairTrusted ? " is-confirmed" : ""
-                          }`}
-                        >
-                          <input
-                            type="checkbox"
-                            checked={customPairTrusted}
-                            disabled={
-                              busy ||
-                              !draft.outputEndpointId ||
-                              !draft.virtualCaptureEndpointId
-                            }
-                            onChange={(event) => {
-                              if (event.target.checked) {
-                                confirmCustomPair();
-                                return;
-                              }
-                              const pair = draft.trustedVirtualAudioPairs.find(
-                                (candidate) =>
-                                  candidate.renderEndpointId ===
-                                    draft.outputEndpointId &&
-                                  candidate.captureEndpointId ===
-                                    draft.virtualCaptureEndpointId,
-                              );
-                              if (pair) void revokeTrustedPair(pair);
-                            }}
-                          />
-                          <span>
-                            <strong>{copy.routing.confirmCustomPair}</strong>
-                            <small>{copy.routing.confirmCustomPairHelp}</small>
-                          </span>
-                        </label>
-
-                        {virtualConfigurationIssue && (
-                          <div
-                            className="virtual-configuration-error"
-                            role="alert"
-                          >
-                            <AlertTriangle size={15} aria-hidden="true" />
-                            <span>
-                              {virtualConfigurationIssue.reason ===
-                              "customPairUnconfirmed"
-                                ? copy.routing.customPairUnconfirmed
-                                : copy.routing.customPairIncomplete}
-                            </span>
-                          </div>
-                        )}
-
-                        {draft.trustedVirtualAudioPairs.length > 0 && (
-                          <details className="trusted-device-manager">
-                            <summary>
-                              {copy.routing.manageTrustedDevices} ·{" "}
-                              {draft.trustedVirtualAudioPairs.length}
-                            </summary>
-                            <div className="trusted-device-list">
-                              {draft.trustedVirtualAudioPairs.map((pair) => (
-                                <div
-                                  className="trusted-device-row"
-                                  key={`${pair.renderEndpointId}:${pair.captureEndpointId}`}
-                                >
-                                  <span>
-                                    <strong>{pair.renderName}</strong>
-                                    <small>{pair.captureName}</small>
-                                  </span>
-                                  <button
-                                    className="icon-button"
-                                    type="button"
-                                    title={copy.routing.revokeTrustedDevice}
-                                    aria-label={
-                                      copy.routing.revokeTrustedDevice
-                                    }
-                                    disabled={busy}
-                                    onClick={() => void revokeTrustedPair(pair)}
-                                  >
-                                    <Trash2 size={14} aria-hidden="true" />
-                                  </button>
-                                </div>
-                              ))}
-                            </div>
-                          </details>
-                        )}
-                      </div>
-                    )}
-                  </div>
+                  />
+                  <RouteLine
+                    icon={<SlidersHorizontal size={14} />}
+                    label={copy.routing.dspSettings}
+                    value={appliedDspSettingsLabel}
+                  />
                 </div>
               </section>
 
-              <div className="routing-side-stack">
-                <section className="surface current-route-panel">
+              <div className="routing-bento-grid">
+                <section className="surface route-config-panel">
                   <PanelHeading
-                    icon={<Network size={16} />}
-                    title={copy.views.routing.active}
-                    subtitle={copy.views.routing.activeSubtitle}
+                    icon={<Route size={16} />}
+                    title={copy.views.routing.configuration}
+                    subtitle={copy.views.routing.configurationSubtitle}
+                    trailing={
+                      <button
+                        className="icon-button"
+                        type="button"
+                        title={copy.routing.refresh}
+                        aria-label={copy.routing.refresh}
+                        onClick={refresh}
+                        disabled={busy}
+                      >
+                        <RefreshCw size={15} />
+                      </button>
+                    }
                   />
-                  <div className="route-lines">
-                    <RouteLine
-                      icon={<Speaker size={14} />}
-                      label={copy.routing.render}
-                      value={routeName(
-                        status.activeRoute?.renderEndpointId,
-                        status.endpoints,
-                        status.activeRoute
-                          ? copy.routing.notInUse
-                          : copy.engineOutputs.inactive,
+                  <div className="routing-controls">
+                    <div
+                      className="playback-reference-configuration"
+                      id="playback-reference-configuration"
+                    >
+                      <Toggle
+                        label={copy.routing.followDefaultRender}
+                        help={copy.routing.followDefaultRenderHelp}
+                        checked={draft.followDefaultRender}
+                        disabled={controlsDisabled || !draft.dsp.aec.enabled}
+                        onChange={(checked) =>
+                          changeSettings((current) => ({
+                            ...current,
+                            followDefaultRender: checked,
+                            renderEndpointId: checked
+                              ? null
+                              : (current.renderEndpointId ??
+                                defaultRender?.id ??
+                                null),
+                          }))
+                        }
+                      />
+
+                      {!draft.followDefaultRender && (
+                        <SelectControl
+                          label={copy.routing.renderReference}
+                          help={copy.routing.renderReferenceHelp}
+                          value={draft.renderEndpointId ?? ""}
+                          disabled={controlsDisabled || !draft.dsp.aec.enabled}
+                          onChange={(value) =>
+                            changeSettings((current) => ({
+                              ...current,
+                              renderEndpointId: value || null,
+                            }))
+                          }
+                        >
+                          <option value="">{copy.routing.selectRender}</option>
+                          {draft.renderEndpointId &&
+                            !renderEndpoints.some(
+                              (endpoint) =>
+                                endpoint.id === draft.renderEndpointId,
+                            ) && (
+                              <option value={draft.renderEndpointId}>
+                                {copy.routing.savedRenderUnavailable}
+                              </option>
+                            )}
+                          {renderEndpoints.map((endpoint) => (
+                            <option key={endpoint.id} value={endpoint.id}>
+                              {endpoint.friendlyName}
+                            </option>
+                          ))}
+                        </SelectControl>
                       )}
+                    </div>
+
+                    <SelectControl
+                      label={copy.routing.captureInput}
+                      help={copy.routing.captureInputHelp}
+                      value={draft.captureEndpointId ?? ""}
+                      disabled={controlsDisabled}
+                      invalid={captureConfigurationIssue !== null}
+                      ariaDescribedBy={
+                        captureConfigurationIssue
+                          ? "physical-capture-required"
+                          : undefined
+                      }
+                      selectRef={captureSelectRef}
+                      onChange={(value) =>
+                        changeSettings((current) => ({
+                          ...current,
+                          captureEndpointId: value || null,
+                        }))
+                      }
+                    >
+                      <option value="" disabled={followDefaultCaptureBlocked}>
+                        {copy.routing.followDefaultCapture}
+                      </option>
+                      {draft.captureEndpointId &&
+                        !captureEndpoints.some(
+                          (endpoint) => endpoint.id === draft.captureEndpointId,
+                        ) && (
+                          <option value={draft.captureEndpointId}>
+                            {copy.routing.savedCaptureUnavailable}
+                          </option>
+                        )}
+                      {captureEndpoints.map((endpoint) => (
+                        <option key={endpoint.id} value={endpoint.id}>
+                          {endpoint.friendlyName}
+                        </option>
+                      ))}
+                    </SelectControl>
+
+                    {captureConfigurationIssue && (
+                      <button
+                        id="physical-capture-required"
+                        className="configuration-blocker"
+                        type="button"
+                        onClick={focusPhysicalCapture}
+                      >
+                        <AlertTriangle size={15} aria-hidden="true" />
+                        <span>
+                          <strong>
+                            {copy.routing.physicalCaptureRequired}
+                          </strong>
+                          <small>
+                            {copy.routing.physicalCaptureRequiredHelp(
+                              routeName(
+                                captureConfigurationIssue.virtualCaptureEndpointId ??
+                                  undefined,
+                                status.endpoints,
+                              ),
+                            )}
+                          </small>
+                        </span>
+                        <ChevronRight size={15} aria-hidden="true" />
+                      </button>
+                    )}
+
+                    <SelectControl
+                      label={copy.routing.captureChannel}
+                      help={copy.routing.captureChannelHelp}
+                      value={
+                        draft.captureChannel == null
+                          ? "auto"
+                          : String(draft.captureChannel)
+                      }
+                      disabled={controlsDisabled}
+                      onChange={(value) =>
+                        changeSettings((current) => ({
+                          ...current,
+                          captureChannel:
+                            value === "auto" ? null : Number(value),
+                        }))
+                      }
+                    >
+                      <option value="auto">Auto</option>
+                      {draft.captureChannel != null &&
+                        draft.captureChannel >= 16 && (
+                          <option value={draft.captureChannel}>
+                            {copy.routing.savedChannel(
+                              draft.captureChannel + 1,
+                            )}
+                          </option>
+                        )}
+                      {CAPTURE_CHANNEL_OPTIONS.map((channel) => (
+                        <option key={channel} value={channel}>
+                          Channel {channel + 1}
+                        </option>
+                      ))}
+                    </SelectControl>
+
+                    <MicrophoneGainControl
+                      value={draft.dsp.limiter.gainDb ?? 0}
+                      disabled={controlsDisabled}
+                      copy={copy.dsp.limiter}
+                      onChange={(gainDb) => updateLimiter({ gainDb })}
                     />
-                    <RouteLine
-                      icon={<Mic2 size={14} />}
-                      label={copy.routing.windowsDefaultCapture}
-                      value={defaultCapture?.friendlyName ?? "-"}
-                    />
-                    <RouteLine
-                      icon={<Mic2 size={14} />}
-                      label={copy.routing.xmicPhysicalCapture}
-                      value={activeCaptureLabel}
-                    />
-                    <RouteLine
-                      icon={<Cable size={14} />}
-                      label={copy.routing.output}
-                      value={routeName(
-                        status.activeRoute?.outputEndpointId,
-                        status.endpoints,
-                        copy.engineOutputs.inactive,
+                  </div>
+                </section>
+
+                <section className="surface">
+                  <PanelHeading
+                    icon={<Cable size={16} />}
+                    title={copy.views.routing.virtualBridge}
+                    subtitle={copy.views.routing.virtualBridgeSubtitle}
+                  />
+                  <div className="routing-controls">
+                    <div
+                      className="virtual-device-configuration"
+                      id="virtual-device-configuration"
+                    >
+                      <div className="field-heading">
+                        <ControlLabel
+                          label={copy.routing.virtualDeviceMode}
+                          help={copy.routing.virtualDeviceModeHelp}
+                        />
+                      </div>
+                      <div className="segmented-control virtual-mode-control">
+                        <button
+                          type="button"
+                          aria-pressed={effectiveVirtualMode === "vbCable"}
+                          disabled={controlsDisabled || !vbCablePair}
+                          onClick={() => selectVirtualMode("vbCable")}
+                        >
+                          {copy.routing.vbCableMode}
+                        </button>
+                        <button
+                          type="button"
+                          aria-pressed={effectiveVirtualMode === "custom"}
+                          disabled={controlsDisabled}
+                          onClick={() => selectVirtualMode("custom")}
+                        >
+                          {copy.routing.customVirtualMode}
+                        </button>
+                      </div>
+
+                      {(customPairOffline || !vbCablePair) && (
+                        <div
+                          className={`virtual-device-notice${
+                            customPairTrusted || knownVbCableOffline
+                              ? " is-advisory"
+                              : ""
+                          }`}
+                          role={
+                            customPairTrusted || knownVbCableOffline
+                              ? "status"
+                              : "alert"
+                          }
+                        >
+                          <AlertTriangle size={17} aria-hidden="true" />
+                          <div>
+                            <strong>
+                              {knownVbCableOffline
+                                ? copy.routing.vbCableWaiting
+                                : customPairOffline
+                                  ? copy.routing.customDeviceWaiting
+                                  : customPairTrusted
+                                    ? copy.routing.customDeviceActive
+                                    : copy.routing.vbCableMissing}
+                            </strong>
+                            <p>
+                              {knownVbCableOffline
+                                ? copy.routing.vbCableWaitingHelp
+                                : customPairOffline
+                                  ? copy.routing.customDeviceWaitingHelp
+                                  : customPairTrusted
+                                    ? copy.routing.customDeviceActiveHelp
+                                    : copy.routing.vbCableMissingHelp}
+                            </p>
+                            {!customPairTrusted && !knownVbCableOffline && (
+                              <ol>
+                                <li>
+                                  {copy.routing.vbCableInstallStepDownload}
+                                </li>
+                                <li>{copy.routing.vbCableInstallStepAdmin}</li>
+                                <li>
+                                  {copy.routing.vbCableInstallStepRefresh}
+                                </li>
+                              </ol>
+                            )}
+                            <div className="inline-actions">
+                              {!customPairTrusted && !knownVbCableOffline && (
+                                <button
+                                  type="button"
+                                  onClick={openVbCableDownload}
+                                >
+                                  <ExternalLink size={14} aria-hidden="true" />
+                                  {copy.routing.openVbCableDownload}
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                onClick={copyDeviceDiagnostics}
+                              >
+                                {diagnosticsCopied ? (
+                                  <CircleCheck size={14} aria-hidden="true" />
+                                ) : (
+                                  <Copy size={14} aria-hidden="true" />
+                                )}
+                                {diagnosticsCopied
+                                  ? copy.routing.diagnosticsCopied
+                                  : copy.routing.copyDeviceDiagnostics}
+                              </button>
+                            </div>
+                          </div>
+                        </div>
                       )}
-                    />
-                    <RouteLine
-                      icon={<SlidersHorizontal size={14} />}
-                      label={copy.routing.dspSettings}
-                      value={appliedDspSettingsLabel}
-                    />
+
+                      {effectiveVirtualMode === "vbCable" ? (
+                        <div
+                          className={`detected-device-pair${vbCablePair ? "" : " is-waiting"}`}
+                        >
+                          {vbCablePair ? (
+                            <CircleCheck size={17} aria-hidden="true" />
+                          ) : (
+                            <AlertTriangle size={17} aria-hidden="true" />
+                          )}
+                          <div>
+                            <strong>
+                              {vbCablePair
+                                ? copy.routing.vbCableDetected
+                                : copy.routing.vbCableWaiting}
+                            </strong>
+                            <span>
+                              {vbCablePair
+                                ? vbCablePair.render.friendlyName
+                                : (draft.outputEndpointId ??
+                                  copy.routing.savedOutputUnavailable)}
+                              <ArrowRight size={13} aria-hidden="true" />
+                              {vbCablePair
+                                ? vbCablePair.capture.friendlyName
+                                : (draft.virtualCaptureEndpointId ??
+                                  copy.routing.savedVirtualCaptureUnavailable)}
+                            </span>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="custom-virtual-pair">
+                          <SelectControl
+                            label={copy.routing.customVirtualRender}
+                            help={copy.routing.customVirtualRenderHelp}
+                            value={
+                              draft.virtualDeviceMode === "custom"
+                                ? (draft.outputEndpointId ?? "")
+                                : ""
+                            }
+                            disabled={controlsDisabled}
+                            invalid={
+                              virtualConfigurationIssue?.reason ===
+                              "customPairIncomplete"
+                            }
+                            selectRef={virtualOutputSelectRef}
+                            onChange={(value) => {
+                              const output = renderEndpoints.find(
+                                (endpoint) => endpoint.id === value,
+                              );
+                              const inferredCapture = output
+                                ? inferPairedCapture(
+                                    output,
+                                    customCaptureEndpoints,
+                                  )
+                                : undefined;
+                              changeSettings((current) => ({
+                                ...current,
+                                virtualDeviceMode: "custom",
+                                outputEndpointId: value || null,
+                                virtualCaptureEndpointId:
+                                  inferredCapture?.id ??
+                                  (current.virtualDeviceMode === "custom"
+                                    ? current.virtualCaptureEndpointId
+                                    : null),
+                              }));
+                            }}
+                          >
+                            <option value="">
+                              {copy.routing.selectCustomVirtualRender}
+                            </option>
+                            {draft.virtualDeviceMode === "custom" &&
+                              draft.outputEndpointId &&
+                              !renderEndpoints.some(
+                                (endpoint) =>
+                                  endpoint.id === draft.outputEndpointId,
+                              ) && (
+                                <option value={draft.outputEndpointId}>
+                                  {copy.routing.savedOutputUnavailable}
+                                </option>
+                              )}
+                            {otherOutputs.map((endpoint) => (
+                              <option key={endpoint.id} value={endpoint.id}>
+                                {endpoint.friendlyName}
+                              </option>
+                            ))}
+                          </SelectControl>
+
+                          <SelectControl
+                            label={copy.routing.customVirtualCapture}
+                            help={copy.routing.customVirtualCaptureHelp}
+                            value={
+                              draft.virtualDeviceMode === "custom"
+                                ? (draft.virtualCaptureEndpointId ?? "")
+                                : ""
+                            }
+                            disabled={controlsDisabled}
+                            invalid={
+                              virtualConfigurationIssue?.reason ===
+                              "customPairIncomplete"
+                            }
+                            onChange={(value) =>
+                              changeSettings((current) => ({
+                                ...current,
+                                virtualDeviceMode: "custom",
+                                virtualCaptureEndpointId: value || null,
+                              }))
+                            }
+                          >
+                            <option value="">
+                              {copy.routing.selectCustomVirtualCapture}
+                            </option>
+                            {draft.virtualDeviceMode === "custom" &&
+                              draft.virtualCaptureEndpointId &&
+                              !allCaptureEndpoints.some(
+                                (endpoint) =>
+                                  endpoint.id ===
+                                  draft.virtualCaptureEndpointId,
+                              ) && (
+                                <option value={draft.virtualCaptureEndpointId}>
+                                  {copy.routing.savedVirtualCaptureUnavailable}
+                                </option>
+                              )}
+                            {customCaptureEndpoints.map((endpoint) => (
+                              <option key={endpoint.id} value={endpoint.id}>
+                                {endpoint.friendlyName}
+                              </option>
+                            ))}
+                          </SelectControl>
+
+                          <label
+                            className={`custom-pair-confirmation${
+                              customPairTrusted ? " is-confirmed" : ""
+                            }`}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={customPairTrusted}
+                              disabled={
+                                busy ||
+                                !draft.outputEndpointId ||
+                                !draft.virtualCaptureEndpointId
+                              }
+                              onChange={(event) => {
+                                if (event.target.checked) {
+                                  confirmCustomPair();
+                                  return;
+                                }
+                                const pair =
+                                  draft.trustedVirtualAudioPairs.find(
+                                    (candidate) =>
+                                      candidate.renderEndpointId ===
+                                        draft.outputEndpointId &&
+                                      candidate.captureEndpointId ===
+                                        draft.virtualCaptureEndpointId,
+                                  );
+                                if (pair) void revokeTrustedPair(pair);
+                              }}
+                            />
+                            <span>
+                              <strong>{copy.routing.confirmCustomPair}</strong>
+                              <small>
+                                {copy.routing.confirmCustomPairHelp}
+                              </small>
+                            </span>
+                          </label>
+
+                          {virtualConfigurationIssue && (
+                            <div
+                              className="virtual-configuration-error"
+                              role="alert"
+                            >
+                              <AlertTriangle size={15} aria-hidden="true" />
+                              <span>
+                                {virtualConfigurationIssue.reason ===
+                                "customPairUnconfirmed"
+                                  ? copy.routing.customPairUnconfirmed
+                                  : copy.routing.customPairIncomplete}
+                              </span>
+                            </div>
+                          )}
+
+                          {draft.trustedVirtualAudioPairs.length > 0 && (
+                            <details className="trusted-device-manager">
+                              <summary>
+                                {copy.routing.manageTrustedDevices} ·{" "}
+                                {draft.trustedVirtualAudioPairs.length}
+                              </summary>
+                              <div className="trusted-device-list">
+                                {draft.trustedVirtualAudioPairs.map((pair) => (
+                                  <div
+                                    className="trusted-device-row"
+                                    key={`${pair.renderEndpointId}:${pair.captureEndpointId}`}
+                                  >
+                                    <span>
+                                      <strong title={pair.renderName}>
+                                        {pair.renderName}
+                                      </strong>
+                                      <small title={pair.captureName}>
+                                        {pair.captureName}
+                                      </small>
+                                    </span>
+                                    <button
+                                      className="icon-button"
+                                      type="button"
+                                      title={copy.routing.revokeTrustedDevice}
+                                      aria-label={
+                                        copy.routing.revokeTrustedDevice
+                                      }
+                                      disabled={busy}
+                                      onClick={() =>
+                                        void revokeTrustedPair(pair)
+                                      }
+                                    >
+                                      <Trash2 size={14} aria-hidden="true" />
+                                    </button>
+                                  </div>
+                                ))}
+                              </div>
+                            </details>
+                          )}
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </section>
 
@@ -2130,7 +2282,6 @@ function App() {
               icon={<SlidersHorizontal size={18} />}
               eyebrow={copy.views.processing.eyebrow}
               title={copy.views.processing.title}
-              subtitle={copy.views.processing.subtitle}
             />
             <div className="processing-view">
               <div
@@ -2295,7 +2446,9 @@ function App() {
                         </div>
                       </div>
                       <details className="diagnostics-panel">
-                        <summary>
+                        <summary
+                          title={`${copy.views.processing.diagnostics} · ${copy.views.processing.diagnosticsSubtitle}`}
+                        >
                           <span className="summary-icon">
                             <Activity size={15} />
                           </span>
@@ -2528,32 +2681,42 @@ function App() {
                   )}
 
                   {activeDspStage === "limiter" && (
-                    <div className="parameter-grid limiter-parameters">
-                      <NumberControl
-                        label={copy.dsp.limiter.ceiling}
-                        help={copy.dsp.limiter.ceilingHelp}
-                        value={draft.dsp.limiter.ceilingDbfs}
-                        minimum={-30}
-                        maximum={0}
-                        step={0.5}
-                        suffix="dBFS"
-                        disabled={controlsDisabled}
-                        onChange={(ceilingDbfs) =>
-                          updateLimiter({ ceilingDbfs })
-                        }
-                      />
-                      <NumberControl
-                        label={copy.dsp.limiter.release}
-                        help={copy.dsp.limiter.releaseHelp}
-                        value={draft.dsp.limiter.releaseMs}
-                        minimum={0.1}
-                        maximum={10000}
-                        step={1}
-                        suffix="ms"
-                        disabled={controlsDisabled}
-                        onChange={(releaseMs) => updateLimiter({ releaseMs })}
-                      />
-                    </div>
+                    <>
+                      <div className="focused-control">
+                        <MicrophoneGainControl
+                          value={draft.dsp.limiter.gainDb ?? 0}
+                          disabled={controlsDisabled}
+                          copy={copy.dsp.limiter}
+                          onChange={(gainDb) => updateLimiter({ gainDb })}
+                        />
+                      </div>
+                      <div className="parameter-grid">
+                        <NumberControl
+                          label={copy.dsp.limiter.ceiling}
+                          help={copy.dsp.limiter.ceilingHelp}
+                          value={draft.dsp.limiter.ceilingDbfs}
+                          minimum={-30}
+                          maximum={0}
+                          step={0.5}
+                          suffix="dBFS"
+                          disabled={controlsDisabled}
+                          onChange={(ceilingDbfs) =>
+                            updateLimiter({ ceilingDbfs })
+                          }
+                        />
+                        <NumberControl
+                          label={copy.dsp.limiter.release}
+                          help={copy.dsp.limiter.releaseHelp}
+                          value={draft.dsp.limiter.releaseMs}
+                          minimum={0.1}
+                          maximum={10000}
+                          step={1}
+                          suffix="ms"
+                          disabled={controlsDisabled}
+                          onChange={(releaseMs) => updateLimiter({ releaseMs })}
+                        />
+                      </div>
+                    </>
                   )}
                 </div>
               </section>
@@ -2570,12 +2733,12 @@ function App() {
               icon={<Info size={18} />}
               eyebrow={copy.views.about.eyebrow}
               title={copy.views.about.title}
-              subtitle={copy.views.about.subtitle}
             />
             <AboutView
               active={activeView === "about"}
               version={appVersion}
               copy={copy.about}
+              engineStatus={status}
             />
           </section>
         </main>
@@ -2619,13 +2782,11 @@ function ViewSectionHeading({
   icon,
   eyebrow,
   title,
-  subtitle,
 }: {
   id: string;
   icon: ReactNode;
   eyebrow: string;
   title: string;
-  subtitle: string;
 }) {
   return (
     <header className="view-section-heading">
@@ -2633,7 +2794,6 @@ function ViewSectionHeading({
       <span className="view-section-copy">
         <small>{eyebrow}</small>
         <h2 id={id}>{title}</h2>
-        <p>{subtitle}</p>
       </span>
     </header>
   );
@@ -2680,8 +2840,8 @@ function PanelHeading({
     <div className="panel-heading">
       <span className="panel-icon">{icon}</span>
       <span className="panel-title">
-        <strong>{title}</strong>
-        <small>{subtitle}</small>
+        <strong title={title}>{title}</strong>
+        <small title={subtitle}>{subtitle}</small>
       </span>
       {trailing && <span className="panel-trailing">{trailing}</span>}
     </div>
@@ -2698,7 +2858,7 @@ function SignalReadout({
   tone: "input" | "output" | "vad";
 }) {
   return (
-    <div className="signal-readout" data-tone={tone}>
+    <div className="signal-readout" data-tone={tone} title={`${label}: ${value}`}>
       <span>{label}</span>
       <strong>{value}</strong>
     </div>
@@ -2707,7 +2867,7 @@ function SignalReadout({
 
 function SnapshotItem({ label, value }: { label: string; value: string }) {
   return (
-    <div className="snapshot-item">
+    <div className="snapshot-item" title={`${label}: ${value}`}>
       <span>{label}</span>
       <strong>{value}</strong>
     </div>
@@ -2729,7 +2889,7 @@ function RouteNode({
     <div className="route-node" data-tone={tone}>
       <span className="route-node-icon">{icon}</span>
       <span className="route-node-copy">
-        <small>{label}</small>
+        <small title={label}>{label}</small>
         <strong title={value}>{value}</strong>
       </span>
     </div>
@@ -2774,6 +2934,7 @@ function QuickDspControl({
         className="dsp-module-open"
         type="button"
         aria-label={copy.views.monitor.openModule(label)}
+        title={`${label} · ${description}`}
         onClick={onOpen}
       >
         <span className="dsp-module-icon">{icon}</span>
@@ -2784,7 +2945,9 @@ function QuickDspControl({
         <ChevronRight size={13} aria-hidden="true" />
       </button>
       <span className="dsp-module-action">
-        <small className="dsp-module-status">{status}</small>
+        <small className="dsp-module-status" title={status}>
+          {status}
+        </small>
         {locked ? (
           <span
             className="dsp-module-lock"
@@ -2816,6 +2979,28 @@ function QuickDspControl({
   );
 }
 
+function SidebarMeterRow({
+  kind,
+  label,
+  fillPercent,
+  valueText,
+}: {
+  kind: "in" | "out";
+  label: string;
+  fillPercent: number;
+  valueText: string;
+}) {
+  return (
+    <div className="sidebar-meter-row" data-meter={kind}>
+      <span>{label}</span>
+      <span className="sidebar-meter-bar" aria-hidden="true">
+        <i style={{ width: `${fillPercent}%` }} />
+      </span>
+      <span>{valueText}</span>
+    </div>
+  );
+}
+
 function MetricReadout({
   label,
   value,
@@ -2826,7 +3011,7 @@ function MetricReadout({
   title?: string;
 }) {
   return (
-    <div className="metric-readout" title={title}>
+    <div className="metric-readout" title={title ?? `${label}: ${value}`}>
       <span>{label}</span>
       <strong>{value}</strong>
     </div>
@@ -2873,8 +3058,10 @@ function ProcessorTab({
       role="tab"
       aria-selected={active}
       data-enabled={enabled}
+      title={`${label} · ${subtitle}`}
       onClick={onClick}
     >
+      <span className="processor-index-badge" aria-hidden="true" />
       <span className="processor-tab-icon">{icon}</span>
       <span className="processor-tab-copy">
         <strong>{label}</strong>
@@ -2896,161 +3083,176 @@ function AecDiagnostics({
 }) {
   return (
     <section
-      className="diagnostics-grid"
+      className="diagnostics-groups-wrap"
       aria-label={copy.dsp.aec.diagnosticsAria}
     >
-      <DiagnosticCell
-        label={copy.dsp.diagnostics.pipelineLatency}
-        value={formatOptionalMetric(metrics.pipelineLatencyMs, "ms")}
-        title={copy.dsp.diagnostics.pipelineLatencyHelp}
-      />
-      <DiagnosticCell
-        label={copy.dsp.diagnostics.captureLatency}
-        value={formatOptionalMetric(metrics.captureLatencyMs, "ms", 1)}
-        title={copy.dsp.diagnostics.captureLatencyHelp}
-      />
-      <DiagnosticCell
-        label={copy.dsp.diagnostics.dspLatency}
-        value={formatOptionalMetric(metrics.dspLatencyMs, "ms")}
-        title={copy.dsp.diagnostics.dspLatencyHelp}
-      />
-      <DiagnosticCell
-        label={copy.dsp.diagnostics.outputLatency}
-        value={formatOptionalMetric(metrics.outputLatencyMs, "ms", 1)}
-        title={copy.dsp.diagnostics.outputLatencyHelp}
-      />
-      <DiagnosticCell
-        label={copy.dsp.diagnostics.hostDelay}
-        value={formatOptionalMetric(metrics.hostDelayMs, "ms")}
-        title={copy.dsp.diagnostics.hostDelayHelp}
-      />
-      <DiagnosticCell
-        label={copy.dsp.diagnostics.rawSkew}
-        value={formatOptionalMetric(metrics.hostDelayRawSkewMs, "ms", 1)}
-        title={copy.dsp.diagnostics.rawSkewHelp}
-      />
-      <DiagnosticCell
-        label={copy.dsp.diagnostics.hostJitter}
-        value={formatOptionalMetric(metrics.hostDelayJitterMs, "ms", 1)}
-        title={copy.dsp.diagnostics.hostJitterHelp}
-      />
-      <DiagnosticCell
-        label={copy.dsp.diagnostics.calibration}
-        value={calibrationLabel(metrics.hostDelayCalibrationState, copy)}
-        title={copy.dsp.diagnostics.calibrationHelp}
-      />
-      <DiagnosticCell
-        label={copy.dsp.diagnostics.delayResets}
-        value={metrics.hostDelayResetEvents.toLocaleString(language)}
-        title={copy.dsp.diagnostics.delayResetsHelp}
-      />
-      <DiagnosticCell
-        label={copy.dsp.diagnostics.aecDelay}
-        value={formatOptionalMetric(metrics.aecEstimatedDelayMs, "ms")}
-        title={copy.dsp.diagnostics.aecDelayHelp}
-      />
-      <DiagnosticCell
-        label={copy.dsp.diagnostics.erl}
-        value={formatOptionalMetric(metrics.aecEchoReturnLossDb, "dB", 1)}
-        title={copy.dsp.diagnostics.erlHelp}
-      />
-      <DiagnosticCell
-        label={copy.dsp.diagnostics.erle}
-        value={formatOptionalMetric(
-          metrics.aecEchoReturnLossEnhancementDb,
-          "dB",
-          1,
-        )}
-        title={copy.dsp.diagnostics.erleHelp}
-      />
-      <DiagnosticCell
-        label={copy.dsp.diagnostics.residualEcho}
-        value={formatOptionalMetric(
-          metrics.aecResidualEchoLikelihood,
-          "",
-          2,
-        ).trim()}
-        title={copy.dsp.diagnostics.residualEchoHelp}
-      />
-      <DiagnosticCell
-        label={copy.dsp.diagnostics.attenuation}
-        value={formatOptionalMetric(metrics.aecAttenuationDb, "dB", 1)}
-        title={copy.dsp.diagnostics.attenuationHelp}
-      />
-      <DiagnosticCell
-        label={copy.dsp.diagnostics.inputPeak}
-        value={formatOptionalMetric(metrics.inputPeakDbfs, "dBFS", 1)}
-        title={copy.dsp.diagnostics.inputPeakHelp}
-      />
-      <DiagnosticCell
-        label={copy.dsp.diagnostics.outputPeak}
-        value={formatOptionalMetric(metrics.outputPeakDbfs, "dBFS", 1)}
-        title={copy.dsp.diagnostics.outputPeakHelp}
-      />
-      <DiagnosticCell
-        label={copy.dsp.diagnostics.inputClipping}
-        value={(metrics.inputClippedSamples ?? 0).toLocaleString(language)}
-        title={copy.dsp.diagnostics.inputClippingHelp}
-      />
-      <DiagnosticCell
-        label={copy.dsp.diagnostics.limiterSamples}
-        value={(metrics.limiterLimitedSamples ?? 0).toLocaleString(language)}
-        title={copy.dsp.diagnostics.limiterSamplesHelp}
-      />
-      <DiagnosticCell
-        label={copy.dsp.diagnostics.rnnoiseVad}
-        value={formatOptionalMetric(metrics.vadProbability, "", 2).trim()}
-        title={copy.dsp.diagnostics.rnnoiseVadHelp}
-      />
-      <DiagnosticCell
-        label={copy.dsp.diagnostics.speechVad}
-        value={booleanState(
-          metrics.speechVadActive,
-          copy.dsp.diagnostics.speech,
-          copy.dsp.diagnostics.noise,
-        )}
-        title={copy.dsp.diagnostics.speechVadHelp}
-      />
-      <DiagnosticCell
-        label={copy.dsp.diagnostics.gateState}
-        value={booleanState(
-          metrics.vadGateOpen,
-          copy.dsp.diagnostics.open,
-          copy.dsp.diagnostics.closed,
-        )}
-        title={copy.dsp.diagnostics.gateStateHelp}
-      />
-      <DiagnosticCell
-        label={copy.dsp.diagnostics.gateEvents}
-        value={(metrics.vadGateOpenEvents ?? 0).toLocaleString(language)}
-        title={copy.dsp.diagnostics.gateEventsHelp}
-      />
-      <DiagnosticCell
-        label={copy.dsp.diagnostics.echoGuardState}
-        value={booleanState(
-          metrics.echoGuardActive,
-          copy.dsp.diagnostics.active,
-          copy.dsp.diagnostics.idle,
-        )}
-        title={copy.dsp.diagnostics.echoGuardStateHelp}
-      />
-      <DiagnosticCell
-        label={copy.dsp.diagnostics.echoGuardEvents}
-        value={(metrics.echoGuardActiveEvents ?? 0).toLocaleString(language)}
-        title={copy.dsp.diagnostics.echoGuardEventsHelp}
-      />
-      <DiagnosticCell
-        label={copy.dsp.diagnostics.nearendCandidates}
-        value={(metrics.echoGuardNearendCandidateEvents ?? 0).toLocaleString(
-          language,
-        )}
-        title={copy.dsp.diagnostics.nearendCandidatesHelp}
-      />
-      <DiagnosticCell
-        label={copy.dsp.diagnostics.echoGuardReleases}
-        value={(metrics.echoGuardReleaseEvents ?? 0).toLocaleString(language)}
-        title={copy.dsp.diagnostics.echoGuardReleasesHelp}
-      />
+      <div className="diag-group-header">{copy.dsp.diagnostics.groupLatency}</div>
+      <section className="diagnostics-grid">
+        <DiagnosticCell
+          label={copy.dsp.diagnostics.pipelineLatency}
+          value={formatOptionalMetric(metrics.pipelineLatencyMs, "ms")}
+          title={copy.dsp.diagnostics.pipelineLatencyHelp}
+        />
+        <DiagnosticCell
+          label={copy.dsp.diagnostics.captureLatency}
+          value={formatOptionalMetric(metrics.captureLatencyMs, "ms", 1)}
+          title={copy.dsp.diagnostics.captureLatencyHelp}
+        />
+        <DiagnosticCell
+          label={copy.dsp.diagnostics.dspLatency}
+          value={formatOptionalMetric(metrics.dspLatencyMs, "ms")}
+          title={copy.dsp.diagnostics.dspLatencyHelp}
+        />
+        <DiagnosticCell
+          label={copy.dsp.diagnostics.outputLatency}
+          value={formatOptionalMetric(metrics.outputLatencyMs, "ms", 1)}
+          title={copy.dsp.diagnostics.outputLatencyHelp}
+        />
+      </section>
+
+      <div className="diag-group-header">
+        {copy.dsp.diagnostics.groupCalibration}
+      </div>
+      <section className="diagnostics-grid">
+        <DiagnosticCell
+          label={copy.dsp.diagnostics.hostDelay}
+          value={formatOptionalMetric(metrics.hostDelayMs, "ms")}
+          title={copy.dsp.diagnostics.hostDelayHelp}
+        />
+        <DiagnosticCell
+          label={copy.dsp.diagnostics.rawSkew}
+          value={formatOptionalMetric(metrics.hostDelayRawSkewMs, "ms", 1)}
+          title={copy.dsp.diagnostics.rawSkewHelp}
+        />
+        <DiagnosticCell
+          label={copy.dsp.diagnostics.hostJitter}
+          value={formatOptionalMetric(metrics.hostDelayJitterMs, "ms", 1)}
+          title={copy.dsp.diagnostics.hostJitterHelp}
+        />
+        <DiagnosticCell
+          label={copy.dsp.diagnostics.calibration}
+          value={calibrationLabel(metrics.hostDelayCalibrationState, copy)}
+          title={copy.dsp.diagnostics.calibrationHelp}
+        />
+        <DiagnosticCell
+          label={copy.dsp.diagnostics.delayResets}
+          value={metrics.hostDelayResetEvents.toLocaleString(language)}
+          title={copy.dsp.diagnostics.delayResetsHelp}
+        />
+        <DiagnosticCell
+          label={copy.dsp.diagnostics.aecDelay}
+          value={formatOptionalMetric(metrics.aecEstimatedDelayMs, "ms")}
+          title={copy.dsp.diagnostics.aecDelayHelp}
+        />
+        <DiagnosticCell
+          label={copy.dsp.diagnostics.erl}
+          value={formatOptionalMetric(metrics.aecEchoReturnLossDb, "dB", 1)}
+          title={copy.dsp.diagnostics.erlHelp}
+        />
+        <DiagnosticCell
+          label={copy.dsp.diagnostics.erle}
+          value={formatOptionalMetric(
+            metrics.aecEchoReturnLossEnhancementDb,
+            "dB",
+            1,
+          )}
+          title={copy.dsp.diagnostics.erleHelp}
+        />
+      </section>
+
+      <div className="diag-group-header">
+        {copy.dsp.diagnostics.groupEchoAndGate}
+      </div>
+      <section className="diagnostics-grid">
+        <DiagnosticCell
+          label={copy.dsp.diagnostics.residualEcho}
+          value={formatOptionalMetric(
+            metrics.aecResidualEchoLikelihood,
+            "",
+            2,
+          ).trim()}
+          title={copy.dsp.diagnostics.residualEchoHelp}
+        />
+        <DiagnosticCell
+          label={copy.dsp.diagnostics.attenuation}
+          value={formatOptionalMetric(metrics.aecAttenuationDb, "dB", 1)}
+          title={copy.dsp.diagnostics.attenuationHelp}
+        />
+        <DiagnosticCell
+          label={copy.dsp.diagnostics.inputPeak}
+          value={formatOptionalMetric(metrics.inputPeakDbfs, "dBFS", 1)}
+          title={copy.dsp.diagnostics.inputPeakHelp}
+        />
+        <DiagnosticCell
+          label={copy.dsp.diagnostics.outputPeak}
+          value={formatOptionalMetric(metrics.outputPeakDbfs, "dBFS", 1)}
+          title={copy.dsp.diagnostics.outputPeakHelp}
+        />
+        <DiagnosticCell
+          label={copy.dsp.diagnostics.inputClipping}
+          value={(metrics.inputClippedSamples ?? 0).toLocaleString(language)}
+          title={copy.dsp.diagnostics.inputClippingHelp}
+        />
+        <DiagnosticCell
+          label={copy.dsp.diagnostics.limiterSamples}
+          value={(metrics.limiterLimitedSamples ?? 0).toLocaleString(language)}
+          title={copy.dsp.diagnostics.limiterSamplesHelp}
+        />
+        <DiagnosticCell
+          label={copy.dsp.diagnostics.rnnoiseVad}
+          value={formatOptionalMetric(metrics.vadProbability, "", 2).trim()}
+          title={copy.dsp.diagnostics.rnnoiseVadHelp}
+        />
+        <DiagnosticCell
+          label={copy.dsp.diagnostics.speechVad}
+          value={booleanState(
+            metrics.speechVadActive,
+            copy.dsp.diagnostics.speech,
+            copy.dsp.diagnostics.noise,
+          )}
+          title={copy.dsp.diagnostics.speechVadHelp}
+        />
+        <DiagnosticCell
+          label={copy.dsp.diagnostics.gateState}
+          value={booleanState(
+            metrics.vadGateOpen,
+            copy.dsp.diagnostics.open,
+            copy.dsp.diagnostics.closed,
+          )}
+          title={copy.dsp.diagnostics.gateStateHelp}
+        />
+        <DiagnosticCell
+          label={copy.dsp.diagnostics.gateEvents}
+          value={(metrics.vadGateOpenEvents ?? 0).toLocaleString(language)}
+          title={copy.dsp.diagnostics.gateEventsHelp}
+        />
+        <DiagnosticCell
+          label={copy.dsp.diagnostics.echoGuardState}
+          value={booleanState(
+            metrics.echoGuardActive,
+            copy.dsp.diagnostics.active,
+            copy.dsp.diagnostics.idle,
+          )}
+          title={copy.dsp.diagnostics.echoGuardStateHelp}
+        />
+        <DiagnosticCell
+          label={copy.dsp.diagnostics.echoGuardEvents}
+          value={(metrics.echoGuardActiveEvents ?? 0).toLocaleString(language)}
+          title={copy.dsp.diagnostics.echoGuardEventsHelp}
+        />
+        <DiagnosticCell
+          label={copy.dsp.diagnostics.nearendCandidates}
+          value={(metrics.echoGuardNearendCandidateEvents ?? 0).toLocaleString(
+            language,
+          )}
+          title={copy.dsp.diagnostics.nearendCandidatesHelp}
+        />
+        <DiagnosticCell
+          label={copy.dsp.diagnostics.echoGuardReleases}
+          value={(metrics.echoGuardReleaseEvents ?? 0).toLocaleString(language)}
+          title={copy.dsp.diagnostics.echoGuardReleasesHelp}
+        />
+      </section>
     </section>
   );
 }
@@ -3068,6 +3270,54 @@ function DiagnosticCell({
     <div className="diagnostic-cell" title={title}>
       <span>{label}</span>
       <strong>{value}</strong>
+    </div>
+  );
+}
+
+function MicrophoneGainControl({
+  value,
+  disabled,
+  copy,
+  onChange,
+}: {
+  value: number;
+  disabled: boolean;
+  copy: Translation["dsp"]["limiter"];
+  onChange: (gainDb: number) => void;
+}) {
+  return (
+    <div className="mic-gain-control">
+      <RangeControl
+        label={copy.gain}
+        help={copy.gainHelp}
+        value={value}
+        minimum={-12}
+        maximum={30}
+        step={0.5}
+        suffix=" dB"
+        disabled={disabled}
+        onChange={onChange}
+      />
+      <div
+        className="mic-gain-presets"
+        role="group"
+        aria-label={copy.gainPresets}
+      >
+        {GAIN_BOOST_PRESETS.map((preset) => (
+          <button
+            key={preset}
+            type="button"
+            className="mic-gain-preset-btn"
+            aria-pressed={value === preset}
+            disabled={disabled}
+            onClick={() => {
+              if (value !== preset) onChange(preset);
+            }}
+          >
+            {preset === 0 ? "0 dB" : `+${preset} dB`}
+          </button>
+        ))}
+      </div>
     </div>
   );
 }

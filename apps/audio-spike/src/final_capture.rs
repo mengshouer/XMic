@@ -137,6 +137,7 @@ pub fn parse_final_options(
             release_ms: vad_release_ms.unwrap_or(default_gate.release_ms),
         },
         limiter: SafetyLimiterConfig {
+            gain_db: default_limiter.gain_db,
             ceiling_dbfs: limiter_ceiling_dbfs.unwrap_or(default_limiter.ceiling_dbfs),
             release_ms: limiter_release_ms.unwrap_or(default_limiter.release_ms),
         },

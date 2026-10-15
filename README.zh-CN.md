@@ -4,6 +4,8 @@
 
 XMic 是一款纯本地运行的 Windows 麦克风处理工具。它从物理麦克风和当前播放设备采集音频，在实时处理后将声音输出到虚拟麦克风，适用于使用音响通话、游戏语音和日常连麦。
 
+前往 **[GitHub Releases](https://github.com/mengshouer/XMic/releases/latest)** 下载最新的 Windows x64 安装包、单文件版或便携包。
+
 ## 软件截图
 
 ![XMic 处理链路](docs/images/xmic-processing-chain-zh-CN.png)
@@ -13,7 +15,7 @@ XMic 是一款纯本地运行的 Windows 麦克风处理工具。它从物理麦
 - 使用 WebRTC AEC3 消除音响回声，能够实现麦克风接收到的音响声音在对方听到时被消除。
 - 使用 RNNoise 降低键盘、风扇和环境底噪。
 - 提供 Natural、Balanced 和 Strong 三种 AEC 处理强度。
-- 提供可调节的 VAD Gate、AGC2、High-pass Filter 和 Limiter。
+- 提供可调节的 VAD Gate、AGC2、High-pass Filter、麦克风增益加强（-12 至 +30 dB）和 Limiter。
 - 支持指定麦克风以及多通道 USB 麦克风。
 - 默认自动识别标准 VB-CABLE，并支持手动确认其他具有 render/capture endpoint pair 的虚拟音频设备。
 - 所选/默认播放设备或麦克风变化并稳定 1 秒后自动重建音频链路；无关 endpoint 变化不会打断音频，所有设备共用一份全局 DSP 设置。
@@ -22,6 +24,7 @@ XMic 是一款纯本地运行的 Windows 麦克风处理工具。它从物理麦
 - 持续 CPU 过载时整条 DSP 链统一退化，并在设备与负载稳定后自动恢复。
 - 主开关关闭时虚拟输出保持未激活。临时 capture-only probe 检测到持续语音后每次应用运行最多提醒一次，但不会转发麦克风声音。
 - 支持系统托盘后台运行。DSP 控件统一修改 draft，并通过一次由 fallback 承接的 Apply 提交；“当前活动路由”始终显示已应用设置和实际 endpoint，跟随默认麦克风时会明确标注解析结果。
+- 提供响应式 Bento 工作区与跟随系统、浅色、深色三种外观主题，配有侧栏常驻实时 I/O 电平表、分组式 AEC3 运行诊断，以及「关于」页面的一键复制脱敏诊断摘要。
 - 支持开机启动以及启动后自动开始处理。
 - 锁屏、断开 Windows 会话或睡眠时暂停处理并释放音频设备；会话恢复后根据保留的用户意图自动恢复。
 - 所有音频均在本机处理，软件运行时不需要联网。
@@ -38,48 +41,16 @@ XMic 不会修改 Windows 默认播放设备或默认麦克风。使用自动播
 
 ## 下载
 
-每个 release 都会发布四个 Windows x64 产物，全部登记在 `SHA256SUMS.txt` 中：
+前往 [GitHub Releases](https://github.com/mengshouer/XMic/releases/latest) 下载最新版本。每个 release 都会发布四个 Windows x64 产物，全部登记在 `SHA256SUMS.txt` 中：
 
-| 产物 | 用途 |
-| --- | --- |
-| `XMic_<version>_x64-setup.exe` | NSIS 安装包，适合常规的当前用户安装。 |
-| `XMic.exe` | 单文件可执行程序。复制到任意位置即可运行。 |
-| `XMic_x64-portable.zip` | 便携包。解压后直接运行其中的 `XMic.exe`。 |
-| `XMic_<version>_MPL-2.0-source.zip` | MPL-2.0 依赖对应的 Source Code Form。 |
+| 产物                                | 用途                                       |
+| ----------------------------------- | ------------------------------------------ |
+| `XMic_<version>_x64-setup.exe`      | NSIS 安装包，适合常规的当前用户安装。      |
+| `XMic.exe`                          | 单文件可执行程序。复制到任意位置即可运行。 |
+| `XMic_x64-portable.zip`             | 便携包。解压后直接运行其中的 `XMic.exe`。  |
+| `XMic_<version>_MPL-2.0-source.zip` | MPL-2.0 依赖对应的 Source Code Form。      |
 
 当前仅发布 x64。裸 EXE 与便携包依赖系统已安装的 Microsoft Edge WebView2 Evergreen Runtime，不会自行下载或安装；installer 保留原有的 bootstrapper。所有形态都不会自我更新：Scoop 安装使用 `scoop update`，其他情况手动替换程序文件。
-
-### 便携模式
-
-只有 `portable.flag` 与可执行文件同目录时才会进入便携模式。便携包包含一个 0 字节 `portable.flag` 和初始为空的 `data/`：
-
-```text
-XMic_x64-portable/
-  XMic.exe
-  portable.flag
-  data/
-```
-
-便携模式下 XMic 自有文件全部留在 `data/`：设置文件、`data/runtime/` 下的 helper 与 managed DSP 副本、以及 `data/webview/` 下的 WebView2 profile。便携模式不会读取、复制或迁移安装版的配置；`data/` 不可写时会给出明确错误并退出。通知历史、崩溃记录以及用户主动开启的开机启动项属于操作系统状态，因此便携模式不声称对宿主机完全无痕。
-
-一个 Scoop manifest 就能保留该目录，XMic 本身不维护 bucket 或 manifest：
-
-```json
-{
-  "version": "<version>",
-  "homepage": "https://github.com/mengshouer/XMic",
-  "license": "MIT",
-  "architecture": {
-    "64bit": {
-      "url": "https://github.com/mengshouer/XMic/releases/download/v<version>/XMic_x64-portable.zip",
-      "hash": "<SHA256SUMS.txt 中的 sha256>"
-    }
-  },
-  "extract_dir": "XMic_x64-portable",
-  "shortcuts": [["XMic.exe", "XMic"]],
-  "persist": "data"
-}
-```
 
 ### 替换 DSP 库
 

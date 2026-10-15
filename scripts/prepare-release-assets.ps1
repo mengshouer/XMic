@@ -145,6 +145,19 @@ function Get-SourceArchiveEntries([string]$SourceRoot) {
     return $entries.ToArray()
 }
 
+function Get-Sha256Hex([string]$Path) {
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    $stream = [IO.File]::OpenRead($Path)
+    try {
+        $hashBytes = $sha256.ComputeHash($stream)
+        return ([BitConverter]::ToString($hashBytes)).Replace("-", "").
+            ToLowerInvariant()
+    } finally {
+        $stream.Dispose()
+        $sha256.Dispose()
+    }
+}
+
 $repositoryVersion = Get-RepositoryVersion
 if (-not $Version) {
     $Version = $repositoryVersion
@@ -240,8 +253,7 @@ foreach ($payloadName in $payloadNames) {
 }
 $checksumLines = foreach ($payloadName in $payloadNames) {
     $payloadPath = Join-Path $OutputDirectory $payloadName
-    $hash = (Get-FileHash -LiteralPath $payloadPath -Algorithm SHA256).Hash.
-        ToLowerInvariant()
+    $hash = Get-Sha256Hex $payloadPath
     "$hash  $payloadName"
 }
 $encoding = [Text.UTF8Encoding]::new($false)

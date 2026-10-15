@@ -15,6 +15,12 @@ import {
   resolveContainedFile,
   validateLicenseExpression,
 } from "./license-utils.mjs";
+import {
+  bumpReleaseVersion,
+  resolveNextVersion,
+  stripLeadingDoubleDash,
+  verifyReleaseVersion,
+} from "./check-release-version.mjs";
 
 const allowedIds = new Set(["Apache-2.0", "MIT", "MPL-2.0"]);
 const allowedExceptions = new Set(["LLVM-exception"]);
@@ -130,4 +136,71 @@ test("generated trees are compared by exact path and content", () => {
   writeFileSync(join(actual, "NOTICE"), "same\n");
   writeFileSync(join(actual, "EXTRA"), "unexpected\n");
   assert.throws(() => assertTreesEqual(expected, actual), /unexpected/);
+});
+
+test("release version bump updates all five manifests/locks and detects drift", () => {
+  assert.deepEqual(stripLeadingDoubleDash(["--", "patch"]), ["patch"]);
+  assert.deepEqual(stripLeadingDoubleDash(["patch"]), ["patch"]);
+  assert.equal(resolveNextVersion("0.4.0", "patch"), "0.4.1");
+  assert.equal(resolveNextVersion("0.4.0", "minor"), "0.5.0");
+  assert.equal(resolveNextVersion("0.4.0", "major"), "1.0.0");
+  assert.equal(resolveNextVersion("0.4.0", "0.6.2"), "0.6.2");
+  assert.equal(resolveNextVersion("0.4.0", "v0.6.2"), "0.6.2");
+  assert.throws(() => resolveNextVersion("0.4.0", "invalid"), /invalid target version/);
+
+  const sandbox = mkdtempSync(join(tmpdir(), "xmic-version-bump-"));
+  mkdirSync(join(sandbox, "src-tauri"), { recursive: true });
+  mkdirSync(join(sandbox, "crates", "engine-core"), { recursive: true });
+
+  writeFileSync(
+    join(sandbox, "Cargo.toml"),
+    `[workspace]\nmembers = [\n  "crates/engine-core",\n  "src-tauri",\n]\n\n[workspace.package]\nversion = "0.4.0"\nedition = "2021"\n`,
+  );
+  writeFileSync(
+    join(sandbox, "crates", "engine-core", "Cargo.toml"),
+    `[package]\nname = "xmic-engine-core"\nversion.workspace = true\n`,
+  );
+  writeFileSync(
+    join(sandbox, "src-tauri", "Cargo.toml"),
+    `[package]\nname = "xmic"\nversion.workspace = true\n`,
+  );
+  writeFileSync(
+    join(sandbox, "Cargo.lock"),
+    `[[package]]\nname = "serde"\nversion = "1.0.0"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\n\n[[package]]\nname = "xmic"\nversion = "0.4.0"\ndependencies = [\n "xmic-engine-core",\n]\n\n[[package]]\nname = "xmic-engine-core"\nversion = "0.4.0"\n`,
+  );
+  writeFileSync(
+    join(sandbox, "package.json"),
+    `${JSON.stringify({ name: "xmic", version: "0.4.0" }, null, 2)}\n`,
+  );
+  writeFileSync(
+    join(sandbox, "package-lock.json"),
+    `${JSON.stringify(
+      {
+        name: "xmic",
+        version: "0.4.0",
+        packages: { "": { name: "xmic", version: "0.4.0" } },
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  writeFileSync(
+    join(sandbox, "src-tauri", "tauri.conf.json"),
+    `${JSON.stringify({ productName: "XMic", version: "0.4.0" }, null, 2)}\n`,
+  );
+
+  assert.equal(verifyReleaseVersion(sandbox, "v0.4.0"), "0.4.0");
+  const bumped = bumpReleaseVersion("minor", sandbox);
+  assert.deepEqual(bumped, { previousVersion: "0.4.0", nextVersion: "0.5.0" });
+  assert.equal(verifyReleaseVersion(sandbox, "v0.5.0"), "0.5.0");
+
+  // Drift in Cargo.lock must be caught by verifyReleaseVersion.
+  writeFileSync(
+    join(sandbox, "Cargo.lock"),
+    `[[package]]\nname = "xmic"\nversion = "0.5.0"\n\n[[package]]\nname = "xmic-engine-core"\nversion = "0.4.0"\n`,
+  );
+  assert.throws(
+    () => verifyReleaseVersion(sandbox, null),
+    /Cargo\.lock \(xmic-engine-core\)=0\.4\.0/,
+  );
 });

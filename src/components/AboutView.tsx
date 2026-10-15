@@ -16,6 +16,8 @@ import {
   type ApplicationDiagnostics,
   buildRedactedApplicationDiagnostics,
   dspValidationState,
+  type EngineDiagnosticSnapshot,
+  mergeLiveDspValidation,
 } from "../aboutDiagnostics";
 import type { Translation } from "../i18n";
 import {
@@ -28,6 +30,7 @@ interface AboutViewProps {
   active: boolean;
   version: string | null;
   copy: Translation["about"];
+  engineStatus?: EngineDiagnosticSnapshot | null;
 }
 
 interface NoticeDialogState {
@@ -42,7 +45,12 @@ type ExternalLinkTarget =
   | "mplLicense"
   | "mplSourceArchive";
 
-export function AboutView({ active, version, copy }: AboutViewProps) {
+export function AboutView({
+  active,
+  version,
+  copy,
+  engineStatus,
+}: AboutViewProps) {
   const [diagnostics, setDiagnostics] =
     useState<ApplicationDiagnostics | null>(null);
   const [diagnosticsLoading, setDiagnosticsLoading] = useState(false);
@@ -91,7 +99,7 @@ export function AboutView({ active, version, copy }: AboutViewProps) {
     setActionError(null);
     try {
       await navigator.clipboard.writeText(
-        buildRedactedApplicationDiagnostics(diagnostics, version),
+        buildRedactedApplicationDiagnostics(diagnostics, version, engineStatus),
       );
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1800);
@@ -125,9 +133,18 @@ export function AboutView({ active, version, copy }: AboutViewProps) {
     setNotice(null);
   };
 
-  const modeLabel = diagnostics ? copy.modes[diagnostics.mode] : "--";
-  const sourceLabel = diagnostics ? copy.sources[diagnostics.dspSource] : "--";
-  const validationState = diagnostics ? dspValidationState(diagnostics) : null;
+  const effectiveDiagnostics = diagnostics
+    ? mergeLiveDspValidation(diagnostics, engineStatus)
+    : null;
+  const modeLabel = effectiveDiagnostics
+    ? copy.modes[effectiveDiagnostics.mode]
+    : "--";
+  const sourceLabel = effectiveDiagnostics
+    ? copy.sources[effectiveDiagnostics.dspSource]
+    : "--";
+  const validationState = effectiveDiagnostics
+    ? dspValidationState(effectiveDiagnostics)
+    : null;
   const validationLabels = {
     valid: copy.validationValid,
     failed: copy.validationFailed,
@@ -146,8 +163,10 @@ export function AboutView({ active, version, copy }: AboutViewProps) {
               <Info size={14} />
             </span>
             <span>
-              <strong>{copy.overviewTitle}</strong>
-              <small>{copy.overviewSubtitle}</small>
+              <strong title={copy.overviewTitle}>{copy.overviewTitle}</strong>
+              <small title={copy.overviewSubtitle}>
+                {copy.overviewSubtitle}
+              </small>
             </span>
           </header>
           <div className="about-overview-body">
@@ -204,8 +223,12 @@ export function AboutView({ active, version, copy }: AboutViewProps) {
               <FolderCog size={14} />
             </span>
             <span>
-              <strong>{copy.diagnosticsTitle}</strong>
-              <small>{copy.diagnosticsSubtitle}</small>
+              <strong title={copy.diagnosticsTitle}>
+                {copy.diagnosticsTitle}
+              </strong>
+              <small title={copy.diagnosticsSubtitle}>
+                {copy.diagnosticsSubtitle}
+              </small>
             </span>
             <button
               className="about-copy-button"
@@ -234,41 +257,44 @@ export function AboutView({ active, version, copy }: AboutViewProps) {
                 </button>
               </div>
             )}
-            {diagnostics && (
+            {effectiveDiagnostics && (
               <dl className="about-diagnostics-list">
                 <DiagnosticItem label={copy.mode} value={modeLabel} />
-                <DiagnosticItem label={copy.dataDirectory} path={diagnostics.dataDirectory} />
+                <DiagnosticItem
+                  label={copy.dataDirectory}
+                  path={effectiveDiagnostics.dataDirectory}
+                />
                 <DiagnosticItem
                   label={copy.runtimeDirectory}
-                  path={diagnostics.runtimeDirectory}
+                  path={effectiveDiagnostics.runtimeDirectory}
                 />
                 <DiagnosticItem
                   label={copy.webviewDirectory}
-                  path={diagnostics.webviewDataDirectory}
+                  path={effectiveDiagnostics.webviewDataDirectory}
                 />
                 <DiagnosticItem label={copy.dspSource} value={sourceLabel} />
                 <DiagnosticItem
                   label={copy.dspLibrary}
-                  path={diagnostics.dspLibraryPath}
+                  path={effectiveDiagnostics.dspLibraryPath}
                 />
                 <DiagnosticItem
                   label={copy.expectedAbi}
-                  value={String(diagnostics.expectedDspAbi)}
+                  value={String(effectiveDiagnostics.expectedDspAbi)}
                 />
                 <DiagnosticItem
                   label={copy.actualAbi}
                   value={
-                    diagnostics.actualDspAbi == null
+                    effectiveDiagnostics.actualDspAbi == null
                       ? copy.unavailable
-                      : String(diagnostics.actualDspAbi)
+                      : String(effectiveDiagnostics.actualDspAbi)
                   }
                 />
                 <DiagnosticItem
                   label={copy.validation}
                   value={validationLabel}
                   detail={
-                    diagnostics.dspValidationError ??
-                    diagnostics.dspSelectionGuardError
+                    effectiveDiagnostics.dspValidationError ??
+                    effectiveDiagnostics.dspSelectionGuardError
                   }
                   danger={validationState === "failed"}
                 />
@@ -284,8 +310,8 @@ export function AboutView({ active, version, copy }: AboutViewProps) {
             <BookOpenText size={14} />
           </span>
           <span>
-            <strong>{copy.noticesTitle}</strong>
-            <small>{copy.noticesSubtitle}</small>
+            <strong title={copy.noticesTitle}>{copy.noticesTitle}</strong>
+            <small title={copy.noticesSubtitle}>{copy.noticesSubtitle}</small>
           </span>
         </header>
         <div className="about-notice-list">
@@ -296,6 +322,7 @@ export function AboutView({ active, version, copy }: AboutViewProps) {
                 type="button"
                 className="about-notice-button"
                 key={definition.id}
+                title={`${noticeCopy.title} · ${noticeCopy.description}`}
                 onClick={() => openNotice(definition.id)}
               >
                 <FileText size={15} aria-hidden="true" />
@@ -329,7 +356,10 @@ export function AboutView({ active, version, copy }: AboutViewProps) {
           <header>
             <span>
               <FileText size={16} aria-hidden="true" />
-              <strong id="notice-dialog-title">
+              <strong
+                id="notice-dialog-title"
+                title={copy.notices[notice.id].title}
+              >
                 {copy.notices[notice.id].title}
               </strong>
             </span>

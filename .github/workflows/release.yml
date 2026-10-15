@@ -2,11 +2,6 @@ name: Release
 
 on:
   workflow_dispatch:
-    inputs:
-      version:
-        description: Release version without the v prefix (for example, 0.3.5)
-        required: true
-        type: string
 
 permissions:
   contents: read
@@ -24,26 +19,63 @@ jobs:
       contents: read
       id-token: write
       attestations: write
-    env:
-      RELEASE_TAG: v${{ inputs.version }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
-      - name: Validate release request
-        shell: pwsh
-        env:
-          RELEASE_VERSION: ${{ inputs.version }}
-        run: |
-          if ($env:GITHUB_REF -ne "refs/heads/main") {
-            throw "Release workflow must run from the main branch"
-          }
-          if ($env:RELEASE_VERSION -notmatch '^\d+\.\d+\.\d+$') {
-            throw "Version must use MAJOR.MINOR.PATCH without a v prefix"
-          }
-
       - name: Check out release commit
         uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+
+      - name: Resolve and validate release version
+        id: version
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:GITHUB_REF -ne "refs/heads/main") {
+            throw "Release workflow must run from the main branch"
+          }
+
+          $prevErrorAction = $ErrorActionPreference
+          $ErrorActionPreference = "Continue"
+          $versionOutput = (& node scripts/check-release-version.mjs --print 2>&1 | Out-String).Trim()
+          $versionExit = $LASTEXITCODE
+          $ErrorActionPreference = $prevErrorAction
+          $global:LASTEXITCODE = 0
+          if ($versionExit -ne 0 -or $versionOutput -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Failed to resolve a valid MAJOR.MINOR.PATCH release version: $versionOutput"
+          }
+          $version = $versionOutput
+          $tag = "v$version"
+
+          function Assert-GitHubEndpointMissing([string]$Endpoint, [string]$Label) {
+            $savedErrorAction = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            $output = (& gh api $Endpoint 2>&1 | Out-String)
+            $exitCode = $LASTEXITCODE
+            $ErrorActionPreference = $savedErrorAction
+            $global:LASTEXITCODE = 0
+            if ($exitCode -eq 0) {
+              throw "$Label already exists. Run 'npm run version:bump -- <version|patch|minor|major>' before starting a new release."
+            }
+            if ($output -notmatch 'HTTP 404|Not Found') {
+              throw "Failed to query $Endpoint (exit $exitCode): $($output.Trim())"
+            }
+          }
+
+          Assert-GitHubEndpointMissing "repos/$env:GH_REPO/git/ref/tags/$tag" "Tag $tag"
+          Assert-GitHubEndpointMissing "repos/$env:GH_REPO/releases/tags/$tag" "Release $tag"
+
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Output "Resolved release version: $version ($tag)"
 
       - name: Install Rust toolchain from rust-toolchain.toml
         shell: pwsh
@@ -99,16 +131,16 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          if ("${{ inputs.version }}" -ne
+          if ($env:RELEASE_VERSION -ne
               (Get-Content package.json -Raw | ConvertFrom-Json).version) {
-            throw "Requested version does not match the repository version"
+            throw "Resolved version does not match the repository version"
           }
           $release = Join-Path (Get-Location) "artifacts/release"
           $payloads = @(
-            "XMic_${{ inputs.version }}_x64-setup.exe",
+            "XMic_${env:RELEASE_VERSION}_x64-setup.exe",
             "XMic.exe",
             "XMic_x64-portable.zip",
-            "XMic_${{ inputs.version }}_MPL-2.0-source.zip"
+            "XMic_${env:RELEASE_VERSION}_MPL-2.0-source.zip"
           )
           $expectedSet = @($payloads + "SHA256SUMS.txt" | Sort-Object)
           $actualSet = @(Get-ChildItem -LiteralPath $release -File |
@@ -185,7 +217,7 @@ jobs:
           $sourceExtract = Join-Path $env:RUNNER_TEMP "xmic-release-mpl-source"
           Remove-Item -LiteralPath $sourceExtract -Recurse -Force -ErrorAction SilentlyContinue
           Expand-Archive -LiteralPath (
-            Join-Path $release "XMic_${{ inputs.version }}_MPL-2.0-source.zip") `
+            Join-Path $release "XMic_${env:RELEASE_VERSION}_MPL-2.0-source.zip") `
             -DestinationPath $sourceExtract
           foreach ($required in @("MPL_SOURCE_CODE.txt", "LICENSE-MPL-2.0.txt", "sources")) {
             if (-not (Test-Path -LiteralPath (Join-Path $sourceExtract $required))) {
@@ -197,10 +229,10 @@ jobs:
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: |
-            artifacts/release/XMic_${{ inputs.version }}_x64-setup.exe
+            artifacts/release/XMic_${{ steps.version.outputs.version }}_x64-setup.exe
             artifacts/release/XMic.exe
             artifacts/release/XMic_x64-portable.zip
-            artifacts/release/XMic_${{ inputs.version }}_MPL-2.0-source.zip
+            artifacts/release/XMic_${{ steps.version.outputs.version }}_MPL-2.0-source.zip
 
       - name: Upload validated release assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -220,7 +252,8 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      RELEASE_TAG: v${{ inputs.version }}
+      RELEASE_VERSION: ${{ needs.build.outputs.version }}
+      RELEASE_TAG: ${{ needs.build.outputs.tag }}
       RELEASE_SHA: ${{ github.sha }}
     steps:
       - name: Download validated release assets
@@ -231,8 +264,6 @@ jobs:
 
       - name: Verify downloaded release payloads
         working-directory: artifacts/release
-        env:
-          RELEASE_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
 

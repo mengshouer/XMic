@@ -161,6 +161,7 @@ impl DspProcessor {
             release_ms: settings.vad_gate.release_ms,
         })?;
         let limiter = SafetyLimiter::new(SafetyLimiterConfig {
+            gain_db: settings.limiter.gain_db,
             ceiling_dbfs: settings.limiter.ceiling_dbfs,
             release_ms: settings.limiter.release_ms,
         })?;

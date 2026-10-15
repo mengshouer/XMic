@@ -4,6 +4,8 @@
 
 XMic is a fully local Windows microphone processing application. It captures audio from a physical microphone and the active playback device, processes it in real time, and sends the result to a virtual microphone. It is designed for speakerphone calls, in-game voice chat, and everyday voice communication.
 
+Download the latest Windows x64 installer, standalone executable, or portable archive from **[GitHub Releases](https://github.com/mengshouer/XMic/releases/latest)**.
+
 ## Screenshot
 
 ![XMic processing chain](docs/images/xmic-processing-chain-en.png)
@@ -13,7 +15,7 @@ XMic is a fully local Windows microphone processing application. It captures aud
 - Uses WebRTC AEC3 to cancel speaker audio picked up by the microphone before it reaches other participants.
 - Reduces keyboard, fan, and ambient noise with RNNoise.
 - Provides Natural, Balanced, and Strong AEC presets.
-- Includes configurable VAD Gate, AGC2, High-pass Filter, and Limiter stages.
+- Includes configurable VAD Gate, AGC2, High-pass Filter, Microphone Gain/Boost (-12 to +30 dB), and Limiter stages.
 - Supports selected microphones and multichannel USB microphones.
 - Automatically detects standard VB-CABLE installations by default and supports manually confirmed render/capture endpoint pairs from other virtual audio devices.
 - Rebuilds the audio pipeline after the selected/default playback device or microphone remains stable for one second, while ignoring unrelated endpoint churn and keeping one global DSP configuration.
@@ -22,6 +24,7 @@ XMic is a fully local Windows microphone processing application. It captures aud
 - Falls back as one complete chain during sustained CPU overload and restores processing after load and devices stabilize.
 - Keeps the virtual output inactive while the main switch is Off. A temporary capture-only probe can send one notification per app run after sustained speech is detected; it never forwards microphone audio.
 - Supports background operation from the system tray. DSP controls edit a shared draft and are applied together through one fallback-backed Apply action; Current active route always shows applied settings and actual endpoints, explicitly identifying a resolved default microphone.
+- Provides a responsive Bento workspace with System, Light, and Dark appearance themes, a persistent sidebar live I/O level meter, grouped AEC3 runtime diagnostics, and one-click redacted diagnostics in the About view.
 - Supports launch at sign-in and optional automatic processing after startup.
 - Pauses processing and releases audio devices while Windows is locked, disconnected, or sleeping, then automatically recovers the preserved desired state after the session returns.
 - Processes all audio locally and requires no network connection at runtime.
@@ -38,48 +41,16 @@ XMic does not change the default Windows playback device or microphone. When aut
 
 ## Downloads
 
-Every release publishes four Windows x64 payloads, all listed in `SHA256SUMS.txt`:
+Download the latest build from [GitHub Releases](https://github.com/mengshouer/XMic/releases/latest). Every release publishes four Windows x64 payloads, all listed in `SHA256SUMS.txt`:
 
-| Payload | Use |
-| --- | --- |
-| `XMic_<version>_x64-setup.exe` | NSIS installer for a normal per-user installation. |
-| `XMic.exe` | Standalone executable. Copy one file anywhere and run it. |
-| `XMic_x64-portable.zip` | Portable archive. Extract it and run `XMic.exe` from the extracted folder. |
-| `XMic_<version>_MPL-2.0-source.zip` | Source Code Form for the MPL-2.0 dependencies. |
+| Payload                             | Use                                                                        |
+| ----------------------------------- | -------------------------------------------------------------------------- |
+| `XMic_<version>_x64-setup.exe`      | NSIS installer for a normal per-user installation.                         |
+| `XMic.exe`                          | Standalone executable. Copy one file anywhere and run it.                  |
+| `XMic_x64-portable.zip`             | Portable archive. Extract it and run `XMic.exe` from the extracted folder. |
+| `XMic_<version>_MPL-2.0-source.zip` | Source Code Form for the MPL-2.0 dependencies.                             |
 
 Only x64 is published today. The standalone executable and the portable archive require the system Microsoft Edge WebView2 Evergreen Runtime and do not download or install it; the installer keeps its bootstrapper. No edition updates itself: use `scoop update` for a Scoop install, and replace the program files manually otherwise.
-
-### Portable mode
-
-Portable mode activates only when `portable.flag` sits next to the executable. The archive ships a zero-byte `portable.flag` and an initially empty `data/` directory:
-
-```text
-XMic_x64-portable/
-  XMic.exe
-  portable.flag
-  data/
-```
-
-In portable mode every XMic-owned file stays inside `data/`: the settings file, the helper and managed DSP copies under `data/runtime/`, and the WebView2 profile under `data/webview/`. Portable mode never reads, copies, or migrates the installed edition's configuration and exits with a clear error when `data/` is not writable. Because notification history, crash records, and a launch-at-sign-in entry the user explicitly enables are operating-system state, portable mode does not claim to leave no trace on the host.
-
-A Scoop manifest can persist that folder without XMic maintaining a bucket or manifest:
-
-```json
-{
-  "version": "<version>",
-  "homepage": "https://github.com/mengshouer/XMic",
-  "license": "MIT",
-  "architecture": {
-    "64bit": {
-      "url": "https://github.com/mengshouer/XMic/releases/download/v<version>/XMic_x64-portable.zip",
-      "hash": "<sha256 from SHA256SUMS.txt>"
-    }
-  },
-  "extract_dir": "XMic_x64-portable",
-  "shortcuts": [["XMic.exe", "XMic"]],
-  "persist": "data"
-}
-```
 
 ### Replacing the DSP library
 

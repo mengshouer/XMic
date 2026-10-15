@@ -240,6 +240,8 @@ const fn default_vad_confirmation_ms() -> u32 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct LimiterSettings {
+    #[serde(default)]
+    pub gain_db: f32,
     pub ceiling_dbfs: f32,
     pub release_ms: f32,
 }
@@ -247,6 +249,7 @@ pub struct LimiterSettings {
 impl Default for LimiterSettings {
     fn default() -> Self {
         Self {
+            gain_db: 0.0,
             ceiling_dbfs: -1.0,
             release_ms: 50.0,
         }
@@ -438,6 +441,7 @@ impl EngineSettings {
         validate_range("VAD floor", self.dsp.vad_gate.floor_db, -90.0, 0.0)?;
         validate_range("VAD attack", self.dsp.vad_gate.attack_ms, 0.1, 10_000.0)?;
         validate_range("VAD release", self.dsp.vad_gate.release_ms, 0.1, 10_000.0)?;
+        validate_range("limiter gain", self.dsp.limiter.gain_db, -12.0, 30.0)?;
         validate_range("limiter ceiling", self.dsp.limiter.ceiling_dbfs, -30.0, 0.0)?;
         validate_range(
             "limiter release",
@@ -1028,6 +1032,7 @@ mod tests {
         assert_eq!(settings.dsp.vad_gate.confirmation_ms, 40);
         assert_eq!(settings.dsp.vad_gate.hold_ms, 300);
         assert_eq!(settings.dsp.vad_gate.floor_db, -20.0);
+        assert_eq!(settings.dsp.limiter.gain_db, 0.0);
         assert_eq!(settings.dsp.limiter.ceiling_dbfs, -1.0);
         assert_eq!(settings.dsp.limiter.release_ms, 50.0);
         assert_eq!(settings.degraded_output, DegradedOutput::Silence);
