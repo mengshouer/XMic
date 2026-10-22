@@ -95,6 +95,16 @@ npm run bundle
 
 完整的贡献和检查流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
+## 致谢
+
+- **[WebRTC](https://webrtc.googlesource.com/src)** — 提供实时 AEC3 声学回声消除、AGC2 自动增益控制与语音活动检测（VAD）算法。
+- **[RNNoise](https://gitlab.xiph.org/xiph/rnnoise)** 与 **[nnnoiseless](https://github.com/jneem/nnnoiseless)** — Xiph.Org 的循环神经网络实时降噪模型及其纯 Rust 实现。
+- **[Rubato](https://github.com/HEnquist/rubato)** 与 **[rtrb](https://github.com/mgeier/rtrb)** — 异步音频重采样与实时无锁环形缓冲区（Wait-free Ring Buffer）。
+- **[windows-rs](https://github.com/microsoft/windows-rs)** — 支撑底层 Windows WASAPI 音频采集、Loopback 参考流与端点拓扑监控的 Rust 绑定。
+- **[Tauri](https://tauri.app/)**、**[React](https://react.dev/)** 与 **[Lucide](https://lucide.dev/)** — 桌面应用宿主框架、工作区界面与图标库。
+- **[VB-CABLE](https://vb-audio.com/Cable/)** — 常与 XMic 配合使用、将处理后麦克风音频桥接至语音或游戏软件的虚拟声卡驱动。
+- **[Linux Do Community](https://linux.do/)** — 社区交流、测试与反馈。
+
 ## 许可证
 
 XMic 使用 [MIT License](LICENSE)。第三方组件的归属说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。每个 release 都会把完整的依赖许可清单内嵌到「关于」页面，并单独发布 MPL-2.0 的 Source Code Form：`XMic_<version>_MPL-2.0-source.zip`。

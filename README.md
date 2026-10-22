@@ -95,6 +95,16 @@ npm run bundle
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the complete contribution and validation workflow.
 
+## Acknowledgements
+
+- **[WebRTC](https://webrtc.googlesource.com/src)** — real-time AEC3 acoustic echo cancellation, AGC2 automatic gain control, and voice activity detection.
+- **[RNNoise](https://gitlab.xiph.org/xiph/rnnoise)** & **[nnnoiseless](https://github.com/jneem/nnnoiseless)** — Xiph.Org's recurrent neural network noise suppression model and its pure-Rust implementation.
+- **[Rubato](https://github.com/HEnquist/rubato)** & **[rtrb](https://github.com/mgeier/rtrb)** — asynchronous audio resampling and realtime-safe wait-free ring buffers.
+- **[windows-rs](https://github.com/microsoft/windows-rs)** — Rust bindings for Windows WASAPI audio capture, loopback reference, and endpoint topology monitoring.
+- **[Tauri](https://tauri.app/)**, **[React](https://react.dev/)**, & **[Lucide](https://lucide.dev/)** — desktop application shell, UI framework, and iconography.
+- **[VB-CABLE](https://vb-audio.com/Cable/)** — virtual audio driver commonly paired with XMic for routing processed microphone audio into voice and game apps.
+- **[Linux Do Community](https://linux.do/)** — community discussion, testing, and feedback.
+
 ## License
 
 XMic is licensed under the [MIT License](LICENSE). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for third-party attribution. Every release embeds the complete dependency notices in the About page and publishes the MPL-2.0 Source Code Form as `XMic_<version>_MPL-2.0-source.zip`.
