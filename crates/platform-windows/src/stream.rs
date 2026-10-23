@@ -624,7 +624,7 @@ fn run_source(mut prepared: PreparedSource, stop: &AtomicBool) -> Result<(), Pla
             } else if wait_result == WAIT_FAILED {
                 return Err(operation_error(
                     "wait for WASAPI source event",
-                    windows::core::Error::from_win32(),
+                    windows::core::Error::from_thread(),
                 ));
             } else {
                 return Err(PlatformError::Operation(format!(

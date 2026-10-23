@@ -426,7 +426,7 @@ fn run_output(mut prepared: PreparedOutput, stop: &AtomicBool) -> Result<(), Pla
             } else if wait_result == WAIT_FAILED {
                 return Err(operation_error(
                     "wait for WASAPI output event",
-                    windows::core::Error::from_win32(),
+                    windows::core::Error::from_thread(),
                 ));
             } else {
                 return Err(PlatformError::Operation(format!(

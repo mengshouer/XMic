@@ -336,7 +336,7 @@ fn record_prepared(
             } else if wait_result == WAIT_FAILED {
                 return Err(operation_error(
                     "wait for WASAPI capture event",
-                    windows::core::Error::from_win32(),
+                    windows::core::Error::from_thread(),
                 ));
             } else {
                 return Err(PlatformError::Operation(format!(

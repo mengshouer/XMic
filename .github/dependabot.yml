@@ -11,13 +11,24 @@ updates:
     directory: /
     patterns: ["*"]
     multi-ecosystem-group: weekly-dependencies
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: npm
     directory: /
     patterns: ["*"]
     multi-ecosystem-group: weekly-dependencies
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: cargo
     directory: /
     patterns: ["*"]
     multi-ecosystem-group: weekly-dependencies
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "windows*"
+        update-types: ["version-update:semver-minor"]

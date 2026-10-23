@@ -222,7 +222,7 @@ fn register_window_class() -> Result<(), PlatformError> {
             if atom != 0 || unsafe { GetLastError() } == ERROR_CLASS_ALREADY_EXISTS {
                 Ok(())
             } else {
-                Err(windows::core::Error::from_win32().to_string())
+                Err(windows::core::Error::from_thread().to_string())
             }
         })
         .clone()
@@ -238,7 +238,7 @@ fn run_message_loop() -> Result<(), PlatformError> {
         if result.0 == -1 {
             return Err(operation_error(
                 "read lifecycle monitor window message",
-                windows::core::Error::from_win32(),
+                windows::core::Error::from_thread(),
             ));
         }
         if !result.as_bool() {

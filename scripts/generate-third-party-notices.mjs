@@ -77,11 +77,11 @@ const overrideLicenseHashes = new Map([
 ]);
 const cargoLicenseOverrides = new Map([
   [
-    "alloc-stdlib@0.2.4",
+    "alloc-stdlib@0.3.0",
     {
       paths: [overrideLicensePaths.allocStdlib],
       source:
-        "https://github.com/dropbox/rust-alloc-no-stdlib/blob/ae42d22078b98549e987d2f03d12df7b984fde47/LICENSE",
+        "https://github.com/dropbox/rust-alloc-no-stdlib/blob/0a81fd6928ea3b33c8cd484aa4575d50ffb98012/LICENSE",
     },
   ],
   [
@@ -102,19 +102,19 @@ const cargoLicenseOverrides = new Map([
     },
   ],
   [
-    "selectors@0.36.1",
+    "selectors@0.38.0",
     {
       paths: [overrideLicensePaths.mpl],
       source: "https://www.mozilla.org/MPL/2.0/",
     },
   ],
   [
-    "tauri-plugin@2.6.3",
+    "tauri-plugin@2.7.2",
     {
       paths: [overrideLicensePaths.tauri],
       selectedLicense: "MIT",
       source:
-        "https://github.com/tauri-apps/tauri/blob/6f6ab1207bb3923c2721fbc67d2fdb1c8deb0c7a/LICENSE_MIT",
+        "https://github.com/tauri-apps/tauri/blob/59b63ab500da9859f12d8888c3298bc29bba0b92/LICENSE_MIT",
     },
   ],
   ...[
@@ -141,19 +141,19 @@ const cargoLicenseOverrides = new Map([
     },
   ],
   [
-    "webview2-com@0.38.2",
+    "webview2-com@0.39.1",
     {
       paths: [overrideLicensePaths.webView2],
       source:
-        "https://github.com/wravery/webview2-rs/blob/b74dc5e2b394044bea5191052868ce7a106c202c/LICENSE",
+        "https://github.com/wravery/webview2-rs/blob/edc2caf886175ccaebe86078c9cfe1ae2a187328/LICENSE",
     },
   ],
   [
-    "webview2-com-sys@0.38.2",
+    "webview2-com-sys@0.39.1",
     {
       paths: [overrideLicensePaths.webView2],
       source:
-        "https://github.com/wravery/webview2-rs/blob/b74dc5e2b394044bea5191052868ce7a106c202c/LICENSE",
+        "https://github.com/wravery/webview2-rs/blob/edc2caf886175ccaebe86078c9cfe1ae2a187328/LICENSE",
     },
   ],
   [
