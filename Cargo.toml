@@ -19,15 +19,15 @@ license = "MIT"
 repository = "https://github.com/mengshouer/XMic"
 
 [workspace.dependencies]
-audioadapter-buffers = "4.0.0"
-libloading = "0.8"
+audioadapter-buffers = "5.2.0"
+libloading = "0.9"
 nnnoiseless = { version = "0.5.2", default-features = false }
-rubato = { version = "4.0.0", default-features = false }
-rtrb = "0.3.5"
+rubato = { version = "5.0.1", default-features = false }
+rtrb = "0.4.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-windows = { version = "0.61.3", features = [
+windows = { version = "0.62.2", features = [
   "Win32_Devices_FunctionDiscovery",
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
@@ -46,4 +46,4 @@ windows = { version = "0.61.3", features = [
   "Win32_UI_Shell_PropertiesSystem",
   "Win32_UI_WindowsAndMessaging",
 ] }
-windows-core = "0.61.2"
+windows-core = "0.62.2"
