@@ -655,8 +655,21 @@ pub struct EngineMetrics {
     pub aec_echo_return_loss_enhancement_db: Option<f32>,
     pub aec_residual_echo_likelihood: Option<f32>,
     pub aec_attenuation_db: Option<f32>,
+    pub render_peak_dbfs: Option<f32>,
     pub input_peak_dbfs: Option<f32>,
+    pub aec_output_peak_dbfs: Option<f32>,
     pub output_peak_dbfs: Option<f32>,
+    pub render_sample_rate_hz: Option<u32>,
+    pub render_channels: Option<u16>,
+    pub capture_sample_rate_hz: Option<u32>,
+    pub capture_channels: Option<u16>,
+    pub render_keepalive_active: Option<bool>,
+    pub render_drift_ppm: Option<f32>,
+    pub capture_drift_ppm: Option<f32>,
+    pub render_queue_blocks: u32,
+    pub capture_queue_blocks: u32,
+    pub render_wait_timeouts: u64,
+    pub capture_wait_timeouts: u64,
     pub input_clipped_samples: u64,
     pub limiter_limited_samples: u64,
     pub vad_probability: Option<f32>,
@@ -674,8 +687,19 @@ impl EngineMetrics {
     /// counters. Both the helper and UI supervisor use this transition so inactive snapshots cannot
     /// drift as metrics evolve.
     pub fn clear_session_gauges(&mut self) {
+        self.render_peak_dbfs = None;
         self.input_peak_dbfs = None;
+        self.aec_output_peak_dbfs = None;
         self.output_peak_dbfs = None;
+        self.render_sample_rate_hz = None;
+        self.render_channels = None;
+        self.capture_sample_rate_hz = None;
+        self.capture_channels = None;
+        self.render_keepalive_active = None;
+        self.render_drift_ppm = None;
+        self.capture_drift_ppm = None;
+        self.render_queue_blocks = 0;
+        self.capture_queue_blocks = 0;
         self.output_queue_depth_ms = 0.0;
         self.output_rate_adjustment_ppm = 0.0;
         self.processing_time_p99_us = 0.0;
@@ -768,6 +792,12 @@ impl EngineMetrics {
         self.echo_guard_release_events = self
             .echo_guard_release_events
             .saturating_add(baseline.echo_guard_release_events);
+        self.render_wait_timeouts = self
+            .render_wait_timeouts
+            .saturating_add(baseline.render_wait_timeouts);
+        self.capture_wait_timeouts = self
+            .capture_wait_timeouts
+            .saturating_add(baseline.capture_wait_timeouts);
         self
     }
 }

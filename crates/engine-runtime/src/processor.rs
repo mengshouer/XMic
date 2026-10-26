@@ -293,6 +293,10 @@ impl DspProcessor {
         self.render_channels
     }
 
+    pub fn aec_output(&self) -> &[f32; DSP_SAMPLES_PER_FRAME] {
+        &self.aec_output
+    }
+
     pub fn aec_metrics(&self) -> Result<Option<DspMetrics>, DspProcessorError> {
         self.aec
             .as_ref()
@@ -609,5 +613,89 @@ mod tests {
             .residual_echo_likelihood
             .is_some());
         assert_eq!(frame_metrics.unwrap().speech_vad_active, Some(false));
+    }
+
+    #[test]
+    fn continuous_render_frames_allow_aec3_to_cancel_delayed_echo_across_pauses() {
+        let native_library = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("artifacts")
+            .join("webrtc")
+            .join("win-x64")
+            .join("xmic_webrtc_dsp.dll");
+        if !native_library.is_file() {
+            return;
+        }
+        let mut settings = DspSettings::default();
+        settings.rnnoise.enabled = false;
+        settings.agc2.enabled = false;
+        settings.vad_gate.enabled = false;
+        let mut processor = DspProcessor::load(&native_library, 1, &settings).unwrap();
+
+        let echo_delay_frames = 5usize; // 50 ms acoustic delay
+        let total_frames = 300usize; // 3 seconds
+        let silence_frame = [0.0f32; DSP_SAMPLES_PER_FRAME];
+        let mut render_history = Vec::with_capacity(total_frames);
+        let mut raw_tail_energy = 0.0f64;
+        let mut processed_tail_energy = 0.0f64;
+
+        for frame_index in 0..total_frames {
+            // Far-end speaks in bursts (frames 0..150 and 180..280) and is silent in between/after.
+            let speaking = (0..150).contains(&frame_index) || (180..280).contains(&frame_index);
+            let mut render_frame = silence_frame;
+            if speaking {
+                for (sample_idx, sample) in render_frame.iter_mut().enumerate() {
+                    let global_sample = (frame_index * DSP_SAMPLES_PER_FRAME + sample_idx) as u64;
+                    // Deterministic broadband speech-like excitation so AEC3's matched-filter delay
+                    // estimator and subband adaptive filter have full-band spectral content.
+                    let noise = ((global_sample
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407)
+                        >> 33) as i32 as f32)
+                        / (i32::MAX as f32);
+                    let envelope = 0.5
+                        + 0.4
+                            * ((global_sample as f32 / 48_000.0) * 6.0 * std::f32::consts::TAU)
+                                .sin();
+                    *sample = noise * envelope * 0.35;
+                }
+            }
+            render_history.push(render_frame);
+
+            let capture_frame = if frame_index >= echo_delay_frames {
+                let mut delayed = render_history[frame_index - echo_delay_frames];
+                for sample in &mut delayed {
+                    *sample *= 0.5;
+                }
+                delayed
+            } else {
+                silence_frame
+            };
+
+            let mut output = [0.0f32; DSP_SAMPLES_PER_FRAME];
+            // Even when speaking == false (WASAPI loopback idle), feeding a zero render frame
+            // advances WebRTC's RenderDelayBuffer so the 50 ms tail echo in frames 250..255 is cancelled.
+            processor.process_render(&render_frame).unwrap();
+            processor
+                .process_capture(&capture_frame, &mut output, 0)
+                .unwrap();
+
+            if (220..285).contains(&frame_index) {
+                raw_tail_energy += capture_frame
+                    .iter()
+                    .map(|&s| f64::from(s) * f64::from(s))
+                    .sum::<f64>();
+                processed_tail_energy += output
+                    .iter()
+                    .map(|&s| f64::from(s) * f64::from(s))
+                    .sum::<f64>();
+            }
+        }
+
+        assert!(
+            processed_tail_energy < raw_tail_energy * 0.05,
+            "expected >13 dB echo attenuation across active speech and pause tail (raw={raw_tail_energy}, processed={processed_tail_energy})"
+        );
     }
 }

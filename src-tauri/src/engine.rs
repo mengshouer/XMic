@@ -55,6 +55,8 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const AEC_CONVERGENCE_TIME: Duration = Duration::from_secs(2);
 const STATUS_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 const ECHO_PATH_RESET_MIN_INTERVAL: Duration = Duration::from_millis(500);
+const MAX_RENDER_LEAD_BLOCKS: usize = 8;
+const TARGET_RENDER_LEAD_BLOCKS: usize = 2;
 const QPC_UNITS_PER_MILLISECOND: f32 = 10_000.0;
 
 pub struct RealtimeEngineController {
@@ -1184,6 +1186,27 @@ impl AudioSource {
         }
     }
 
+    fn apply_stream_info(&self, metrics: &mut EngineMetrics) {
+        match self {
+            Self::Duplex(source) => {
+                let info = source.info();
+                metrics.render_sample_rate_hz = Some(info.render_format.sample_rate_hz);
+                metrics.render_channels = Some(info.render_format.channels);
+                metrics.capture_sample_rate_hz = Some(info.capture_format.sample_rate_hz);
+                metrics.capture_channels = Some(info.capture_format.channels);
+                metrics.render_keepalive_active = Some(info.render_keepalive_active);
+            }
+            Self::Capture(source) => {
+                let info = source.info();
+                metrics.render_sample_rate_hz = None;
+                metrics.render_channels = None;
+                metrics.capture_sample_rate_hz = Some(info.capture_format.sample_rate_hz);
+                metrics.capture_channels = Some(info.capture_format.channels);
+                metrics.render_keepalive_active = None;
+            }
+        }
+    }
+
     fn pop_capture(&mut self) -> Option<xmic_engine_core::CaptureFrame> {
         match self {
             Self::Duplex(source) => source.pop_capture(),
@@ -1195,6 +1218,13 @@ impl AudioSource {
         match self {
             Self::Duplex(source) => source.pop_render(),
             Self::Capture(_) => None,
+        }
+    }
+
+    fn render_queue_blocks(&self) -> usize {
+        match self {
+            Self::Duplex(source) => source.render_queue_blocks(),
+            Self::Capture(_) => 0,
         }
     }
 
@@ -1232,6 +1262,11 @@ impl AudioSource {
         }
     }
 
+    fn discard_startup_backlog(&mut self) {
+        self.discard_render_backlog();
+        while self.pop_capture().is_some() {}
+    }
+
     fn stop(self) -> Result<(), PlatformError> {
         match self {
             Self::Duplex(source) => source.stop(),
@@ -1248,6 +1283,7 @@ struct RealtimeSession {
     route: ActiveRoute,
     aec_enabled: bool,
     vad_gate_enabled: bool,
+    degraded_output: DegradedOutput,
     processing_histogram: ProcessingHistogram,
 }
 
@@ -1404,6 +1440,7 @@ impl RealtimeSession {
             route,
             aec_enabled: settings.dsp.aec.enabled,
             vad_gate_enabled: settings.dsp.vad_gate.enabled,
+            degraded_output: settings.degraded_output,
             processing_histogram: ProcessingHistogram::default(),
         })
     }
@@ -1412,13 +1449,15 @@ impl RealtimeSession {
         let (state, output, reason) = if self.aec_enabled {
             (
                 EngineState::Degraded,
-                EngineOutput::Silence,
+                degraded_engine_output(self.degraded_output),
                 Some(PrimaryReason::new(PrimaryReasonCode::AecWarmup)),
             )
         } else {
             (EngineState::Processing, EngineOutput::Processed, None)
         };
-        let metrics = lock_unpoisoned(runtime).metrics;
+        let mut metrics = lock_unpoisoned(runtime).metrics;
+        metrics.clear_session_gauges();
+        self.source.apply_stream_info(&mut metrics);
         lock_unpoisoned(runtime).publish(RuntimeTransition {
             state,
             output,
@@ -1436,11 +1475,13 @@ impl RealtimeSession {
         telemetry: &mut TelemetryPublisher,
         initial_metrics: EngineMetrics,
     ) -> SessionExit {
+        self.source.discard_startup_backlog();
         let started = Instant::now();
         let mut interleaved_render = [0.0; DSP_SAMPLES_PER_FRAME * MAX_RENDER_CHANNELS];
         let mut processed = [0.0; DSP_SAMPLES_PER_FRAME];
         let mut metrics = initial_metrics;
         metrics.clear_session_gauges();
+        self.source.apply_stream_info(&mut metrics);
         metrics.processing_load_mode = ProcessingLoadMode::Full;
         let counter_baseline =
             MetricBaseline::new(&metrics, &self.source.counters(), &self.output.counters());
@@ -1448,13 +1489,11 @@ impl RealtimeSession {
         let mut echo_guard_was_active = false;
         let mut nearend_candidate_was_active = false;
         let mut host_delay_estimator = HostDelayEstimator::default();
-        let mut last_data_discontinuities = self.source.counters().data_discontinuities;
         let mut window = StatusWindow::new(Instant::now());
         let mut overload = ProcessingOverloadController::new();
         let mut echo_path_reset = EchoPathResetLimiter::default();
         let mut last_backlog_events = dsp_backlog_events(&self.source);
         let mut recovery_mute_until = None;
-        let mut pending_render = None;
 
         loop {
             if stop.load(Ordering::Acquire) {
@@ -1478,44 +1517,46 @@ impl RealtimeSession {
             }
 
             window.observe_backlog(self.source.capture_queue_blocks());
+            window.observe_render_backlog(self.source.render_queue_blocks());
             let Some(capture) = self.source.pop_capture() else {
                 thread::park_timeout(Duration::from_millis(20));
                 continue;
             };
             let processing_started = Instant::now();
-            let source_counters = self.source.counters();
-            if counter_changed(
-                &mut last_data_discontinuities,
-                source_counters.data_discontinuities,
-            ) && self.aec_enabled
-            {
-                host_delay_estimator.reset();
-                metrics.host_delay_reset_events = metrics.host_delay_reset_events.saturating_add(1);
-                echo_path_reset.request();
-            }
             let input_peak_dbfs = peak_dbfs(&capture.samples);
             window.observe_input_peak(input_peak_dbfs);
             metrics.input_clipped_samples = metrics
                 .input_clipped_samples
                 .saturating_add(clipped_sample_count(&capture.samples));
 
-            let mut latest_render_qpc_position_100ns = None;
-            let mut latest_render_sample_count = 0usize;
-            loop {
-                let render = pending_render.take().or_else(|| self.source.pop_render());
-                let Some(render) = render else { break };
-                if render_is_after_capture(
-                    render.timestamp.qpc_position_100ns,
-                    capture.timestamp.qpc_position_100ns,
-                ) {
-                    pending_render = Some(render);
-                    break;
+            let mut host_delay_observation = host_delay_estimator.current();
+            if self.aec_enabled {
+                let render_sample_count =
+                    DSP_SAMPLES_PER_FRAME * self.source.render_channels();
+                let mut latest_render_qpc_position_100ns = None;
+                let capture_queued = self.source.capture_queue_blocks();
+                if self.source.render_queue_blocks().saturating_sub(capture_queued)
+                    > MAX_RENDER_LEAD_BLOCKS
+                {
+                    while self.source.render_queue_blocks().saturating_sub(capture_queued)
+                        > TARGET_RENDER_LEAD_BLOCKS
+                    {
+                        if self.source.pop_render().is_none() {
+                            break;
+                        }
+                    }
                 }
-                interleave_render(&render, &mut interleaved_render);
-                let sample_count = DSP_SAMPLES_PER_FRAME * render.channels;
+                if let Some(render) = self.source.pop_render() {
+                    interleave_render(&render, &mut interleaved_render);
+                    latest_render_qpc_position_100ns = Some(render.timestamp.qpc_position_100ns);
+                } else {
+                    metrics.render_underruns = metrics.render_underruns.saturating_add(1);
+                    interleaved_render[..render_sample_count].fill(0.0);
+                }
+                window.observe_render_peak(peak_dbfs(&interleaved_render[..render_sample_count]));
                 if let Err(error) = self
                     .processor
-                    .process_render(&interleaved_render[..sample_count])
+                    .process_render(&interleaved_render[..render_sample_count])
                 {
                     self.refresh_metrics(&mut metrics, &counter_baseline, &mut window);
                     return SessionExit::FallbackRequired {
@@ -1523,15 +1564,6 @@ impl RealtimeSession {
                         metrics,
                     };
                 }
-                latest_render_qpc_position_100ns = Some(render.timestamp.qpc_position_100ns);
-                latest_render_sample_count = sample_count;
-            }
-            if self.aec_enabled && latest_render_sample_count == 0 {
-                metrics.render_underruns = metrics.render_underruns.saturating_add(1);
-            }
-
-            let mut host_delay_observation = host_delay_estimator.current();
-            if self.aec_enabled {
                 if let Some(render_qpc_position_100ns) = latest_render_qpc_position_100ns {
                     host_delay_observation = host_delay_estimator.observe(
                         capture.timestamp.qpc_position_100ns,
@@ -1551,17 +1583,15 @@ impl RealtimeSession {
                             metrics,
                         };
                     }
-                    if latest_render_sample_count > 0 {
-                        if let Err(error) = self
-                            .processor
-                            .process_render(&interleaved_render[..latest_render_sample_count])
-                        {
-                            self.refresh_metrics(&mut metrics, &counter_baseline, &mut window);
-                            return SessionExit::FallbackRequired {
-                                failure: RealtimeFailure::RenderAfterReset(error),
-                                metrics,
-                            };
-                        }
+                    if let Err(error) = self
+                        .processor
+                        .process_render(&interleaved_render[..render_sample_count])
+                    {
+                        self.refresh_metrics(&mut metrics, &counter_baseline, &mut window);
+                        return SessionExit::FallbackRequired {
+                            failure: RealtimeFailure::RenderAfterReset(error),
+                            metrics,
+                        };
                     }
                     recovery_mute_until = Some(Instant::now() + AEC_CONVERGENCE_TIME);
                 }
@@ -1582,6 +1612,9 @@ impl RealtimeSession {
                     };
                 }
             };
+            if self.aec_enabled {
+                window.observe_aec_output_peak(peak_dbfs(self.processor.aec_output()));
+            }
             metrics.limiter_limited_samples = metrics
                 .limiter_limited_samples
                 .saturating_add(u64::try_from(frame_metrics.limited_samples).unwrap_or(u64::MAX));
@@ -1624,18 +1657,22 @@ impl RealtimeSession {
                 recovery_mute_until = None;
             }
             let (state, output_kind, reason, output) = if rebuild_warmup {
+                let (output_kind, output) =
+                    degraded_frame_output(self.degraded_output, &capture.samples);
                 (
                     EngineState::Degraded,
-                    EngineOutput::Silence,
+                    output_kind,
                     Some(PrimaryReason::new(PrimaryReasonCode::AecRebuild)),
-                    [0.0; DSP_SAMPLES_PER_FRAME],
+                    output,
                 )
             } else if initial_warmup {
+                let (output_kind, output) =
+                    degraded_frame_output(self.degraded_output, &capture.samples);
                 (
                     EngineState::Degraded,
-                    EngineOutput::Silence,
+                    output_kind,
                     Some(PrimaryReason::new(PrimaryReasonCode::AecWarmup)),
-                    [0.0; DSP_SAMPLES_PER_FRAME],
+                    output,
                 )
             } else {
                 (
@@ -1694,6 +1731,7 @@ impl RealtimeSession {
     ) {
         let source_counters = self.source.counters();
         let output_counters = self.output.counters();
+        self.source.apply_stream_info(metrics);
         apply_device_metrics(
             metrics,
             &source_counters,
@@ -1703,7 +1741,9 @@ impl RealtimeSession {
             counter_baseline,
             window,
         );
+        metrics.render_peak_dbfs = window.take_render_peak();
         metrics.input_peak_dbfs = window.take_input_peak();
+        metrics.aec_output_peak_dbfs = window.take_aec_output_peak();
         metrics.output_peak_dbfs = window.take_output_peak();
         apply_processing_time_metrics(metrics, &self.processing_histogram, counter_baseline);
         if self.aec_enabled {
@@ -2082,6 +2122,9 @@ impl FallbackSession {
     fn publish(&self, runtime: &Mutex<RuntimeSnapshot>) {
         let mut metrics = lock_unpoisoned(runtime).metrics;
         metrics.clear_session_gauges();
+        if let Some(source) = &self.source {
+            source.apply_stream_info(&mut metrics);
+        }
         metrics.processing_load_mode = if self.reason.code == PrimaryReasonCode::CpuOverload {
             ProcessingLoadMode::Protection
         } else {
@@ -2104,6 +2147,9 @@ impl FallbackSession {
     ) -> SessionExit {
         let mut metrics = initial_metrics;
         metrics.clear_session_gauges();
+        if let Some(source) = &self.source {
+            source.apply_stream_info(&mut metrics);
+        }
         metrics.processing_load_mode = if self.reason.code == PrimaryReasonCode::CpuOverload {
             ProcessingLoadMode::Protection
         } else {
@@ -2193,6 +2239,9 @@ impl FallbackSession {
             .map(AudioSource::counters)
             .unwrap_or_default();
         let output_counters = self.output.counters();
+        if let Some(source) = &self.source {
+            source.apply_stream_info(metrics);
+        }
         apply_device_metrics(
             metrics,
             &source_counters,
@@ -2202,7 +2251,9 @@ impl FallbackSession {
             counter_baseline,
             window,
         );
+        metrics.render_peak_dbfs = None;
         metrics.input_peak_dbfs = window.take_input_peak();
+        metrics.aec_output_peak_dbfs = None;
         metrics.output_peak_dbfs = window.take_output_peak();
         clear_dsp_metrics(metrics);
     }
@@ -2318,8 +2369,21 @@ fn fallback_request_reason(reason: &AtomicU8) -> PrimaryReasonCode {
     }
 }
 
-fn render_is_after_capture(render_qpc_100ns: u64, capture_qpc_100ns: u64) -> bool {
-    render_qpc_100ns != 0 && capture_qpc_100ns != 0 && render_qpc_100ns > capture_qpc_100ns
+fn degraded_engine_output(degraded_output: DegradedOutput) -> EngineOutput {
+    match degraded_output {
+        DegradedOutput::Raw => EngineOutput::Raw,
+        DegradedOutput::Silence => EngineOutput::Silence,
+    }
+}
+
+fn degraded_frame_output(
+    degraded_output: DegradedOutput,
+    raw_capture: &[f32; DSP_SAMPLES_PER_FRAME],
+) -> (EngineOutput, [f32; DSP_SAMPLES_PER_FRAME]) {
+    match degraded_output {
+        DegradedOutput::Raw => (EngineOutput::Raw, *raw_capture),
+        DegradedOutput::Silence => (EngineOutput::Silence, [0.0; DSP_SAMPLES_PER_FRAME]),
+    }
 }
 
 fn interleave_render(
@@ -2343,15 +2407,6 @@ fn update_host_delay_metrics(metrics: &mut EngineMetrics, observation: HostDelay
         CoreDelayCalibrationState::WarmingUp => ProtocolDelayCalibrationState::WarmingUp,
         CoreDelayCalibrationState::Calibrated => ProtocolDelayCalibrationState::Calibrated,
     };
-}
-
-fn counter_changed(previous: &mut u64, current: u64) -> bool {
-    if *previous == current {
-        false
-    } else {
-        *previous = current;
-        true
-    }
 }
 
 fn peak_dbfs(samples: &[f32]) -> f32 {
@@ -2424,8 +2479,11 @@ impl EchoPathResetLimiter {
 #[derive(Debug)]
 struct StatusWindow {
     last_update: Instant,
+    render_peak_dbfs: Option<f32>,
     input_peak_dbfs: Option<f32>,
+    aec_output_peak_dbfs: Option<f32>,
     output_peak_dbfs: Option<f32>,
+    render_backlog_blocks: usize,
     backlog_blocks: usize,
 }
 
@@ -2433,18 +2491,33 @@ impl StatusWindow {
     fn new(now: Instant) -> Self {
         Self {
             last_update: now,
+            render_peak_dbfs: None,
             input_peak_dbfs: None,
+            aec_output_peak_dbfs: None,
             output_peak_dbfs: None,
+            render_backlog_blocks: 0,
             backlog_blocks: 0,
         }
+    }
+
+    fn observe_render_peak(&mut self, peak_dbfs: f32) {
+        self.render_peak_dbfs = max_level(self.render_peak_dbfs, peak_dbfs);
     }
 
     fn observe_input_peak(&mut self, peak_dbfs: f32) {
         self.input_peak_dbfs = max_level(self.input_peak_dbfs, peak_dbfs);
     }
 
+    fn observe_aec_output_peak(&mut self, peak_dbfs: f32) {
+        self.aec_output_peak_dbfs = max_level(self.aec_output_peak_dbfs, peak_dbfs);
+    }
+
     fn observe_output_peak(&mut self, peak_dbfs: f32) {
         self.output_peak_dbfs = max_level(self.output_peak_dbfs, peak_dbfs);
+    }
+
+    fn observe_render_backlog(&mut self, blocks: usize) {
+        self.render_backlog_blocks = self.render_backlog_blocks.max(blocks);
     }
 
     fn observe_backlog(&mut self, blocks: usize) {
@@ -2459,12 +2532,24 @@ impl StatusWindow {
         true
     }
 
+    fn take_render_peak(&mut self) -> Option<f32> {
+        self.render_peak_dbfs.take()
+    }
+
     fn take_input_peak(&mut self) -> Option<f32> {
         self.input_peak_dbfs.take()
     }
 
+    fn take_aec_output_peak(&mut self) -> Option<f32> {
+        self.aec_output_peak_dbfs.take()
+    }
+
     fn take_output_peak(&mut self) -> Option<f32> {
         self.output_peak_dbfs.take()
+    }
+
+    fn take_render_backlog_blocks(&mut self) -> usize {
+        std::mem::take(&mut self.render_backlog_blocks)
     }
 
     fn take_backlog_blocks(&mut self) -> usize {
@@ -2476,12 +2561,16 @@ impl StatusWindow {
 struct MetricBaseline {
     prior_render_overflows: u64,
     prior_capture_overflows: u64,
+    prior_render_wait_timeouts: u64,
+    prior_capture_wait_timeouts: u64,
     prior_device_discontinuities: u64,
     prior_output_underruns: u64,
     prior_output_queue_overflows: u64,
     prior_processing_deadline_misses: u64,
     initial_render_overflows: u64,
     initial_capture_overflows: u64,
+    initial_render_wait_timeouts: u64,
+    initial_capture_wait_timeouts: u64,
     initial_device_discontinuities: u64,
     initial_output_underruns: u64,
     initial_output_queue_overflows: u64,
@@ -2496,12 +2585,16 @@ impl MetricBaseline {
         Self {
             prior_render_overflows: metrics.render_overflows,
             prior_capture_overflows: metrics.capture_overflows,
+            prior_render_wait_timeouts: metrics.render_wait_timeouts,
+            prior_capture_wait_timeouts: metrics.capture_wait_timeouts,
             prior_device_discontinuities: metrics.device_discontinuities,
             prior_output_underruns: metrics.output_underruns,
             prior_output_queue_overflows: metrics.output_queue_overflows,
             prior_processing_deadline_misses: metrics.processing_deadline_misses,
             initial_render_overflows: source.render_overflows,
             initial_capture_overflows: source.capture_overflows,
+            initial_render_wait_timeouts: source.render_wait_timeouts,
+            initial_capture_wait_timeouts: source.capture_wait_timeouts,
             initial_device_discontinuities: source.data_discontinuities,
             initial_output_underruns: output.underrun_events,
             initial_output_queue_overflows: output.queue_overflows,
@@ -2540,6 +2633,22 @@ fn apply_device_metrics(
             .capture_overflows
             .saturating_sub(baseline.initial_capture_overflows),
     );
+    metrics.render_wait_timeouts = baseline.prior_render_wait_timeouts.saturating_add(
+        source
+            .render_wait_timeouts
+            .saturating_sub(baseline.initial_render_wait_timeouts),
+    );
+    metrics.capture_wait_timeouts = baseline.prior_capture_wait_timeouts.saturating_add(
+        source
+            .capture_wait_timeouts
+            .saturating_sub(baseline.initial_capture_wait_timeouts),
+    );
+    metrics.render_drift_ppm = source.render_drift_ppm();
+    metrics.capture_drift_ppm = source.capture_drift_ppm();
+    let render_backlog_blocks = window.take_render_backlog_blocks();
+    let capture_backlog_blocks = window.take_backlog_blocks();
+    metrics.render_queue_blocks = u32::try_from(render_backlog_blocks).unwrap_or(u32::MAX);
+    metrics.capture_queue_blocks = u32::try_from(capture_backlog_blocks).unwrap_or(u32::MAX);
     metrics.device_discontinuities = baseline.prior_device_discontinuities.saturating_add(
         source
             .data_discontinuities
@@ -2561,7 +2670,7 @@ fn apply_device_metrics(
     latency_breakdown(
         processing_latency_frames,
         source.capture_packet_lag_100ns,
-        window.take_backlog_blocks(),
+        capture_backlog_blocks,
         output,
         output_stream_latency_100ns,
     )
@@ -2615,6 +2724,8 @@ fn clear_aec_metrics(metrics: &mut EngineMetrics) {
     metrics.aec_echo_return_loss_enhancement_db = None;
     metrics.aec_residual_echo_likelihood = None;
     metrics.aec_attenuation_db = None;
+    metrics.render_peak_dbfs = None;
+    metrics.aec_output_peak_dbfs = None;
 }
 
 fn clear_dsp_metrics(metrics: &mut EngineMetrics) {
@@ -3070,11 +3181,22 @@ mod tests {
     }
 
     #[test]
-    fn render_pairing_keeps_future_reference_for_a_later_capture() {
-        assert!(render_is_after_capture(20_000, 10_000));
-        assert!(!render_is_after_capture(10_000, 20_000));
-        assert!(!render_is_after_capture(0, 20_000));
-        assert!(!render_is_after_capture(20_000, 0));
+    fn aec_warmup_and_rebuild_follow_configured_degraded_output() {
+        let raw_capture = [0.35; DSP_SAMPLES_PER_FRAME];
+        assert_eq!(degraded_engine_output(DegradedOutput::Raw), EngineOutput::Raw);
+        assert_eq!(
+            degraded_engine_output(DegradedOutput::Silence),
+            EngineOutput::Silence
+        );
+
+        let (raw_kind, raw_samples) = degraded_frame_output(DegradedOutput::Raw, &raw_capture);
+        assert_eq!(raw_kind, EngineOutput::Raw);
+        assert_eq!(raw_samples, raw_capture);
+
+        let (silence_kind, silence_samples) =
+            degraded_frame_output(DegradedOutput::Silence, &raw_capture);
+        assert_eq!(silence_kind, EngineOutput::Silence);
+        assert_eq!(silence_samples, [0.0; DSP_SAMPLES_PER_FRAME]);
     }
 
     #[test]

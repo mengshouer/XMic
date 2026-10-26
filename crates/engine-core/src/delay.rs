@@ -45,9 +45,10 @@ impl HostDelayEstimator {
         let signed_ticks =
             i128::from(capture_qpc_position_100ns) - i128::from(render_qpc_position_100ns);
         let raw_skew_ms = signed_ticks as f64 / QPC_TICKS_PER_MILLISECOND;
-        let reset_required = self
-            .previous_raw_skew_ms
-            .is_some_and(|previous| (raw_skew_ms - previous).abs() > LARGE_SKEW_JUMP_MS);
+        let reset_required = self.valid_samples >= WARMUP_SAMPLES
+            && self
+                .previous_raw_skew_ms
+                .is_some_and(|previous| (raw_skew_ms - previous).abs() > LARGE_SKEW_JUMP_MS);
         if reset_required {
             self.reset();
         }
@@ -255,5 +256,20 @@ mod tests {
         let observation = HostDelayEstimator::default().observe(qpc_after(800), BASE_QPC);
 
         assert_eq!(observation.stream_delay_ms, 500);
+    }
+
+    #[test]
+    fn warmup_outlier_above_jump_threshold_does_not_trigger_reset() {
+        let mut estimator = HostDelayEstimator::default();
+        let first = estimator.observe(qpc_after(200), BASE_QPC);
+        assert!(!first.reset_required);
+
+        for _ in 1..WARMUP_SAMPLES {
+            let next = estimator.observe(qpc_after(20), BASE_QPC);
+            assert!(!next.reset_required);
+        }
+
+        assert_eq!(estimator.current().state, DelayCalibrationState::Calibrated);
+        assert_eq!(estimator.current().stream_delay_ms, 20);
     }
 }

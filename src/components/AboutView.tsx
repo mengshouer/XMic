@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import {
+  Activity,
   BookOpenText,
   Check,
   Copy,
@@ -9,14 +10,17 @@ import {
   Info,
   RefreshCw,
   ShieldAlert,
+  Trash2,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   type ApplicationDiagnostics,
   buildRedactedApplicationDiagnostics,
+  type DebugTraceState,
   dspValidationState,
   type EngineDiagnosticSnapshot,
+  evaluateDebugFindings,
   mergeLiveDspValidation,
 } from "../aboutDiagnostics";
 import type { Translation } from "../i18n";
@@ -31,6 +35,9 @@ interface AboutViewProps {
   version: string | null;
   copy: Translation["about"];
   engineStatus?: EngineDiagnosticSnapshot | null;
+  debugTrace?: DebugTraceState | null;
+  onToggleDebug?: () => void;
+  onClearDebug?: () => void;
 }
 
 interface NoticeDialogState {
@@ -50,6 +57,9 @@ export function AboutView({
   version,
   copy,
   engineStatus,
+  debugTrace,
+  onToggleDebug,
+  onClearDebug,
 }: AboutViewProps) {
   const [diagnostics, setDiagnostics] =
     useState<ApplicationDiagnostics | null>(null);
@@ -99,7 +109,12 @@ export function AboutView({
     setActionError(null);
     try {
       await navigator.clipboard.writeText(
-        buildRedactedApplicationDiagnostics(diagnostics, version, engineStatus),
+        buildRedactedApplicationDiagnostics(
+          diagnostics,
+          version,
+          engineStatus,
+          debugTrace,
+        ),
       );
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1800);
@@ -304,6 +319,138 @@ export function AboutView({
         </section>
       </div>
 
+      <section className="surface about-debug-panel">
+        <header className="about-panel-heading">
+          <span className="panel-icon" aria-hidden="true">
+            <Activity size={14} />
+          </span>
+          <span>
+            <strong title={copy.debug.title}>{copy.debug.title}</strong>
+            <small title={copy.debug.subtitle}>{copy.debug.subtitle}</small>
+          </span>
+          <div className="about-debug-actions">
+            <span
+              className="about-mode-badge"
+              data-recording={debugTrace?.enabled || undefined}
+            >
+              {debugTrace?.enabled
+                ? `${copy.debug.recordingBadge} · ${debugTrace.samples.length}s`
+                : copy.debug.idleBadge}
+            </span>
+            {onToggleDebug && (
+              <button
+                type="button"
+                className="about-copy-button"
+                aria-pressed={Boolean(debugTrace?.enabled)}
+                onClick={onToggleDebug}
+              >
+                {debugTrace?.enabled ? copy.debug.disable : copy.debug.enable}
+              </button>
+            )}
+            {onClearDebug && (debugTrace?.samples.length ?? 0) > 0 && (
+              <button
+                type="button"
+                className="about-copy-button"
+                onClick={onClearDebug}
+              >
+                <Trash2 size={13} aria-hidden="true" />
+                {copy.debug.clear}
+              </button>
+            )}
+            <button
+              type="button"
+              className="about-copy-button"
+              onClick={copyDiagnostics}
+              disabled={!diagnostics}
+            >
+              {copied ? (
+                <Check size={13} aria-hidden="true" />
+              ) : (
+                <Copy size={13} aria-hidden="true" />
+              )}
+              {copied ? copy.copied : copy.debug.copyReport}
+            </button>
+          </div>
+        </header>
+
+        <div className="about-debug-body">
+          {engineStatus && (
+            <dl className="about-diagnostics-list about-debug-metrics-grid">
+              <DiagnosticItem
+                label={copy.debug.renderPeak}
+                value={formatDb(engineStatus.metrics.renderPeakDbfs)}
+              />
+              <DiagnosticItem
+                label={copy.debug.inputPeak}
+                value={formatDb(engineStatus.metrics.inputPeakDbfs)}
+              />
+              <DiagnosticItem
+                label={copy.debug.aecPeak}
+                value={formatDb(engineStatus.metrics.aecOutputPeakDbfs)}
+              />
+              <DiagnosticItem
+                label={copy.debug.outputPeak}
+                value={formatDb(engineStatus.metrics.outputPeakDbfs)}
+              />
+              <DiagnosticItem
+                label={copy.debug.renderStream}
+                value={formatStreamSpec(
+                  engineStatus.metrics.renderSampleRateHz,
+                  engineStatus.metrics.renderChannels,
+                  engineStatus.metrics.renderKeepaliveActive == null
+                    ? null
+                    : engineStatus.metrics.renderKeepaliveActive
+                      ? copy.debug.keepaliveOn
+                      : copy.debug.keepaliveOff,
+                  copy.unavailable,
+                )}
+              />
+              <DiagnosticItem
+                label={copy.debug.captureStream}
+                value={formatStreamSpec(
+                  engineStatus.metrics.captureSampleRateHz,
+                  engineStatus.metrics.captureChannels,
+                  null,
+                  copy.unavailable,
+                )}
+              />
+              <DiagnosticItem
+                label={copy.debug.clockDrift}
+                value={`${formatPpm(engineStatus.metrics.renderDriftPpm)} / ${formatPpm(engineStatus.metrics.captureDriftPpm)}`}
+              />
+              <DiagnosticItem
+                label={copy.debug.queueAndTimeouts}
+                value={`Q ${engineStatus.metrics.renderQueueBlocks ?? 0}/${engineStatus.metrics.captureQueueBlocks ?? 0} · T ${engineStatus.metrics.renderWaitTimeouts ?? 0}/${engineStatus.metrics.captureWaitTimeouts ?? 0}`}
+              />
+            </dl>
+          )}
+
+          {debugTrace && debugTrace.samples.length >= 3 && (
+            <div className="about-debug-findings">
+              {evaluateDebugFindings(debugTrace.samples).map((code) => (
+                <div
+                  key={code}
+                  className="about-custom-warning about-debug-finding"
+                  data-healthy={code === "healthy" || undefined}
+                  role="status"
+                >
+                  <Info size={15} aria-hidden="true" />
+                  <span>{copy.debug.findings[code]}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {debugTrace && debugTrace.samples.length > 0 ? (
+            <pre className="about-debug-log">
+              {formatDebugTimelinePreview(debugTrace)}
+            </pre>
+          ) : (
+            <p className="about-debug-empty">{copy.debug.emptyHint}</p>
+          )}
+        </div>
+      </section>
+
       <section className="surface about-notices">
         <header className="about-panel-heading">
           <span className="panel-icon" aria-hidden="true">
@@ -413,4 +560,51 @@ function DiagnosticItem({
       {detail && <small>{detail}</small>}
     </div>
   );
+}
+
+function formatDb(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "--";
+  return `${value.toFixed(1)} dBFS`;
+}
+
+function formatPpm(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "--";
+  return `${value >= 0 ? "+" : ""}${value.toFixed(1)} ppm`;
+}
+
+function formatStreamSpec(
+  sampleRateHz: number | null | undefined,
+  channels: number | null | undefined,
+  extra: string | null,
+  fallback: string,
+): string {
+  if (sampleRateHz == null) return fallback;
+  const base = `${sampleRateHz} Hz · ${channels ?? "?"}ch`;
+  return extra ? `${base} · ${extra}` : base;
+}
+
+function formatDebugTimelinePreview(trace: DebugTraceState): string {
+  const lines: string[] = [];
+  if (trace.events.length > 0) {
+    lines.push("Events:");
+    for (const event of trace.events.slice(-12)) {
+      lines.push(`  [+${event.elapsedSec}s #${event.seq}] ${event.summary}`);
+    }
+    lines.push("");
+  }
+  lines.push(
+    "t     | state/out              | R / In / AEC / Out dBFS     | H/Skew/AEC ms | ERL / ERLE / Res  | VAD / Gate",
+  );
+  for (const sample of trace.samples.slice(-30)) {
+    const t = `+${String(sample.elapsedSec).padStart(3, " ")}s`;
+    const state = `${sample.state}/${sample.output}${sample.reasonCode ? `(${sample.reasonCode})` : ""}`.padEnd(22, " ");
+    const fmt = (n: number | null, d = 1) =>
+      n == null || !Number.isFinite(n) ? "  -- " : n.toFixed(d).padStart(5, " ");
+    const levels = `${fmt(sample.renderPeakDbfs)}/${fmt(sample.inputPeakDbfs)}/${fmt(sample.aecOutputPeakDbfs)}/${fmt(sample.outputPeakDbfs)}`;
+    const delays = `${fmt(sample.hostDelayMs, 0)}/${fmt(sample.rawSkewMs, 1)}/${fmt(sample.aecEstimatedDelayMs, 0)}`;
+    const echo = `${fmt(sample.erlDb, 1)}/${fmt(sample.erleDb, 1)}/${fmt(sample.residualEchoLikelihood, 2)}`;
+    const gate = `${fmt(sample.vadProbability, 2)} ${sample.vadGateOpen == null ? "-" : sample.vadGateOpen ? "open" : "shut"}`;
+    lines.push(`${t} | ${state} | ${levels} | ${delays} | ${echo} | ${gate}`);
+  }
+  return lines.join("\n");
 }

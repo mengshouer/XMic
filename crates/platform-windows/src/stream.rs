@@ -1,7 +1,7 @@
 use std::{
     ptr::null_mut,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc, Arc,
     },
     thread::{self, JoinHandle, Thread},
@@ -12,11 +12,11 @@ use rtrb::{Consumer, Producer, RingBuffer};
 use windows::Win32::{
     Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
     Media::Audio::{
-        IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator,
-        AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
+        IAudioCaptureClient, IAudioClient, IAudioRenderClient, IMMDevice, IMMDeviceEnumerator,
+        MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
         AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR, AUDCLNT_SHAREMODE_SHARED,
         AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
-        AUDCLNT_STREAMFLAGS_NOPERSIST,
+        AUDCLNT_STREAMFLAGS_NOPERSIST, WAVEFORMATEX,
     },
     System::{
         Com::{CoCreateInstance, CLSCTX_ALL},
@@ -43,6 +43,8 @@ const SOURCE_RING_BLOCKS: usize = 32;
 const EVENT_WAIT_MS: u32 = 100;
 /// Packet timestamps beyond this age are treated as driver noise rather than real latency.
 const MAX_CAPTURE_PACKET_LAG_100NS: u64 = 5_000_000;
+const MAX_TIMELINE_DRIFT_100NS: u64 = 500_000;
+const KEEPALIVE_BUFFER_DURATION_100NS: i64 = 1_000_000;
 
 #[derive(Debug, Clone)]
 pub struct DuplexSourceRequest {
@@ -58,32 +60,88 @@ pub struct SourceStreamInfo {
     pub render_format: AudioFormatDescriptor,
     pub capture_format: AudioFormatDescriptor,
     pub render_channels: usize,
+    pub render_keepalive_active: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceCountersSnapshot {
     pub render_blocks: u64,
     pub capture_blocks: u64,
     pub render_overflows: u64,
     pub capture_overflows: u64,
     pub wait_timeouts: u64,
+    pub render_wait_timeouts: u64,
+    pub capture_wait_timeouts: u64,
     pub data_discontinuities: u64,
     pub non_finite_samples_replaced: u64,
     /// Smoothed age of a capture packet when the WASAPI worker receives it, in 100 ns units. This is
     /// the measured device-to-process latency; 0 means no usable packet timestamp yet.
     pub capture_packet_lag_100ns: u64,
+    pub render_drift_ppm_bits: u32,
+    pub capture_drift_ppm_bits: u32,
 }
 
-#[derive(Default)]
+impl Default for SourceCountersSnapshot {
+    fn default() -> Self {
+        Self {
+            render_blocks: 0,
+            capture_blocks: 0,
+            render_overflows: 0,
+            capture_overflows: 0,
+            wait_timeouts: 0,
+            render_wait_timeouts: 0,
+            capture_wait_timeouts: 0,
+            data_discontinuities: 0,
+            non_finite_samples_replaced: 0,
+            capture_packet_lag_100ns: 0,
+            render_drift_ppm_bits: f32::NAN.to_bits(),
+            capture_drift_ppm_bits: f32::NAN.to_bits(),
+        }
+    }
+}
+
+impl SourceCountersSnapshot {
+    pub fn render_drift_ppm(&self) -> Option<f32> {
+        decode_optional_f32(self.render_drift_ppm_bits)
+    }
+
+    pub fn capture_drift_ppm(&self) -> Option<f32> {
+        decode_optional_f32(self.capture_drift_ppm_bits)
+    }
+}
+
 struct SourceCounters {
     render_blocks: AtomicU64,
     capture_blocks: AtomicU64,
     render_overflows: AtomicU64,
     capture_overflows: AtomicU64,
     wait_timeouts: AtomicU64,
+    render_wait_timeouts: AtomicU64,
+    capture_wait_timeouts: AtomicU64,
     data_discontinuities: AtomicU64,
     non_finite_samples_replaced: AtomicU64,
     capture_packet_lag_100ns: AtomicU64,
+    render_drift_ppm_bits: AtomicU32,
+    capture_drift_ppm_bits: AtomicU32,
+}
+
+impl Default for SourceCounters {
+    fn default() -> Self {
+        Self {
+            render_blocks: AtomicU64::new(0),
+            capture_blocks: AtomicU64::new(0),
+            render_overflows: AtomicU64::new(0),
+            capture_overflows: AtomicU64::new(0),
+            wait_timeouts: AtomicU64::new(0),
+            render_wait_timeouts: AtomicU64::new(0),
+            capture_wait_timeouts: AtomicU64::new(0),
+            data_discontinuities: AtomicU64::new(0),
+            non_finite_samples_replaced: AtomicU64::new(0),
+            capture_packet_lag_100ns: AtomicU64::new(0),
+            render_drift_ppm_bits: AtomicU32::new(f32::NAN.to_bits()),
+            capture_drift_ppm_bits: AtomicU32::new(f32::NAN.to_bits()),
+        }
+    }
 }
 
 impl SourceCounters {
@@ -94,9 +152,13 @@ impl SourceCounters {
             render_overflows: self.render_overflows.load(Ordering::Relaxed),
             capture_overflows: self.capture_overflows.load(Ordering::Relaxed),
             wait_timeouts: self.wait_timeouts.load(Ordering::Relaxed),
+            render_wait_timeouts: self.render_wait_timeouts.load(Ordering::Relaxed),
+            capture_wait_timeouts: self.capture_wait_timeouts.load(Ordering::Relaxed),
             data_discontinuities: self.data_discontinuities.load(Ordering::Relaxed),
             non_finite_samples_replaced: self.non_finite_samples_replaced.load(Ordering::Relaxed),
             capture_packet_lag_100ns: self.capture_packet_lag_100ns.load(Ordering::Relaxed),
+            render_drift_ppm_bits: self.render_drift_ppm_bits.load(Ordering::Relaxed),
+            capture_drift_ppm_bits: self.capture_drift_ppm_bits.load(Ordering::Relaxed),
         }
     }
 
@@ -106,6 +168,22 @@ impl SourceCounters {
         self.capture_packet_lag_100ns
             .store(smoothed_sample(previous, sample_100ns), Ordering::Relaxed);
     }
+
+    fn observe_drift_ppm(&self, is_render: bool, drift_ppm: Option<f64>) {
+        let bits = drift_ppm
+            .map(|value| (value as f32).to_bits())
+            .unwrap_or(f32::NAN.to_bits());
+        if is_render {
+            self.render_drift_ppm_bits.store(bits, Ordering::Relaxed);
+        } else {
+            self.capture_drift_ppm_bits.store(bits, Ordering::Relaxed);
+        }
+    }
+}
+
+fn decode_optional_f32(bits: u32) -> Option<f32> {
+    let value = f32::from_bits(bits);
+    value.is_finite().then_some(value)
 }
 
 pub struct DuplexSourceStream {
@@ -138,6 +216,11 @@ impl DuplexSourceStream {
                 break;
             }
         }
+    }
+
+    /// Render frames already normalized and waiting for the DSP thread, including the next one.
+    pub fn render_queue_blocks(&self) -> usize {
+        self.render_consumer.slots()
     }
 
     /// Capture frames already normalized and waiting for the DSP thread, including the next one.
@@ -254,6 +337,7 @@ pub fn start_duplex_source(
             render_format: render.format,
             capture_format: capture.format,
             render_channels: render.output_channels,
+            render_keepalive_active: render.keepalive_active,
         },
         (render, capture) => {
             stop.store(true, Ordering::Release);
@@ -460,6 +544,7 @@ struct PreparedSourceInfo {
     endpoint: EndpointDescriptor,
     format: AudioFormatDescriptor,
     output_channels: usize,
+    keepalive_active: bool,
 }
 
 enum FrameProducer {
@@ -470,6 +555,7 @@ enum FrameProducer {
 struct PreparedSource {
     client: IAudioClient,
     capture_client: IAudioCaptureClient,
+    keepalive: Option<SilentRenderKeepalive>,
     event: EventHandle,
     endpoint: EndpointDescriptor,
     format: AudioFormatDescriptor,
@@ -484,6 +570,69 @@ struct PreparedSource {
     producer: FrameProducer,
     counters: Arc<SourceCounters>,
     wake_thread: Thread,
+    received_packet: bool,
+    idle_since_last_packet: bool,
+    synthetic_device_frames: u64,
+}
+
+/// Keeps the Windows audio engine pumping loopback packets at a steady hardware clock rate even when
+/// no other application is actively playing audio on the selected render endpoint.
+struct SilentRenderKeepalive {
+    client: IAudioClient,
+    render_client: IAudioRenderClient,
+    buffer_frames: u32,
+}
+
+impl SilentRenderKeepalive {
+    fn new(device: &IMMDevice, mix_format: *const WAVEFORMATEX) -> Option<Self> {
+        unsafe {
+            let client: IAudioClient = device.Activate(CLSCTX_ALL, None).ok()?;
+            client
+                .Initialize(
+                    AUDCLNT_SHAREMODE_SHARED,
+                    AUDCLNT_STREAMFLAGS_NOPERSIST,
+                    KEEPALIVE_BUFFER_DURATION_100NS,
+                    0,
+                    mix_format,
+                    None,
+                )
+                .ok()?;
+            let buffer_frames = client.GetBufferSize().ok()?;
+            let render_client: IAudioRenderClient = client.GetService().ok()?;
+            let keepalive = Self {
+                client,
+                render_client,
+                buffer_frames,
+            };
+            keepalive.fill_silent();
+            Some(keepalive)
+        }
+    }
+
+    fn start(&self) {
+        let _ = unsafe { self.client.Start() };
+    }
+
+    fn stop(&self) {
+        let _ = unsafe { self.client.Stop() };
+    }
+
+    fn fill_silent(&self) {
+        unsafe {
+            let Ok(padding) = self.client.GetCurrentPadding() else {
+                return;
+            };
+            let available = self.buffer_frames.saturating_sub(padding);
+            if available == 0 {
+                return;
+            }
+            if self.render_client.GetBuffer(available).is_ok() {
+                let _ = self
+                    .render_client
+                    .ReleaseBuffer(available, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32);
+            }
+        }
+    }
 }
 
 impl PreparedSource {
@@ -492,6 +641,7 @@ impl PreparedSource {
             endpoint: self.endpoint.clone(),
             format: self.format.clone(),
             output_channels: self.mapper.output_channels(),
+            keepalive_active: self.keepalive.is_some(),
         }
     }
 }
@@ -581,10 +731,14 @@ fn prepare_source(
     let mapped_samples = endpoint_buffer_frames
         .checked_mul(output_channels)
         .ok_or_else(|| PlatformError::Operation("source map buffer overflow".to_owned()))?;
+    let keepalive = (request.flow == DataFlow::Render)
+        .then(|| SilentRenderKeepalive::new(&device, mix_format.as_ptr()))
+        .flatten();
 
     Ok(PreparedSource {
         client,
         capture_client,
+        keepalive,
         event,
         endpoint,
         format,
@@ -600,27 +754,56 @@ fn prepare_source(
         producer,
         counters,
         wake_thread,
+        received_packet: false,
+        idle_since_last_packet: false,
+        synthetic_device_frames: 0,
     })
 }
 
 fn run_source(mut prepared: PreparedSource, stop: &AtomicBool) -> Result<(), PlatformError> {
     let _mmcss = MmcssRegistration::register()?;
-    unsafe {
+    if let Some(keepalive) = &prepared.keepalive {
+        keepalive.start();
+    }
+    if let Err(error) = unsafe {
         prepared
             .client
             .Start()
-            .map_err(|error| operation_error("start WASAPI source", error))?;
+            .map_err(|error| operation_error("start WASAPI source", error))
+    } {
+        if let Some(keepalive) = &prepared.keepalive {
+            keepalive.stop();
+        }
+        return Err(error);
     }
     let run_result = (|| {
         while !stop.load(Ordering::Acquire) {
+            if let Some(keepalive) = &prepared.keepalive {
+                keepalive.fill_silent();
+            }
             let wait_result = unsafe { WaitForSingleObject(prepared.event.raw(), EVENT_WAIT_MS) };
             if wait_result == WAIT_OBJECT_0 {
                 drain_source_packets(&mut prepared)?;
             } else if wait_result == WAIT_TIMEOUT {
+                prepared.idle_since_last_packet = true;
                 prepared
                     .counters
                     .wait_timeouts
                     .fetch_add(1, Ordering::Relaxed);
+                match prepared.producer {
+                    FrameProducer::Render(_) => {
+                        prepared
+                            .counters
+                            .render_wait_timeouts
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    FrameProducer::Capture(_) => {
+                        prepared
+                            .counters
+                            .capture_wait_timeouts
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
             } else if wait_result == WAIT_FAILED {
                 return Err(operation_error(
                     "wait for WASAPI source event",
@@ -641,6 +824,9 @@ fn run_source(mut prepared: PreparedSource, stop: &AtomicBool) -> Result<(), Pla
             .Stop()
             .map_err(|error| operation_error("stop WASAPI source", error))
     };
+    if let Some(keepalive) = &prepared.keepalive {
+        keepalive.stop();
+    }
     run_result?;
     stop_result
 }
@@ -734,32 +920,62 @@ fn process_source_packet(
         .mapper
         .map_interleaved(decoded, &mut prepared.mapped[..mapped_samples])
         .map_err(|error| PlatformError::Operation(format!("map source packet: {error}")))?;
-    let discontinuity = flag_is_set(flags, AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32);
+    let raw_discontinuity = flag_is_set(flags, AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32);
     let timestamp_error = flag_is_set(flags, AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32);
-    if discontinuity || timestamp_error {
-        prepared
-            .counters
-            .data_discontinuities
-            .fetch_add(1, Ordering::Relaxed);
+    let is_first_packet = !prepared.received_packet;
+    let is_render_idle_resume =
+        matches!(prepared.producer, FrameProducer::Render(_)) && prepared.idle_since_last_packet;
+    if is_first_packet && device_position != 0 {
+        prepared.synthetic_device_frames = device_position;
     }
+    let effective_device_position = if device_position >= prepared.synthetic_device_frames {
+        prepared.synthetic_device_frames = device_position;
+        device_position
+    } else {
+        prepared.synthetic_device_frames
+    };
+    prepared.synthetic_device_frames = prepared
+        .synthetic_device_frames
+        .saturating_add(frame_count as u64);
+    prepared.received_packet = true;
+    prepared.idle_since_last_packet = false;
     observe_capture_packet_lag(prepared, qpc_position, timestamp_error);
     let clock_update = prepared
         .normalizer
         .observe_clock(ClockObservation {
-            device_position_frames: device_position,
+            device_position_frames: effective_device_position,
             qpc_position_100ns: qpc_position,
-            discontinuity,
+            discontinuity: raw_discontinuity && !is_first_packet,
             timestamp_error,
         })
         .map_err(|error| PlatformError::Operation(format!("observe source clock: {error}")))?;
     if clock_update == ClockUpdate::Reanchored {
         prepared.timeline.reset();
+        if raw_discontinuity && !is_first_packet && !is_render_idle_resume {
+            prepared
+                .counters
+                .data_discontinuities
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
-    if !timestamp_error {
+    prepared.counters.observe_drift_ppm(
+        matches!(prepared.producer, FrameProducer::Render(_)),
+        prepared.normalizer.metrics().measured_drift_ppm,
+    );
+    let queued_input_frames = prepared.normalizer.queue_fill_frames();
+    if !timestamp_error && qpc_position != 0 {
         prepared.timeline.observe_packet(
-            device_position,
+            effective_device_position,
             qpc_position,
             prepared.format.sample_rate_hz,
+            queued_input_frames,
+        );
+    } else if prepared.timeline.needs_anchor() {
+        prepared.timeline.observe_packet(
+            effective_device_position,
+            prepared.clock.now_100ns(),
+            prepared.format.sample_rate_hz,
+            queued_input_frames,
         );
     }
     prepared
@@ -865,18 +1081,43 @@ impl OutputTimeline {
         *self = Self::default();
     }
 
+    fn needs_anchor(&self) -> bool {
+        self.anchor_qpc_100ns.is_none()
+    }
+
     fn observe_packet(
         &mut self,
         device_position: u64,
         qpc_position_100ns: u64,
         input_rate_hz: u32,
+        queued_input_frames: usize,
     ) {
-        if self.anchor_qpc_100ns.is_none() && qpc_position_100ns != 0 {
-            self.anchor_qpc_100ns = Some(qpc_position_100ns);
-            self.anchor_device_position = Some(
-                device_position.saturating_mul(DSP_SAMPLE_RATE_HZ as u64)
-                    / u64::from(input_rate_hz),
-            );
+        if qpc_position_100ns == 0 || input_rate_hz == 0 {
+            return;
+        }
+        let rate_hz = u64::from(input_rate_hz);
+        let queued_frames = queued_input_frames as u64;
+        let queued_qpc_100ns = queued_frames.saturating_mul(10_000_000) / rate_hz;
+        let queued_dsp_frames =
+            queued_frames.saturating_mul(DSP_SAMPLE_RATE_HZ as u64) / rate_hz;
+        let head_qpc_100ns = qpc_position_100ns.saturating_sub(queued_qpc_100ns);
+        let head_device_position = (device_position
+            .saturating_mul(DSP_SAMPLE_RATE_HZ as u64)
+            / rate_hz)
+            .saturating_sub(queued_dsp_frames);
+        let needs_reanchor = match self.anchor_qpc_100ns {
+            None => true,
+            Some(anchor_qpc) => {
+                let current_qpc = anchor_qpc.saturating_add(
+                    self.output_frames.saturating_mul(10_000_000) / DSP_SAMPLE_RATE_HZ as u64,
+                );
+                head_qpc_100ns.abs_diff(current_qpc) > MAX_TIMELINE_DRIFT_100NS
+            }
+        };
+        if needs_reanchor {
+            self.anchor_qpc_100ns = Some(head_qpc_100ns);
+            self.anchor_device_position = Some(head_device_position);
+            self.output_frames = 0;
         }
     }
 
@@ -920,7 +1161,7 @@ mod tests {
     #[test]
     fn output_timeline_advances_by_ten_milliseconds() {
         let mut timeline = OutputTimeline::default();
-        timeline.observe_packet(48_000, 50_000_000, 48_000);
+        timeline.observe_packet(48_000, 50_000_000, 48_000, 0);
 
         let first = timeline.next_timestamp();
         let second = timeline.next_timestamp();
@@ -936,14 +1177,28 @@ mod tests {
     #[test]
     fn output_timeline_reanchors_after_reset() {
         let mut timeline = OutputTimeline::default();
-        timeline.observe_packet(48_000, 50_000_000, 48_000);
+        timeline.observe_packet(48_000, 50_000_000, 48_000, 0);
         let _ = timeline.next_timestamp();
 
         timeline.reset();
-        timeline.observe_packet(96_000, 100_000_000, 48_000);
+        timeline.observe_packet(96_000, 100_000_000, 48_000, 0);
 
         let timestamp = timeline.next_timestamp();
         assert_eq!(timestamp.device_position_frames, 96_000);
         assert_eq!(timestamp.qpc_position_100ns, 100_000_000);
+    }
+
+    #[test]
+    fn output_timeline_reanchors_after_unflagged_idle_gap() {
+        let mut timeline = OutputTimeline::default();
+        timeline.observe_packet(48_000, 50_000_000, 48_000, 0);
+        let _ = timeline.next_timestamp();
+
+        // Loopback was idle for 300 ms with 240 residual frames (5 ms) still queued, then resumed.
+        timeline.observe_packet(48_480, 53_100_000, 48_000, 240);
+
+        let timestamp = timeline.next_timestamp();
+        assert_eq!(timestamp.device_position_frames, 48_240);
+        assert_eq!(timestamp.qpc_position_100ns, 53_050_000);
     }
 }

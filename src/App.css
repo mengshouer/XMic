@@ -2643,6 +2643,7 @@ svg {
 
 .about-overview,
 .about-diagnostics,
+.about-debug-panel,
 .about-notices {
   overflow: hidden;
 }
@@ -2680,8 +2681,69 @@ svg {
 }
 
 .about-overview-body,
-.about-diagnostics-body {
+.about-diagnostics-body,
+.about-debug-body {
   padding: 14px;
+}
+
+.about-debug-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.about-mode-badge[data-recording="true"] {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.about-debug-metrics-grid {
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.about-debug-findings {
+  margin-top: 10px;
+  display: grid;
+  gap: 6px;
+}
+
+.about-debug-finding {
+  margin-top: 0;
+  align-items: center;
+  font-size: 12px;
+  line-height: 17px;
+}
+
+.about-debug-finding[data-healthy="true"] {
+  border-color: var(--line-strong);
+  color: var(--accent);
+  background: var(--canvas);
+}
+
+.about-debug-log {
+  margin: 10px 0 0;
+  max-height: 220px;
+  padding: 10px 12px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--canvas);
+  color: var(--text-secondary);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 16px;
+  white-space: pre;
+}
+
+.about-debug-empty {
+  margin: 10px 0 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 18px;
 }
 
 .about-product-row {

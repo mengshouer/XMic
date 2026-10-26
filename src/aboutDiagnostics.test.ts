@@ -2,9 +2,12 @@ import { describe, expect, it } from "vitest";
 import {
   type ApplicationDiagnostics,
   buildRedactedApplicationDiagnostics,
+  createDebugTraceState,
   dspValidationState,
   type EngineDiagnosticSnapshot,
+  evaluateDebugFindings,
   mergeLiveDspValidation,
+  recordDebugSnapshot,
 } from "./aboutDiagnostics";
 
 const diagnostics: ApplicationDiagnostics = {
@@ -296,5 +299,61 @@ describe("buildRedactedApplicationDiagnostics", () => {
     expect(
       buildRedactedApplicationDiagnostics(diagnostics, "0.4.0", boostedEngine),
     ).toContain("Limiter=gain=+10dB,-1dBFS/50ms");
+  });
+
+  it("records debug timeline samples, flags missing render signal, and appends redacted trace", () => {
+    let trace = createDebugTraceState(true);
+    const silentRenderEngine: EngineDiagnosticSnapshot = {
+      ...engineFixture,
+      state: "processing",
+      output: "processed",
+      primaryReason: null,
+      metrics: {
+        ...engineFixture.metrics,
+        renderPeakDbfs: -120,
+        inputPeakDbfs: -22,
+        aecOutputPeakDbfs: -22,
+        outputPeakDbfs: -22,
+        renderSampleRateHz: 48000,
+        renderChannels: 2,
+        captureSampleRateHz: 48000,
+        captureChannels: 1,
+        renderKeepaliveActive: true,
+        renderDriftPpm: -1.5,
+        captureDriftPpm: 2.0,
+      },
+    };
+
+    trace = recordDebugSnapshot(trace, silentRenderEngine, 1000);
+    trace = recordDebugSnapshot(
+      trace,
+      {
+        ...silentRenderEngine,
+        metrics: { ...silentRenderEngine.metrics, processedBlocks: 4300 },
+      },
+      2000,
+    );
+    trace = recordDebugSnapshot(
+      trace,
+      {
+        ...silentRenderEngine,
+        metrics: { ...silentRenderEngine.metrics, processedBlocks: 4400 },
+      },
+      3000,
+    );
+
+    expect(evaluateDebugFindings(trace.samples)).toContain("noRenderSignal");
+
+    const text = buildRedactedApplicationDiagnostics(
+      diagnostics,
+      "0.4.1",
+      silentRenderEngine,
+      trace,
+    );
+    expect(text).toContain(
+      "Stream format & clock: render=48000Hz/2ch(keepalive=on, drift=-1.5ppm, q=0, timeouts=0), capture=48000Hz/1ch(drift=2.0ppm, q=0, timeouts=0)",
+    );
+    expect(text).toContain("--- Debug Trace (3s captured");
+    expect(text).toContain("findings=noRenderSignal");
   });
 });

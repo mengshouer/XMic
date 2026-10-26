@@ -46,6 +46,10 @@ import {
   useState,
 } from "react";
 import "./App.css";
+import {
+  createDebugTraceState,
+  recordDebugSnapshot,
+} from "./aboutDiagnostics";
 import { AboutView } from "./components/AboutView";
 import {
   ControlLabel,
@@ -211,8 +215,21 @@ interface EngineMetrics {
   aecEchoReturnLossEnhancementDb: number | null;
   aecResidualEchoLikelihood: number | null;
   aecAttenuationDb: number | null;
+  renderPeakDbfs: number | null;
   inputPeakDbfs: number | null;
+  aecOutputPeakDbfs: number | null;
   outputPeakDbfs: number | null;
+  renderSampleRateHz: number | null;
+  renderChannels: number | null;
+  captureSampleRateHz: number | null;
+  captureChannels: number | null;
+  renderKeepaliveActive: boolean | null;
+  renderDriftPpm: number | null;
+  captureDriftPpm: number | null;
+  renderQueueBlocks: number;
+  captureQueueBlocks: number;
+  renderWaitTimeouts: number;
+  captureWaitTimeouts: number;
   inputClippedSamples: number;
   limiterLimitedSamples: number;
   vadProbability: number | null;
@@ -318,6 +335,7 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [dspOverrideWarning, setDspOverrideWarning] = useState(false);
   const [diagnosticsCopied, setDiagnosticsCopied] = useState(false);
+  const [debugTrace, setDebugTrace] = useState(createDebugTraceState);
   const captureSelectRef = useRef<HTMLSelectElement>(null);
   const virtualOutputSelectRef = useRef<HTMLSelectElement>(null);
   // Scroll-spy geometry. Neither value changes while scrolling, so both are measured when the layout
@@ -408,12 +426,30 @@ function App() {
   const acceptStatus = useCallback(
     (next: EngineStatus, forceSettings = false) => {
       setStatus(next);
+      setDebugTrace((current) => recordDebugSnapshot(current, next));
       setSettingsDraft((current) =>
         acceptDraftSettings(current, next.settings, forceSettings),
       );
     },
     [],
   );
+
+  const toggleDebugTrace = useCallback(() => {
+    setDebugTrace((current) => {
+      if (current.enabled) {
+        return { ...current, enabled: false };
+      }
+      const next = {
+        ...current,
+        enabled: true,
+      };
+      return status ? recordDebugSnapshot(next, status) : next;
+    });
+  }, [status]);
+
+  const clearDebugTrace = useCallback(() => {
+    setDebugTrace((current) => createDebugTraceState(current.enabled));
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
@@ -2739,6 +2775,9 @@ function App() {
               version={appVersion}
               copy={copy.about}
               engineStatus={status}
+              debugTrace={debugTrace}
+              onToggleDebug={toggleDebugTrace}
+              onClearDebug={clearDebugTrace}
             />
           </section>
         </main>

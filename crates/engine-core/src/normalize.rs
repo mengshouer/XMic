@@ -8,7 +8,9 @@ use serde::Serialize;
 use crate::{DSP_SAMPLES_PER_FRAME, DSP_SAMPLE_RATE_HZ, MAX_RENDER_CHANNELS};
 
 const MAX_RELATIVE_RATIO: f64 = 1.01;
+const MAX_CLOCK_DRIFT_RATIO: f64 = 1.0002;
 const CLOCK_ESTIMATE_INTERVAL_100NS: u64 = 5_000_000;
+const MAX_CLOCK_GAP_100NS: u64 = 500_000;
 const SINC_LENGTH: usize = 64;
 const SINC_OVERSAMPLING: usize = 128;
 pub const DEFAULT_QUEUE_CAPACITY_FRAMES: usize = DSP_SAMPLES_PER_FRAME * 16;
@@ -188,16 +190,10 @@ impl AdaptiveNormalizer {
         &mut self,
         observation: ClockObservation,
     ) -> Result<ClockUpdate, NormalizerError> {
-        if observation.discontinuity || observation.timestamp_error {
-            self.reset_stream_timing();
-            if !observation.timestamp_error && observation.qpc_position_100ns != 0 {
-                self.clock_anchor = Some((
-                    observation.device_position_frames,
-                    observation.qpc_position_100ns,
-                ));
-            }
+        if observation.timestamp_error || observation.qpc_position_100ns == 0 {
+            self.clock_anchor = None;
             self.metrics.clock_discontinuities += 1;
-            return Ok(ClockUpdate::Reanchored);
+            return Ok(ClockUpdate::Stable);
         }
 
         let Some((anchor_device, anchor_qpc)) = self.clock_anchor else {
@@ -205,33 +201,52 @@ impl AdaptiveNormalizer {
                 observation.device_position_frames,
                 observation.qpc_position_100ns,
             ));
+            if observation.discontinuity {
+                self.metrics.clock_discontinuities += 1;
+                return Ok(ClockUpdate::Reanchored);
+            }
             return Ok(ClockUpdate::Stable);
         };
-        if observation.device_position_frames <= anchor_device
-            || observation.qpc_position_100ns <= anchor_qpc
+        if observation.device_position_frames < anchor_device
+            || observation.qpc_position_100ns < anchor_qpc
         {
-            self.reset_stream_timing();
-            self.clock_anchor = Some((
+            self.reanchor_clock(
                 observation.device_position_frames,
                 observation.qpc_position_100ns,
-            ));
-            self.metrics.clock_discontinuities += 1;
+            );
             return Ok(ClockUpdate::Reanchored);
         }
 
         let qpc_delta = observation.qpc_position_100ns - anchor_qpc;
-        if qpc_delta < CLOCK_ESTIMATE_INTERVAL_100NS {
-            return Ok(ClockUpdate::Stable);
-        }
         let device_delta = observation.device_position_frames - anchor_device;
-        let measured_rate = device_delta as f64 * 10_000_000.0 / qpc_delta as f64;
-        if !measured_rate.is_finite() || measured_rate < 1_000.0 {
-            self.metrics.clock_discontinuities += 1;
-            self.reset_stream_timing();
-            self.clock_anchor = Some((
+        let expected_qpc_delta = u128::from(device_delta)
+            .saturating_mul(10_000_000)
+            / u128::from(self.nominal_input_rate_hz);
+        let expected_qpc_delta = u64::try_from(expected_qpc_delta).unwrap_or(u64::MAX);
+        let allowed_drift_100ns = (expected_qpc_delta / 20).max(MAX_CLOCK_GAP_100NS);
+        if qpc_delta.abs_diff(expected_qpc_delta) > allowed_drift_100ns {
+            self.reanchor_clock(
                 observation.device_position_frames,
                 observation.qpc_position_100ns,
-            ));
+            );
+            return Ok(ClockUpdate::Reanchored);
+        }
+        if observation.discontinuity && device_delta == 0 {
+            self.reanchor_clock(
+                observation.device_position_frames,
+                observation.qpc_position_100ns,
+            );
+            return Ok(ClockUpdate::Reanchored);
+        }
+        if qpc_delta < CLOCK_ESTIMATE_INTERVAL_100NS || device_delta == 0 {
+            return Ok(ClockUpdate::Stable);
+        }
+        let measured_rate = device_delta as f64 * 10_000_000.0 / qpc_delta as f64;
+        if !is_plausible_clock_rate(measured_rate, self.nominal_input_rate_hz) {
+            self.reanchor_clock(
+                observation.device_position_frames,
+                observation.qpc_position_100ns,
+            );
             return Ok(ClockUpdate::Reanchored);
         }
         let smoothed_rate = match self.smoothed_input_rate_hz {
@@ -239,8 +254,8 @@ impl AdaptiveNormalizer {
             None => measured_rate,
         };
         self.smoothed_input_rate_hz = Some(smoothed_rate);
-        let minimum_ratio = self.metrics.nominal_resample_ratio / MAX_RELATIVE_RATIO;
-        let maximum_ratio = self.metrics.nominal_resample_ratio * MAX_RELATIVE_RATIO;
+        let minimum_ratio = self.metrics.nominal_resample_ratio / MAX_CLOCK_DRIFT_RATIO;
+        let maximum_ratio = self.metrics.nominal_resample_ratio * MAX_CLOCK_DRIFT_RATIO;
         let ratio = (DSP_SAMPLE_RATE_HZ as f64 / smoothed_rate).clamp(minimum_ratio, maximum_ratio);
         self.resampler
             .set_resample_ratio(ratio, true)
@@ -333,20 +348,9 @@ impl AdaptiveNormalizer {
         self.metrics.maximum_queue_fill_frames = self.metrics.maximum_queue_fill_frames.max(fill);
     }
 
-    fn reset_stream_timing(&mut self) {
-        let discarded_frames = self.queue.len_frames();
-        self.queue.clear();
-        self.resampler.reset();
-        self.clock_anchor = None;
-        self.smoothed_input_rate_hz = None;
-        self.metrics.dropped_input_frames = self
-            .metrics
-            .dropped_input_frames
-            .saturating_add(discarded_frames as u64);
-        self.metrics.current_resample_ratio = self.metrics.nominal_resample_ratio;
-        self.metrics.measured_input_rate_hz = None;
-        self.metrics.measured_drift_ppm = None;
-        self.update_fill_metrics();
+    fn reanchor_clock(&mut self, device_position_frames: u64, qpc_position_100ns: u64) {
+        self.clock_anchor = Some((device_position_frames, qpc_position_100ns));
+        self.metrics.clock_discontinuities += 1;
     }
 }
 
@@ -356,6 +360,16 @@ fn validate_channels(channels: usize) -> Result<(), NormalizerError> {
     } else {
         Err(NormalizerError::UnsupportedChannelCount(channels))
     }
+}
+
+fn is_plausible_clock_rate(measured_rate: f64, nominal_rate_hz: u32) -> bool {
+    if !measured_rate.is_finite() || nominal_rate_hz == 0 {
+        return false;
+    }
+    let nominal = f64::from(nominal_rate_hz);
+    let min_rate = nominal * 0.95;
+    let max_rate = nominal * 1.05;
+    (min_rate..=max_rate).contains(&measured_rate)
 }
 
 struct InterleavedRing {
@@ -442,11 +456,6 @@ impl InterleavedRing {
         debug_assert!(frames <= self.len_frames);
         self.head_frame = (self.head_frame + frames) % self.capacity_frames;
         self.len_frames -= frames;
-    }
-
-    fn clear(&mut self) {
-        self.head_frame = 0;
-        self.len_frames = 0;
     }
 }
 
@@ -550,28 +559,40 @@ mod tests {
     }
 
     #[test]
-    fn discontinuity_discards_queued_audio_and_requests_reanchor() {
+    fn discontinuity_reanchors_without_discarding_queued_audio_or_starving_resampler() {
         let mut normalizer =
             AdaptiveNormalizer::new(48_000, 1, DEFAULT_QUEUE_CAPACITY_FRAMES).unwrap();
-        normalizer
-            .push_interleaved(&[0.25; DSP_SAMPLES_PER_FRAME])
-            .unwrap();
+        let mut output = NormalizedBlock::silence(1).unwrap();
+        let mut blocks = 0;
 
-        let update = normalizer
-            .observe_clock(ClockObservation {
-                device_position_frames: 48_000,
-                qpc_position_100ns: 10_000_000,
-                discontinuity: true,
-                timestamp_error: false,
-            })
-            .unwrap();
+        // Even if a buggy audio driver sets AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY on every
+        // 10 ms packet (480 frames < 512 initial sinc window), the normalizer must preserve
+        // queued audio across packets and produce a steady stream of 480-sample blocks.
+        for packet in 0..20 {
+            let update = normalizer
+                .observe_clock(ClockObservation {
+                    device_position_frames: packet * 480,
+                    qpc_position_100ns: 1_000_000 + packet * 100_000,
+                    discontinuity: true,
+                    timestamp_error: false,
+                })
+                .unwrap();
+            if packet == 0 {
+                assert_eq!(update, ClockUpdate::Reanchored);
+            } else {
+                assert_eq!(update, ClockUpdate::Stable);
+            }
+            normalizer
+                .push_interleaved(&[0.25; DSP_SAMPLES_PER_FRAME])
+                .unwrap();
+            while normalizer.queue_fill_frames() >= normalizer.input_frames_needed() {
+                assert!(normalizer.process_next(&mut output).unwrap());
+                blocks += 1;
+            }
+        }
 
-        assert_eq!(update, ClockUpdate::Reanchored);
-        assert_eq!(normalizer.queue_fill_frames(), 0);
-        assert_eq!(
-            normalizer.metrics().dropped_input_frames,
-            DSP_SAMPLES_PER_FRAME as u64
-        );
+        assert!(blocks >= 18);
+        assert_eq!(normalizer.metrics().dropped_input_frames, 0);
     }
 
     #[test]
@@ -580,5 +601,84 @@ mod tests {
             AdaptiveNormalizer::new(384_000, 2, DEFAULT_QUEUE_CAPACITY_FRAMES).unwrap();
 
         assert!(normalizer.input_frames_needed() <= DEFAULT_QUEUE_CAPACITY_FRAMES);
+    }
+
+    #[test]
+    fn idle_clock_gap_reanchors_without_discarding_queued_audio_or_corrupting_rate() {
+        let mut normalizer =
+            AdaptiveNormalizer::new(48_000, 1, DEFAULT_QUEUE_CAPACITY_FRAMES).unwrap();
+        normalizer
+            .observe_clock(ClockObservation {
+                device_position_frames: 0,
+                qpc_position_100ns: 1_000_000,
+                discontinuity: false,
+                timestamp_error: false,
+            })
+            .unwrap();
+        normalizer
+            .push_interleaved(&[0.25; DSP_SAMPLES_PER_FRAME])
+            .unwrap();
+
+        let update = normalizer
+            .observe_clock(ClockObservation {
+                device_position_frames: 480,
+                qpc_position_100ns: 4_000_000,
+                discontinuity: false,
+                timestamp_error: false,
+            })
+            .unwrap();
+
+        assert_eq!(update, ClockUpdate::Reanchored);
+        assert_eq!(normalizer.queue_fill_frames(), DSP_SAMPLES_PER_FRAME);
+        assert_eq!(normalizer.metrics().dropped_input_frames, 0);
+        assert_eq!(normalizer.metrics().measured_input_rate_hz, None);
+    }
+
+    #[test]
+    fn timestamp_error_skips_clock_anchor_without_dropping_audio() {
+        let mut normalizer =
+            AdaptiveNormalizer::new(48_000, 1, DEFAULT_QUEUE_CAPACITY_FRAMES).unwrap();
+        normalizer
+            .push_interleaved(&[0.25; DSP_SAMPLES_PER_FRAME])
+            .unwrap();
+
+        let update = normalizer
+            .observe_clock(ClockObservation {
+                device_position_frames: 480,
+                qpc_position_100ns: 0,
+                discontinuity: false,
+                timestamp_error: true,
+            })
+            .unwrap();
+
+        assert_eq!(update, ClockUpdate::Stable);
+        assert_eq!(normalizer.queue_fill_frames(), DSP_SAMPLES_PER_FRAME);
+        assert_eq!(normalizer.metrics().dropped_input_frames, 0);
+    }
+
+    #[test]
+    fn resample_ratio_adjustment_is_clamped_to_crystal_drift_tolerance() {
+        let mut normalizer =
+            AdaptiveNormalizer::new(48_000, 1, DEFAULT_QUEUE_CAPACITY_FRAMES).unwrap();
+        normalizer
+            .observe_clock(ClockObservation {
+                device_position_frames: 0,
+                qpc_position_100ns: 1_000_000,
+                discontinuity: false,
+                timestamp_error: false,
+            })
+            .unwrap();
+        // Simulate 5 ms of WASAPI QPC timestamp jitter over a 500 ms interval (10,000 ppm apparent skew).
+        normalizer
+            .observe_clock(ClockObservation {
+                device_position_frames: 24_000,
+                qpc_position_100ns: 6_050_000,
+                discontinuity: false,
+                timestamp_error: false,
+            })
+            .unwrap();
+
+        let ratio_deviation = (normalizer.metrics().current_resample_ratio - 1.0).abs();
+        assert!(ratio_deviation <= (MAX_CLOCK_DRIFT_RATIO - 1.0) + 1e-9);
     }
 }
