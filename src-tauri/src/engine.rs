@@ -1531,14 +1531,19 @@ impl RealtimeSession {
 
             let mut host_delay_observation = host_delay_estimator.current();
             if self.aec_enabled {
-                let render_sample_count =
-                    DSP_SAMPLES_PER_FRAME * self.source.render_channels();
+                let render_sample_count = DSP_SAMPLES_PER_FRAME * self.source.render_channels();
                 let mut latest_render_qpc_position_100ns = None;
                 let capture_queued = self.source.capture_queue_blocks();
-                if self.source.render_queue_blocks().saturating_sub(capture_queued)
+                if self
+                    .source
+                    .render_queue_blocks()
+                    .saturating_sub(capture_queued)
                     > MAX_RENDER_LEAD_BLOCKS
                 {
-                    while self.source.render_queue_blocks().saturating_sub(capture_queued)
+                    while self
+                        .source
+                        .render_queue_blocks()
+                        .saturating_sub(capture_queued)
                         > TARGET_RENDER_LEAD_BLOCKS
                     {
                         if self.source.pop_render().is_none() {
@@ -3183,7 +3188,10 @@ mod tests {
     #[test]
     fn aec_warmup_and_rebuild_follow_configured_degraded_output() {
         let raw_capture = [0.35; DSP_SAMPLES_PER_FRAME];
-        assert_eq!(degraded_engine_output(DegradedOutput::Raw), EngineOutput::Raw);
+        assert_eq!(
+            degraded_engine_output(DegradedOutput::Raw),
+            EngineOutput::Raw
+        );
         assert_eq!(
             degraded_engine_output(DegradedOutput::Silence),
             EngineOutput::Silence

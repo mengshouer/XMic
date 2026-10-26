@@ -1098,11 +1098,9 @@ impl OutputTimeline {
         let rate_hz = u64::from(input_rate_hz);
         let queued_frames = queued_input_frames as u64;
         let queued_qpc_100ns = queued_frames.saturating_mul(10_000_000) / rate_hz;
-        let queued_dsp_frames =
-            queued_frames.saturating_mul(DSP_SAMPLE_RATE_HZ as u64) / rate_hz;
+        let queued_dsp_frames = queued_frames.saturating_mul(DSP_SAMPLE_RATE_HZ as u64) / rate_hz;
         let head_qpc_100ns = qpc_position_100ns.saturating_sub(queued_qpc_100ns);
-        let head_device_position = (device_position
-            .saturating_mul(DSP_SAMPLE_RATE_HZ as u64)
+        let head_device_position = (device_position.saturating_mul(DSP_SAMPLE_RATE_HZ as u64)
             / rate_hz)
             .saturating_sub(queued_dsp_frames);
         let needs_reanchor = match self.anchor_qpc_100ns {

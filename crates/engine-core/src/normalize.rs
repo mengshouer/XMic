@@ -219,8 +219,7 @@ impl AdaptiveNormalizer {
 
         let qpc_delta = observation.qpc_position_100ns - anchor_qpc;
         let device_delta = observation.device_position_frames - anchor_device;
-        let expected_qpc_delta = u128::from(device_delta)
-            .saturating_mul(10_000_000)
+        let expected_qpc_delta = u128::from(device_delta).saturating_mul(10_000_000)
             / u128::from(self.nominal_input_rate_hz);
         let expected_qpc_delta = u64::try_from(expected_qpc_delta).unwrap_or(u64::MAX);
         let allowed_drift_100ns = (expected_qpc_delta / 20).max(MAX_CLOCK_GAP_100NS);
